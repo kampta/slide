@@ -10,9 +10,8 @@ import { SessionList } from "./components/SessionList";
 import { SessionView } from "./components/SessionView";
 import { NewSessionDialog } from "./components/NewSessionDialog";
 import { useSessions } from "./state/sessionStore";
-import { useHotkeys } from "./hooks/useHotkeys";
 import { useIsMobile } from "./hooks/useMediaQuery";
-import { api, setToken, type SessionState } from "./state/api";
+import { setToken } from "./state/api";
 
 const SIDEBAR_WIDTH_KEY = "slide.sidebarWidth";
 const SIDEBAR_COLLAPSED_KEY = "slide.sidebarCollapsed";
@@ -95,29 +94,6 @@ export function App() {
 
   useEffect(() => () => resizeCleanupRef.current?.(), []);
 
-  const cycleState = useCallback(
-    (state: SessionState | "any") => {
-      const { sessions, order, activeId } = useSessions.getState();
-      const filtered = order
-        .map((id) => sessions[id])
-        .filter((s) => s && (state === "any" || s.state === state));
-      if (filtered.length === 0) return;
-      const idx = filtered.findIndex((s) => s.id === activeId);
-      const next = filtered[(idx + 1) % filtered.length];
-      setActive(next.id);
-    },
-    [setActive],
-  );
-
-  const cyclePrev = useCallback(() => {
-    const { sessions, order, activeId } = useSessions.getState();
-    const list = order.map((id) => sessions[id]).filter(Boolean);
-    if (list.length === 0) return;
-    const idx = list.findIndex((s) => s!.id === activeId);
-    const prev = list[(idx - 1 + list.length) % list.length]!;
-    setActive(prev.id);
-  }, [setActive]);
-
   const stopResizing = useCallback(() => {
     resizeCleanupRef.current?.();
   }, []);
@@ -175,29 +151,6 @@ export function App() {
     },
     [],
   );
-
-  useHotkeys({
-    "alt+n": () => setNewOpen(true),
-    "alt+j": () => cycleState("any"),
-    "alt+k": cyclePrev,
-    "alt+shift+w": () => cycleState("waiting"),
-    "alt+shift+a": () => cycleState("active"),
-    "alt+shift+x": async () => {
-      const { activeId, sessions } = useSessions.getState();
-      if (!activeId) return;
-      const s = sessions[activeId];
-      if (!s) return;
-      const running = s.state === "active" || s.state === "waiting";
-      try {
-        await api.updateSession(activeId, {
-          action: running ? "stop" : "resume",
-        });
-      } catch (error) {
-        reportError(error);
-      }
-    },
-    escape: () => setNewOpen(false),
-  });
 
   // Mobile: single pane. List when no session is focused; SessionView
   // (with its own back button) when one is. Skip the resizer entirely —

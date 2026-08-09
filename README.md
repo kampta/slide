@@ -1,45 +1,61 @@
 # slide
 
-A lightweight IDE for juggling coding-agent sessions (Claude Code, Codex, …) at once. The session list keeps live work first and stopped work collapsed, while hotkeys jump directly to **Waiting** or **Active** sessions. Each local session runs in an auto-created git worktree so concurrent agents don't stomp on each other.
+A lightweight IDE for juggling coding-agent sessions (Claude Code, Codex, …) at once. The session list keeps live work first and stopped work collapsed. Each local session runs in an auto-created git worktree so concurrent agents don't stomp on each other.
 
 Architecture: a small Rust daemon (`slide serve`) hosts an HTTP+WebSocket API and serves a React SPA. Open it in any browser.
 
-## Quick start (any fresh macOS/Linux laptop)
+## Setup
+
+On a fresh macOS or Linux machine:
 
 ```bash
 git clone https://github.com/kampta/slide
 cd slide
-./scripts/bootstrap.sh   # installs rustup, node, and JS deps
-./scripts/dev.sh         # runs daemon + Vite dev server
-# → click the http://localhost:5173/?token=… URL the daemon prints
+./scripts/bootstrap.sh
 ```
 
-In dev mode the daemon prints the full URL with the bootstrap token so you can click it. The token is stripped from the URL and stored in `localStorage` so paired mobile browsers survive tab suspension and restarts.
+The bootstrap script installs the pinned Rust toolchain, Node.js, and the web dependencies. Run it once per machine.
 
-Or, after `bootstrap.sh`, build a single binary:
+## Development mode
 
 ```bash
-(cd web && npm run build)
-cargo build --release -p slide-cli
-./target/release/slide serve  # auto-opens the browser; token never hits stdout
+./scripts/dev.sh
 ```
 
-If you started the daemon with `--no-open`, run `slide open` from another terminal to launch the browser. `slide token` will print just the token if you need it for a manual paste.
+This starts the Rust daemon on `127.0.0.1:7777` and the Vite development server on `127.0.0.1:5173`. Vite serves the UI with hot reload and proxies `/api` and `/ws` to the daemon. Open the token-bearing `http://localhost:5173/?token=…` URL printed in the terminal. Stop both processes with `Ctrl+C`.
 
-## Hotkeys
+To test from another device on a trusted local network:
 
-| Key | Action |
-| --- | --- |
-| `Alt+N` | New session dialog |
-| `Alt+J` / `Alt+K` | Next / previous session |
-| `Alt+Shift+W` | Cycle to next **waiting** session |
-| `Alt+Shift+A` | Cycle to next **active** session |
-| `Alt+Shift+X` | Stop / resume focused session |
-| `Esc` | Close modal |
-| Drag | Select text in the terminal |
-| `Cmd+C` / `Ctrl+Shift+C` | Copy selection to the system clipboard |
-| `Cmd+V` / `Ctrl+Shift+V` | Paste from the system clipboard |
-| Mousewheel | Scroll xterm scrollback (normal screen) or page through tmux pane history via copy-mode (alt-screen TUI — press `q` to exit) |
+```bash
+./scripts/dev.sh --lan
+```
+
+This exposes both development servers on the network, including the token-bearing URL, so do not use it on an untrusted network.
+
+## Production mode
+
+Build the web app first, then the release binary:
+
+```bash
+npm --prefix web run build
+cargo build --release -p slide-cli
+```
+
+The release binary embeds `web/dist`, so production runs as one process with no Node.js or Vite server:
+
+```bash
+./target/release/slide serve
+```
+
+It serves the embedded UI and API on `http://127.0.0.1:7777` and opens the authenticated page in your browser without printing the token-bearing URL. To start without opening a tab, add `--no-open`; while the daemon is running, `./target/release/slide open` opens it later.
+
+For access from another device, run `./target/release/slide serve --lan`, then use `./target/release/slide pair` to print the pairing URLs and QR codes. Only expose Slide on a trusted network.
+
+Re-run both build commands whenever the frontend changes. Rust-only changes require only the Cargo build.
+
+## Terminal interaction
+
+The terminal uses standard terminal controls. Drag to select text, use the platform clipboard keys to copy or paste, and use the mouse wheel for scrollback. In an alternate-screen TUI, the mouse wheel enters tmux copy mode; press `q` to leave it.
 
 ## New session
 
