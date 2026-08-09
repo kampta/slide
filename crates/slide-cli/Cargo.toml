@@ -1,0 +1,36 @@
+[package]
+name = "slide-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "slide"
+path = "src/main.rs"
+
+[dependencies]
+slide-core = { workspace = true }
+anyhow.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+rand.workspace = true
+futures.workspace = true
+bytes.workspace = true
+dirs.workspace = true
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.5", features = ["cors", "trace", "catch-panic"] }
+clap = { version = "4", features = ["derive"] }
+opener = "0.7"
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+mime_guess = "2"
+qrcode = { version = "0.14", default-features = false }
+if-addrs = "0.13"
+
+[dev-dependencies]
+tempfile.workspace = true

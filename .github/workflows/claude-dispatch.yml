@@ -1,0 +1,39 @@
+name: Claude Dispatch
+
+# Disabled until the Claude Code GitHub App (https://github.com/apps/claude)
+# is installed on this repo — the action's token exchange returns 401
+# without it. To re-enable @claude mentions on issues/PRs, restore:
+#
+#   on:
+#     issues:
+#       types: [labeled, opened]
+#     issue_comment:
+#       types: [created]
+#     pull_request_review_comment:
+#       types: [created]
+#
+# and reinstate the `if:` gate below so only @claude / `claude`-labeled
+# events run. For manual dispatch there's nothing to gate.
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+      # claude-code-action authenticates to Anthropic via GitHub OIDC;
+      # without id-token:write the action errors out before the prompt runs.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: --max-turns 20 --model claude-opus-4-7

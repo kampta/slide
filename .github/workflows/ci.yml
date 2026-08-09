@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  # Full-workspace job also runs on a weekly cadence and on manual trigger.
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Default GITHUB_TOKEN is `contents: read` only. gitleaks needs
+# `pull-requests: read` to list PR commits; rustsec/audit-check needs
+# `checks: write` to publish its check-run.
+permissions:
+  contents: read
+  pull-requests: read
+  checks: write
+
+jobs:
+  ci:
+    # Fast path on every PR: fmt, web, clippy, and the smoke-subset tests
+    # that cover the security-critical validators. Full-workspace test runs
+    # in the `full-test` job below on push to main + schedule.
+    name: fmt · web · clippy · smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Setup Node (for rust-embed web/dist)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Rust format
+        run: cargo fmt --all -- --check
+
+      - name: Install web deps
+        run: npm --prefix web ci
+
+      - name: Build web assets
+        run: npm --prefix web run build
+
+      - name: Web regression tests
+        run: npm --prefix web run test
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # slide-core's lib tests cover every validator added for the sharing
+      # review (valid_id, validate_host). slide-cli's server::tests cover
+      # the constant-time token compare + the subprotocol bearer shape.
+      - name: Smoke test slide-core
+        run: cargo test -p slide-core --lib
+
+      - name: Smoke test slide-cli auth
+        run: cargo test -p slide-cli --bin slide server::tests
+
+  security:
+    # Runs in parallel with `ci`. Pure scans only — no Rust compile — so
+    # this stays under a minute and doesn't stack on the main build.
+    name: npm audit · cargo audit · secret scan
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 is only needed for gitleaks on push events so it can
+      # diff the full history; PRs go through the API path.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web deps
+        run: npm --prefix web ci
+
+      - name: npm audit
+        run: npm --prefix web audit --audit-level=moderate
+
+      # taiki-e/install-action fetches a prebuilt cargo-audit binary from
+      # GitHub Releases. rustsec/audit-check compiles cargo-audit from
+      # source, which was costing ~4min on a cold runner — no thanks.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: cargo audit
+        run: cargo audit
+
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  full-test:
+    # Full-workspace test. Skipped on PRs (smoke subset gates them) and run
+    # on push to main + weekly schedule + manual dispatch. Keeps PR wall
+    # time under a few minutes while still catching broader regressions
+    # before the next release.
+    name: Full workspace test
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Setup Node (for rust-embed web/dist)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web deps
+        run: npm --prefix web ci
+
+      - name: Build web assets
+        run: npm --prefix web run build
+
+      - name: Test workspace
+        run: cargo test --workspace

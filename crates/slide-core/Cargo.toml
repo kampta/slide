@@ -1,0 +1,25 @@
+[package]
+name = "slide-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+regex.workspace = true
+rusqlite.workspace = true
+portable-pty.workspace = true
+dirs.workspace = true
+bytes.workspace = true
+async-trait.workspace = true
+tokio-rusqlite = "0.5"
+
+[dev-dependencies]
+tempfile.workspace = true

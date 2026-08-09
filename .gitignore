@@ -1,0 +1,11 @@
+/target
+/web/node_modules
+/web/dist
+/web/dist-embed
+/web/*.tsbuildinfo
+.DS_Store
+*.log
+.env
+.env.local
+.slide-worktrees/
+/.claude/
