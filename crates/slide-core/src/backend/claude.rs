@@ -22,6 +22,68 @@ impl ClaudeBackend {
     }
 }
 
+/// Tools Slide pre-approves without granting general shell access. The user
+/// explicitly opts all Git subcommands into the allowlist.
+fn permission_args() -> Vec<String> {
+    let allowed = [
+        "Read",
+        "Glob",
+        "Grep",
+        "WebSearch",
+        "WebFetch",
+        "Edit",
+        "Write",
+        "NotebookEdit",
+        "Bash(git:*)",
+        "Bash(cargo build:*)",
+        "Bash(cargo check:*)",
+        "Bash(cargo test:*)",
+        "Bash(cargo fmt:*)",
+        "Bash(cargo clippy:*)",
+        "Bash(cargo fetch:*)",
+        "Bash(npm install:*)",
+        "Bash(npm ci:*)",
+        "Bash(npm test:*)",
+        "Bash(npm run build:*)",
+        "Bash(npm run test:*)",
+        "Bash(npm run lint:*)",
+        "Bash(npm run typecheck:*)",
+        "Bash(pnpm install:*)",
+        "Bash(pnpm test:*)",
+        "Bash(pnpm run build:*)",
+        "Bash(pnpm run test:*)",
+        "Bash(pnpm run lint:*)",
+        "Bash(pnpm run typecheck:*)",
+        "Bash(yarn install:*)",
+        "Bash(yarn test:*)",
+        "Bash(yarn run build:*)",
+        "Bash(yarn run test:*)",
+        "Bash(yarn run lint:*)",
+        "Bash(yarn run typecheck:*)",
+        "Bash(make build:*)",
+        "Bash(make test:*)",
+        "Bash(make lint:*)",
+        "Bash(./scripts/dev.sh:*)",
+        "Bash(./scripts/bootstrap.sh:*)",
+        "Bash(gh pr view:*)",
+        "Bash(gh pr checks:*)",
+        "Bash(gh run view:*)",
+        "Bash(gh issue view:*)",
+        "Bash(ps:*)",
+        "Bash(pgrep:*)",
+        "Bash(lsof:*)",
+        "Bash(kill:*)",
+        "Bash(pkill:*)",
+    ];
+    vec!["--allowedTools".into(), allowed.join(",")]
+}
+
+fn argv_with_permissions() -> Vec<String> {
+    let mut argv = vec!["claude".into()];
+    argv.extend(permission_args());
+    argv
+}
+
 /// Patterns observed from `tmux capture-pane -p` against a live Claude
 /// Code session. Working hint is the bottom-row "esc to interrupt" label;
 /// idle hints are the default `? for shortcuts` plus the three `⏵⏵`
@@ -149,7 +211,7 @@ impl Backend for ClaudeBackend {
     }
 
     fn argv(&self, _cwd: &Path) -> Vec<String> {
-        vec!["claude".into()]
+        argv_with_permissions()
     }
 
     fn signals(&self) -> &'static Signals {
@@ -157,7 +219,9 @@ impl Backend for ClaudeBackend {
     }
 
     fn resume_argv(&self, _cwd: &Path, session_id: &str) -> Option<Vec<String>> {
-        Some(vec!["claude".into(), "--resume".into(), session_id.into()])
+        let mut argv = argv_with_permissions();
+        argv.extend(["--resume".into(), session_id.into()]);
+        Some(argv)
     }
 
     fn read_context_usage(&self, cwd: &Path, session_id: &str) -> Option<ContextUsage> {
@@ -206,7 +270,29 @@ mod tests {
     fn resume_argv_starts_with_claude_resume() {
         let b = ClaudeBackend::new();
         let argv = b.resume_argv(Path::new("/tmp"), "abc-123").unwrap();
-        assert_eq!(argv, vec!["claude", "--resume", "abc-123"]);
+        assert_eq!(argv[0], "claude");
+        assert_eq!(&argv[argv.len() - 2..], ["--resume", "abc-123"]);
+        assert!(argv.iter().any(|arg| arg.contains("Bash(git:*)")));
+    }
+
+    #[test]
+    fn launch_argv_preapproves_daily_development_tools() {
+        let argv = ClaudeBackend::new().argv(Path::new("/tmp"));
+        let allowlist = argv.last().unwrap();
+        for permission in [
+            "Read",
+            "WebSearch",
+            "Edit",
+            "Bash(git:*)",
+            "Bash(cargo test:*)",
+            "Bash(npm install:*)",
+            "Bash(./scripts/dev.sh:*)",
+            "Bash(gh pr view:*)",
+            "Bash(lsof:*)",
+        ] {
+            assert!(allowlist.contains(permission), "missing {permission}");
+        }
+        assert!(!allowlist.contains("gh pr merge"));
     }
 
     fn any(regs: &[Regex], s: &str) -> bool {

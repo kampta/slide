@@ -94,14 +94,31 @@ fn run(host: Option<&str>, tmux_args: &[&str], ctx: &str) -> Result<()> {
 /// and the backend dies immediately on exec. Falls back to `/bin/sh` if
 /// `$SHELL` is unset, e.g. when the daemon is launched from a service
 /// manager that strips env.
-fn build_pane_command(cwd: &Path, argv: &[String]) -> String {
+fn build_pane_command(cwd: &Path, argv: &[String], env: &[(String, String)]) -> String {
     let quoted: Vec<String> = argv.iter().map(|a| shell_quote(a)).collect();
+    let assignments = env
+        .iter()
+        .map(|(key, value)| shell_quote(&format!("{key}={value}")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let env_prefix = if assignments.is_empty() {
+        String::new()
+    } else {
+        format!("env {assignments} ")
+    };
     let inner = format!(
-        "cd {} && exec {}",
+        "cd {} && {}exec {}",
         shell_quote(&cwd.to_string_lossy()),
+        env_prefix,
         quoted.join(" "),
     );
     format!("exec \"${{SHELL:-/bin/sh}}\" -lc {}", shell_quote(&inner))
+}
+
+/// Backend process definition used when creating a tmux pane.
+pub struct PaneCommand<'a> {
+    pub argv: &'a [String],
+    pub env: &'a [(String, String)],
 }
 
 /// Create a new detached tmux session that runs `argv` in `cwd`.
@@ -109,14 +126,14 @@ pub fn new_session(
     host: Option<&str>,
     id: &str,
     cwd: &Path,
-    argv: &[String],
+    command: PaneCommand<'_>,
     cols: u16,
     rows: u16,
 ) -> Result<()> {
-    if argv.is_empty() {
+    if command.argv.is_empty() {
         bail!("new_session: empty argv");
     }
-    let cmd = build_pane_command(cwd, argv);
+    let cmd = build_pane_command(cwd, command.argv, command.env);
     let name = session_name(id);
     let cols_s = cols.to_string();
     let rows_s = rows.to_string();
@@ -189,15 +206,15 @@ pub fn create_session_with_log(
     host: Option<&str>,
     id: &str,
     cwd: &Path,
-    argv: &[String],
+    command: PaneCommand<'_>,
     cols: u16,
     rows: u16,
     log_path: &Path,
 ) -> Result<()> {
-    if argv.is_empty() {
+    if command.argv.is_empty() {
         bail!("create_session_with_log: empty argv");
     }
-    let cmd = build_pane_command(cwd, argv);
+    let cmd = build_pane_command(cwd, command.argv, command.env);
     let name = session_name(id);
     let cols_s = cols.to_string();
     let rows_s = rows.to_string();
@@ -539,6 +556,7 @@ mod tests {
                 "--resume".to_string(),
                 "id".to_string(),
             ],
+            &[],
         );
         assert!(cmd.contains("-lc"), "missing login-shell flag: {cmd}");
         assert!(
@@ -557,10 +575,25 @@ mod tests {
         let cmd = build_pane_command(
             Path::new("/home/u/my projects/app"),
             &["claude".to_string()],
+            &[],
         );
         // The inner string is single-quoted once for the outer shell, so
         // embedded single quotes inside the cd path get the '\'' dance.
         assert!(cmd.contains("my projects/app"), "path mangled: {cmd}");
+    }
+
+    #[test]
+    fn build_pane_command_applies_backend_environment() {
+        let cmd = build_pane_command(
+            Path::new("/home/u/proj"),
+            &["opencode".to_string()],
+            &[(
+                "OPENCODE_PERMISSION".to_string(),
+                r#"{"read":"allow"}"#.to_string(),
+            )],
+        );
+        assert!(cmd.contains("OPENCODE_PERMISSION="), "missing env: {cmd}");
+        assert!(cmd.contains("opencode"), "missing backend: {cmd}");
     }
 
     #[test]
@@ -618,7 +651,10 @@ mod tests {
             None,
             &id,
             cwd,
-            &["sleep".to_string(), "60".to_string()],
+            PaneCommand {
+                argv: &["sleep".to_string(), "60".to_string()],
+                env: &[],
+            },
             80,
             24,
         )
@@ -655,7 +691,10 @@ mod tests {
             None,
             &id,
             tmp.path(),
-            &["sleep".to_string(), "60".to_string()],
+            PaneCommand {
+                argv: &["sleep".to_string(), "60".to_string()],
+                env: &[],
+            },
             80,
             24,
         )
@@ -695,7 +734,10 @@ mod tests {
             None,
             &id,
             tmp.path(),
-            &["sleep".to_string(), "60".to_string()],
+            PaneCommand {
+                argv: &["sleep".to_string(), "60".to_string()],
+                env: &[],
+            },
             80,
             24,
             &log,
