@@ -515,6 +515,118 @@ body.is-resizing-panels * {
   font-variant-numeric: tabular-nums;
 }
 
+.subagent-dock {
+  flex: none;
+  max-height: min(240px, 32dvh);
+  overflow: hidden;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.subagent-dock-header {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 30px;
+  padding: 4px 14px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-align: left;
+  text-transform: uppercase;
+}
+
+.subagent-active-count {
+  margin-left: auto;
+  color: var(--active);
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.subagent-list {
+  max-height: min(210px, calc(32dvh - 30px));
+  margin: 0;
+  padding: 2px 8px 7px;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.subagent-row {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 31px;
+  padding: 4px 7px;
+  border-radius: 4px;
+}
+
+.subagent-row:hover {
+  background: var(--surface-raised);
+}
+
+.subagent-row.subagent-nested {
+  margin-left: 17px;
+}
+
+.subagent-state {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--stopped);
+}
+
+.subagent-state-starting,
+.subagent-state-running {
+  background: var(--active);
+}
+
+.subagent-state-waiting {
+  background: var(--waiting);
+}
+
+.subagent-state-failed {
+  background: var(--danger);
+}
+
+.subagent-copy {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 7px;
+}
+
+.subagent-name,
+.subagent-role {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subagent-name {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 550;
+}
+
+.subagent-role {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.subagent-meta {
+  display: flex;
+  gap: 8px;
+  color: var(--text-faint);
+  font: 10px var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
 .term-host {
   min-height: 0;
   flex: 1;
@@ -794,6 +906,23 @@ body.is-resizing-panels * {
 
   .session-view {
     padding-bottom: 52px;
+  }
+
+  .subagent-dock-header {
+    min-height: 36px;
+    padding-inline: 10px;
+  }
+
+  .subagent-list {
+    padding-inline: 4px;
+  }
+
+  .subagent-row {
+    min-height: 38px;
+  }
+
+  .subagent-role {
+    display: none;
   }
 
   .mobile-keybar {

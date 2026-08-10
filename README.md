@@ -57,6 +57,10 @@ Re-run both build commands whenever the frontend changes. Rust-only changes requ
 
 The terminal uses standard terminal controls. Drag to select text, use the platform clipboard keys to copy or paste, and use the mouse wheel for scrollback. In an alternate-screen TUI, the mouse wheel enters tmux copy mode; press `q` to leave it.
 
+## Subagent dock
+
+When a backend exposes structured child-agent metadata, Slide shows a collapsible dock above the terminal with each descendant's name, role, state, hierarchy, and elapsed time. Codex sessions use the CLI's app-server metadata API; the snapshot is bounded and excludes prompts, tool arguments, command output, and transcript paths. Unsupported backends continue to render as ordinary terminal sessions with no empty dock.
+
 ## New session
 
 - **Name** (required) — shown in the left panel and used as the worktree folder / branch if auto-creating one.

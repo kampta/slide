@@ -1,6 +1,6 @@
 use super::pty::{self, Pty};
 use super::{CreateSessionRequest, Location, Session, SessionEvent, SessionState, SupervisorKind};
-use crate::backend::{self, BackendKind, ContextUsage};
+use crate::backend::{self, BackendKind, ContextUsage, SubagentList};
 use crate::classifier;
 use crate::config;
 use crate::git;
@@ -12,7 +12,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, Notify, RwLock};
 use tokio::task::JoinHandle;
@@ -20,8 +20,15 @@ use tokio::task::JoinHandle;
 const RING_CAP: usize = 2 * 1024 * 1024; // 2 MB per session
 const TAIL_SNIFF: usize = 4 * 1024;
 const BROADCAST_CAP: usize = 256;
+const SUBAGENT_CACHE_TTL: Duration = Duration::from_secs(3);
 const ATTACH_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const ATTACH_RETRY_MAX: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct CachedSubagents {
+    fetched_at: Instant,
+    value: SubagentList,
+}
 
 /// Bounded terminal history without the repeated 2 MB memmove caused by
 /// trimming the front of a `Vec<u8>` for every output chunk after capacity.
@@ -178,6 +185,13 @@ pub struct SessionManager {
     /// requests from spawning duplicate attach PTYs without making a slow
     /// remote operation block unrelated sessions.
     operation_locks: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// A short cache keeps several browser clients from each starting a
+    /// provider metadata query on the same polling boundary. Entries are
+    /// small (at most 50 sanitized rows) and removed with their session.
+    subagent_cache: RwLock<HashMap<String, CachedSubagents>>,
+    /// Deduplicate cache misses per session without making a slow remote
+    /// provider query block metadata requests for unrelated sessions.
+    subagent_query_locks: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl SessionManager {
@@ -191,6 +205,8 @@ impl SessionManager {
             events,
             next_client_id: AtomicU64::new(1),
             operation_locks: StdMutex::new(HashMap::new()),
+            subagent_cache: RwLock::new(HashMap::new()),
+            subagent_query_locks: StdMutex::new(HashMap::new()),
         });
 
         // Cold-start reconciliation. For Direct sessions the backend died
@@ -382,6 +398,71 @@ impl SessionManager {
         .flatten()
     }
 
+    /// Fetch a sanitized child-agent snapshot from the provider. Provider
+    /// calls are blocking subprocess I/O, so they run off Tokio's workers;
+    /// a short success cache amortizes the query across attached browsers.
+    pub async fn subagents(&self, id: &str) -> Result<SubagentList> {
+        check_id(id)?;
+        if let Some(cached) = self.subagent_cache.read().await.get(id).cloned() {
+            if cached.fetched_at.elapsed() < SUBAGENT_CACHE_TTL {
+                return Ok(cached.value);
+            }
+        }
+        let query_lock = self
+            .subagent_query_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _query_guard = query_lock.lock().await;
+        // A request that was ahead of us may have filled the cache while we
+        // waited. Recheck before starting another local process or SSH call.
+        if let Some(cached) = self.subagent_cache.read().await.get(id).cloned() {
+            if cached.fetched_at.elapsed() < SUBAGENT_CACHE_TTL {
+                return Ok(cached.value);
+            }
+        }
+
+        let session = self.find(id).await?;
+        let Some(session_id) = session.backend_session_id.clone() else {
+            return Ok(SubagentList {
+                supported: session.backend.info().subagents,
+                agents: Vec::new(),
+            });
+        };
+        let cwd = PathBuf::from(session.project_path);
+        let ssh_host = session.ssh_host.clone();
+        let backend_kind = session.backend;
+        let result = tokio::task::spawn_blocking(move || {
+            backend::for_kind(backend_kind).read_subagents(&cwd, &session_id, ssh_host.as_deref())
+        })
+        .await
+        .context("join subagent metadata query")??;
+        let value = match result {
+            Some(agents) => SubagentList {
+                supported: true,
+                agents,
+            },
+            None => SubagentList {
+                supported: false,
+                agents: Vec::new(),
+            },
+        };
+        // Deletion can run while the provider subprocess is in flight. Do
+        // not resurrect a cache entry after the owning session disappears.
+        if self.find(id).await.is_ok() {
+            self.subagent_cache.write().await.insert(
+                id.to_string(),
+                CachedSubagents {
+                    fetched_at: Instant::now(),
+                    value: value.clone(),
+                },
+            );
+        }
+        Ok(value)
+    }
+
     pub async fn write_input(&self, id: &str, bytes: &[u8]) -> Result<()> {
         check_id(id)?;
         let running = self.running.read().await;
@@ -492,6 +573,11 @@ impl SessionManager {
             tokio::task::spawn_blocking(move || git::remove_worktree(&base, &wt)).await??;
         }
         self.store.delete(id).await?;
+        self.subagent_cache.write().await.remove(id);
+        self.subagent_query_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(id);
         let _ = tokio::fs::remove_file(config::logs_dir().join(format!("{id}.log"))).await;
         self.emit(SessionEvent::SessionRemoved { id: id.to_string() });
         Ok(())

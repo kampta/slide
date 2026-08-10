@@ -7,6 +7,7 @@ export interface BackendInfo {
   id: Backend;
   label: string;
   context_usage: boolean;
+  subagents: boolean;
 }
 
 export interface SshHost {
@@ -160,6 +161,28 @@ export interface ContextUsage {
   output_tokens: number;
 }
 
+export type SubagentState =
+  | "starting"
+  | "running"
+  | "waiting"
+  | "completed"
+  | "failed";
+
+export interface Subagent {
+  id: string;
+  parent_id: string;
+  name: string | null;
+  role: string | null;
+  state: SubagentState;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface SubagentList {
+  supported: boolean;
+  agents: Subagent[];
+}
+
 export const api = {
   listSessions: () => req<Session[]>("GET", "/api/sessions"),
   listBackends: () => req<BackendInfo[]>("GET", "/api/backends"),
@@ -184,6 +207,8 @@ export const api = {
   listSshHosts: () => req<SshHost[]>("GET", "/api/ssh-hosts"),
   getContext: (id: string) =>
     req<ContextUsage | null>("GET", sessionPath(id, "/context")),
+  getSubagents: (id: string) =>
+    req<SubagentList>("GET", sessionPath(id, "/subagents")),
   getLog: async (id: string) => {
     const res = await fetch(sessionPath(id, "/log"), {
       headers: authHeaders(),

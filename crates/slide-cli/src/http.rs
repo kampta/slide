@@ -17,6 +17,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/sessions/:id/log", get(get_log))
         .route("/sessions/:id/context", get(get_context))
+        .route("/sessions/:id/subagents", get(get_subagents))
         .route("/ls", get(list_dir))
         .route("/backends", get(list_backends))
         .route("/ssh-hosts", get(list_ssh_hosts))
@@ -120,6 +121,13 @@ async fn get_context(State(state): State<AppState>, Path(id): Path<String>) -> R
     // Returns `null` when the session has no usable transcript yet — the
     // frontend treats that as "hide the chip" rather than an error.
     Json(state.manager.context_usage(&id).await).into_response()
+}
+
+async fn get_subagents(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    match state.manager.subagents(&id).await {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => server_error(&error),
+    }
 }
 
 #[derive(Deserialize)]
