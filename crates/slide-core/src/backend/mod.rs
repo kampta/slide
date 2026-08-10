@@ -182,6 +182,13 @@ pub trait Backend: Send + Sync {
         None
     }
 
+    /// Resume the newest conversation scoped to `cwd` when Slide has no
+    /// provider-native id. Used only for an existing session being relaunched,
+    /// never for a newly-created session.
+    fn resume_latest_argv(&self, _cwd: &Path) -> Option<Vec<String>> {
+        None
+    }
+
     /// Scan the backend's transcript directory on the host where it runs
     /// for the newest session file whose mtime is after `since`. Returns
     /// the file's session id (its stem), or `None` if no matching file

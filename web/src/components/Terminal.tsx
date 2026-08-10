@@ -16,6 +16,7 @@ import { useIsMobile } from "../hooks/useMediaQuery";
 import {
   attachMouseSelection,
   attachTouchNavigation,
+  clipboardAction,
 } from "./terminalInteractions";
 
 /// Imperative handle exposed via forwardRef so the parent (and the
@@ -90,20 +91,15 @@ export const TerminalView = forwardRef<
     // default processing for that one event.
     const isMac = navigator.platform.toUpperCase().includes("MAC");
     term.attachCustomKeyEventHandler((e) => {
-      if (e.type !== "keydown") return true;
-      const mod = isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && e.shiftKey;
-      if (!mod) return true;
-      const key = e.key.toLowerCase();
-      if (key === "c" && term.hasSelection()) {
+      const action = clipboardAction(e, isMac, term.hasSelection());
+      if (action === "copy") {
         navigator.clipboard.writeText(term.getSelection()).catch(() => {});
         return false;
       }
-      if (key === "v") {
-        navigator.clipboard
-          .readText()
-          // term.paste fires onData → WebSocket, identical to typing.
-          .then((text) => term.paste(text))
-          .catch(() => {});
+      if (action === "native-paste") {
+        // The browser dispatches a paste event after this keydown and xterm
+        // forwards that clipboard payload through onData. Manually calling
+        // readText() + term.paste() here sends the same text a second time.
         return false;
       }
       return true;

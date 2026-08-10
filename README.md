@@ -55,6 +55,8 @@ For access from another device, run `./target/release/slide serve --lan`, then u
 
 Re-run both build commands whenever the frontend changes. Rust-only changes require only the Cargo build.
 
+Restarting the Slide daemon reattaches existing tmux-backed agents; it does not relaunch them. After changing backend launch options, use Stop and then Resume on an existing session to start that backend with the new options.
+
 ## Terminal interaction
 
 The terminal uses standard terminal controls. Drag to select text, use the platform clipboard keys to copy or paste, and use the mouse wheel for scrollback. In an alternate-screen TUI, the mouse wheel enters tmux copy mode; press `q` to leave it.
