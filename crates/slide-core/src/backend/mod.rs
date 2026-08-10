@@ -1,10 +1,12 @@
 use crate::classifier::Signals;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::SystemTime;
 
 mod claude;
 mod codex;
+mod codex_subagents;
 
 pub use claude::ClaudeBackend;
 pub use codex::CodexBackend;
@@ -24,6 +26,38 @@ pub struct ContextUsage {
     pub output_tokens: u64,
 }
 
+/// A privacy-bounded view of a backend child agent. Provider prompts, tool
+/// arguments, command output, and transcript paths deliberately never cross
+/// this boundary; the dock only needs identity, hierarchy, and lifecycle.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SubagentSnapshot {
+    pub id: String,
+    pub parent_id: String,
+    pub name: Option<String>,
+    pub role: Option<String>,
+    pub state: SubagentState,
+    /// Unix timestamp in seconds, matching the provider's thread metadata.
+    pub created_at: i64,
+    /// Unix timestamp in seconds, matching the provider's thread metadata.
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentState {
+    Starting,
+    Running,
+    Waiting,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SubagentList {
+    pub supported: bool,
+    pub agents: Vec<SubagentSnapshot>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendKind {
@@ -36,6 +70,7 @@ pub struct BackendInfo {
     pub id: BackendKind,
     pub label: &'static str,
     pub context_usage: bool,
+    pub subagents: bool,
 }
 
 impl BackendKind {
@@ -63,11 +98,13 @@ impl BackendKind {
                 id: self,
                 label: "Claude",
                 context_usage: true,
+                subagents: false,
             },
             Self::Codex => BackendInfo {
                 id: self,
                 label: "Codex",
                 context_usage: false,
+                subagents: true,
             },
         }
     }
@@ -112,6 +149,19 @@ pub trait Backend: Send + Sync {
     /// hasn't been discovered yet, or no assistant turn has been recorded.
     fn read_context_usage(&self, _cwd: &Path, _session_id: &str) -> Option<ContextUsage> {
         None
+    }
+
+    /// Return a bounded, sanitized snapshot of descendants spawned by this
+    /// backend session. `ssh_host` is present when the provider and its
+    /// metadata live on a remote Slide host. Backends without a structured
+    /// child-agent API return `Ok(None)` so the frontend can hide the dock.
+    fn read_subagents(
+        &self,
+        _cwd: &Path,
+        _session_id: &str,
+        _ssh_host: Option<&str>,
+    ) -> Result<Option<Vec<SubagentSnapshot>>> {
+        Ok(None)
     }
 }
 

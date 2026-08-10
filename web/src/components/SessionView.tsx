@@ -5,6 +5,7 @@ import type { TerminalHandle } from "./Terminal";
 import { MobileKeyBar } from "./MobileKeyBar";
 import { useIsMobile } from "../hooks/useMediaQuery";
 import { SessionPath, sessionDisplayPath } from "./SessionPath";
+import { SubagentDock } from "./SubagentDock";
 
 const TerminalView = lazy(() =>
   import("./Terminal").then((module) => ({ default: module.TerminalView })),
@@ -190,6 +191,13 @@ export function SessionView() {
           </button>
         </div>
       </header>
+      {session.backend_session_id && (
+        <SubagentDock
+          sessionId={session.id}
+          rootThreadId={session.backend_session_id}
+          live={isRunning}
+        />
+      )}
       <Suspense fallback={<div className="term-host terminal-loading">Loading terminal…</div>}>
         <TerminalView ref={termRef} sessionId={session.id} live={isRunning} />
       </Suspense>

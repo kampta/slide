@@ -1,5 +1,6 @@
-use super::{Backend, BackendKind};
+use super::{codex_subagents, Backend, BackendKind, SubagentSnapshot};
 use crate::classifier::Signals;
+use anyhow::Result;
 use regex::Regex;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -151,6 +152,15 @@ impl Backend for CodexBackend {
     fn discover_session_id(&self, cwd: &Path, since: SystemTime) -> Option<String> {
         let root = transcript_root()?;
         discover_session_id_in(&root, cwd, since)
+    }
+
+    fn read_subagents(
+        &self,
+        _cwd: &Path,
+        session_id: &str,
+        ssh_host: Option<&str>,
+    ) -> Result<Option<Vec<SubagentSnapshot>>> {
+        codex_subagents::query(session_id, ssh_host).map(Some)
     }
 }
 
