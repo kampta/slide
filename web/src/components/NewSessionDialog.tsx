@@ -211,7 +211,7 @@ export function NewSessionDialog({
         </fieldset>
         <fieldset className="form-field">
           <legend>Backend</legend>
-          <div className="btn-group">
+          <div className="btn-group btn-group-wrap">
             {backends.map((item) => (
               <button
                 key={item.id}

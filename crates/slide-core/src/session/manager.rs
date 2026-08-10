@@ -20,6 +20,8 @@ use tokio::task::JoinHandle;
 const RING_CAP: usize = 2 * 1024 * 1024; // 2 MB per session
 const TAIL_SNIFF: usize = 4 * 1024;
 const BROADCAST_CAP: usize = 256;
+const ATTACH_RETRY_INITIAL: Duration = Duration::from_secs(1);
+const ATTACH_RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// Bounded terminal history without the repeated 2 MB memmove caused by
 /// trimming the front of a `Vec<u8>` for every output chunk after capacity.
@@ -100,6 +102,26 @@ fn remove_if_current<T>(map: &mut HashMap<String, Arc<T>>, id: &str, expected: &
         map.remove(id);
     }
     is_current
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TmuxExitAction {
+    Reattach,
+    Stop,
+    Retry,
+}
+
+/// Losing a tmux *client* is not the same thing as losing the backend that
+/// tmux owns. Remote sessions hit this whenever their SSH transport blips;
+/// local sessions can hit it when an attach client is detached. Only tmux
+/// confirming that the named session is absent is authoritative evidence
+/// that the backend stopped.
+fn tmux_exit_action(probe: crate::tmux::SessionProbe) -> TmuxExitAction {
+    match probe {
+        crate::tmux::SessionProbe::Present => TmuxExitAction::Reattach,
+        crate::tmux::SessionProbe::Absent => TmuxExitAction::Stop,
+        crate::tmux::SessionProbe::Unreachable => TmuxExitAction::Retry,
+    }
 }
 
 struct Running {
@@ -727,6 +749,136 @@ impl SessionManager {
         }
     }
 
+    /// Handle termination of the daemon-owned child process. For direct
+    /// supervision that child *is* the backend, so its exit is terminal. For
+    /// tmux supervision it is only an attach client (`tmux attach`, or
+    /// `ssh -t host tmux attach`); probe the independently-owned tmux session
+    /// before deciding whether the backend stopped.
+    async fn handle_child_exit(
+        self: &Arc<Self>,
+        id: String,
+        running: Arc<Running>,
+        code: Option<i32>,
+    ) {
+        let operation = self.operation_lock(&id);
+        let guard = operation.lock().await;
+        let removed_current = {
+            let mut running_map = self.running.write().await;
+            remove_if_current(&mut running_map, &id, &running)
+        };
+        // A stopped session can be resumed before its old PTY exit is
+        // delivered. That stale watcher must not stop or reconnect over the
+        // replacement.
+        if !removed_current {
+            return;
+        }
+        // Release the old broadcast sender/classifier immediately. This
+        // closes the terminal WebSocket so the frontend enters its existing
+        // reconnect loop instead of remaining attached to a dead PTY while
+        // transport recovery runs in the background.
+        drop(running);
+
+        let session = match self.find(&id).await {
+            Ok(session) => session,
+            Err(_) => return,
+        };
+        if !matches!(session.supervisor, SupervisorKind::Tmux) {
+            self.mark_exited(&id, code).await;
+            return;
+        }
+
+        // Let explicit stop/delete/resume acquire the lifecycle lock while
+        // the transport is down. Recovery re-checks both persisted state and
+        // the running map under the same lock before every attempt.
+        drop(guard);
+        self.recover_tmux_attachment(id, code).await;
+    }
+
+    async fn mark_exited(&self, id: &str, code: Option<i32>) {
+        let _ = self
+            .store
+            .update_state(id, SessionState::Stopped, now_ms())
+            .await;
+        self.emit(SessionEvent::SessionExit {
+            id: id.to_string(),
+            code,
+        });
+        self.emit(SessionEvent::SessionState {
+            id: id.to_string(),
+            state: SessionState::Stopped,
+        });
+    }
+
+    /// Reattach a daemon PTY to a tmux-owned backend after the prior local
+    /// attach process exits. Retries indefinitely with bounded exponential
+    /// backoff while the host is unreachable; a transient VPN/SSH outage
+    /// must not turn a healthy remote backend into a Stopped session.
+    async fn recover_tmux_attachment(self: &Arc<Self>, id: String, code: Option<i32>) {
+        let mut delay = ATTACH_RETRY_INITIAL;
+        tokio::time::sleep(delay).await;
+
+        loop {
+            let operation = self.operation_lock(&id);
+            let guard = operation.lock().await;
+
+            // A manual resume may have won the race while we slept.
+            if self.running.read().await.contains_key(&id) {
+                return;
+            }
+            let session = match self.find(&id).await {
+                Ok(session) if !matches!(session.state, SessionState::Stopped) => session,
+                _ => return, // explicitly stopped or deleted
+            };
+
+            let host = session.ssh_host.clone();
+            let probe_id = id.clone();
+            let probe = tokio::task::spawn_blocking(move || {
+                crate::tmux::has_session(host.as_deref(), &probe_id)
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(crate::tmux::SessionProbe::Unreachable);
+
+            match tmux_exit_action(probe) {
+                TmuxExitAction::Reattach => match self.spawn_process(&session).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            session = %id,
+                            host = ?session.ssh_host,
+                            "reattached after tmux client exited",
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            session = %id,
+                            host = ?session.ssh_host,
+                            error = %format!("{error:#}"),
+                            "tmux session is alive but reattach failed; retrying",
+                        );
+                    }
+                },
+                TmuxExitAction::Stop => {
+                    self.mark_exited(&id, code).await;
+                    return;
+                }
+                TmuxExitAction::Retry => {
+                    tracing::warn!(
+                        session = %id,
+                        host = ?session.ssh_host,
+                        retry_seconds = delay.as_secs(),
+                        "host unreachable after tmux client exited; retrying attachment",
+                    );
+                }
+            }
+
+            drop(guard);
+            tokio::time::sleep(delay).await;
+            delay = std::cmp::min(delay * 2, ATTACH_RETRY_MAX);
+        }
+    }
+
     /// Best-effort drain on graceful daemon shutdown. Direct-supervised
     /// children are explicitly killed — without that they outlive us as
     /// orphans parented to PID 1 when the daemon is started without a
@@ -746,174 +898,170 @@ impl SessionManager {
         }
     }
 
-    async fn spawn_process(self: &Arc<Self>, session: &Session) -> Result<()> {
-        let backend = backend::for_kind(session.backend);
-        // Step 1: build the backend argv and the cwd *on the host that runs
-        // the backend*. The supervisor is responsible for wrapping this in
-        // whatever transport is needed (direct exec, tmux, ssh+tmux).
-        let host_cwd = PathBuf::from(&session.project_path);
-        // If we've previously discovered the backend's native session id
-        // and this backend supports resume (e.g. `claude --resume <id>`),
-        // prefer that argv so a fresh tmux invocation continues the same
-        // conversation rather than starting over.
-        let backend_argv = session
-            .backend_session_id
-            .as_deref()
-            .and_then(|sid| backend.resume_argv(&host_cwd, sid))
-            .unwrap_or_else(|| backend.argv(&host_cwd));
+    /// Boxed because the exit watcher can recover a tmux attachment by
+    /// spawning its replacement, which installs another exit watcher. Type
+    /// erasure breaks that recursive async-future type while retaining the
+    /// `Send` guarantee required by `tokio::spawn`.
+    fn spawn_process<'a>(
+        self: &'a Arc<Self>,
+        session: &'a Session,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let backend = backend::for_kind(session.backend);
+            // Step 1: build the backend argv and the cwd *on the host that runs
+            // the backend*. The supervisor is responsible for wrapping this in
+            // whatever transport is needed (direct exec, tmux, ssh+tmux).
+            let host_cwd = PathBuf::from(&session.project_path);
+            // If we've previously discovered the backend's native session id
+            // and this backend supports resume (e.g. `claude --resume <id>`),
+            // prefer that argv so a fresh tmux invocation continues the same
+            // conversation rather than starting over.
+            let backend_argv = session
+                .backend_session_id
+                .as_deref()
+                .and_then(|sid| backend.resume_argv(&host_cwd, sid))
+                .unwrap_or_else(|| backend.argv(&host_cwd));
+            let backend_env = backend.env();
 
-        if matches!(session.location, Location::Remote) && session.ssh_host.is_none() {
-            bail!("remote session missing ssh_host");
-        }
-
-        // Step 2: hand the backend to its supervisor. For Direct this is a
-        // no-op that returns the argv back; for Tmux this creates (or
-        // reattaches to) the tmux session, locally or over SSH, and
-        // returns the attach argv for our local PTY to run.
-        let log_path = session
-            .host_log_path
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| config::logs_dir().join(format!("{}.log", session.id)));
-        let sup = supervisor::for_session(session);
-        let spawn_req = SpawnReq {
-            id: session.id.clone(),
-            argv: backend_argv,
-            cwd: host_cwd.clone(),
-            log_path: log_path.clone(),
-            cols: DEFAULT_COLS,
-            rows: DEFAULT_ROWS,
-        };
-        let handoff = sup.spawn(&spawn_req).await?;
-
-        // Step 3: open a local PTY for the attach process. For Direct this
-        // is just the backend itself; for Tmux it's `tmux attach-session`.
-        let spawned = pty::spawn(&handoff.attach_argv, &handoff.attach_cwd).with_context(|| {
-            format!(
-                "spawn {} in {}",
-                handoff.attach_argv.join(" "),
-                handoff.attach_cwd.display()
-            )
-        })?;
-        let writes_log = handoff.writes_log;
-        let (output_tx, _) = broadcast::channel(BROADCAST_CAP);
-        let ring = Arc::new(tokio::sync::Mutex::new(ByteRing::new()));
-        let last_activity = Arc::new(AtomicI64::new(now_ms()));
-        let activity_notify = Arc::new(Notify::new());
-
-        // Per-session classifier task. Runs only while this Running entry
-        // is in the map; aborted via `Running::Drop` when the session is
-        // stopped, killed, or the daemon shuts down.
-        let classifier_handle = tokio::spawn(classifier_task(ClassifierCtx {
-            mgr: self.clone(),
-            id: session.id.clone(),
-            backend_kind: session.backend,
-            supervisor: session.supervisor,
-            ssh_host: session.ssh_host.clone(),
-            initial_state: session.state,
-            last_activity: last_activity.clone(),
-            activity_notify: activity_notify.clone(),
-            ring: ring.clone(),
-        }));
-
-        let running = Arc::new(Running {
-            pty: spawned.pty,
-            output_tx: output_tx.clone(),
-            ring: ring.clone(),
-            classifier_handle,
-            client_sizes: tokio::sync::Mutex::new(HashMap::new()),
-        });
-        self.running
-            .write()
-            .await
-            .insert(session.id.clone(), running.clone());
-
-        // Log file writer — only when the supervisor isn't doing it for us.
-        // Tmux's pipe-pane writes the same log_path on the host, so a daemon
-        // writer would double-count.
-        let log_file = if matches!(writes_log, WritesLog::Daemon) {
-            tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-                .await
-                .ok()
-        } else {
-            None
-        };
-
-        // Reader task: pumps PTY bytes into the ring buffer, log file, and
-        // per-session broadcast. PTY output never enters the global events
-        // bus — that channel is for low-volume lifecycle metadata only —
-        // so /ws/events stays cheap regardless of how chatty a backend is.
-        let mut output = spawned.output;
-        tokio::spawn(async move {
-            let mut log_file = log_file;
-            while let Some(chunk) = output.recv().await {
-                last_activity.store(now_ms(), Ordering::SeqCst);
-                // Append to ring AND broadcast under the same lock so that
-                // `subscribe_output_with_snapshot` is atomic w.r.t. live
-                // bytes: a subscriber that snapshots the ring and creates a
-                // broadcast receiver while holding this same lock will see
-                // every chunk exactly once with no gap and no duplicate.
-                {
-                    let mut ring = ring.lock().await;
-                    ring.push(&chunk);
-                    // Bytes::clone is a refcount bump; broadcast subscribers
-                    // share one allocation with the channel's own slot.
-                    let _ = output_tx.send(chunk.clone());
-                }
-                if let Some(f) = log_file.as_mut() {
-                    let _ = f.write_all(&chunk).await;
-                }
-                // Wake the classifier. notify_one is a single permit, so a
-                // burst of chunks coalesces into one wakeup — exactly the
-                // debouncing the classifier relies on to avoid running its
-                // (potentially SSH-bound) pane capture per chunk.
-                activity_notify.notify_one();
+            if matches!(session.location, Location::Remote) && session.ssh_host.is_none() {
+                bail!("remote session missing ssh_host");
             }
-        });
 
-        // Exit watcher.
-        let id2 = session.id.clone();
-        let mgr2 = self.clone();
-        tokio::spawn(async move {
-            let code = spawned.exit.await.ok().flatten();
-            let operation = mgr2.operation_lock(&id2);
-            let _guard = operation.lock().await;
-            let removed_current = {
-                let mut running_map = mgr2.running.write().await;
-                remove_if_current(&mut running_map, &id2, &running)
+            // Step 2: hand the backend to its supervisor. For Direct this is a
+            // no-op that returns the argv back; for Tmux this creates (or
+            // reattaches to) the tmux session, locally or over SSH, and
+            // returns the attach argv for our local PTY to run.
+            let log_path = session
+                .host_log_path
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| config::logs_dir().join(format!("{}.log", session.id)));
+            let sup = supervisor::for_session(session);
+            let spawn_req = SpawnReq {
+                id: session.id.clone(),
+                argv: backend_argv,
+                env: backend_env,
+                cwd: host_cwd.clone(),
+                log_path: log_path.clone(),
+                cols: DEFAULT_COLS,
+                rows: DEFAULT_ROWS,
             };
-            // A stopped session can be resumed before its old PTY exit is
-            // delivered. That stale watcher must not stop the replacement.
-            if !removed_current {
-                return;
+            let handoff = sup.spawn(&spawn_req).await?;
+
+            // Step 3: open a local PTY for the attach process. For Direct this
+            // is just the backend itself; for Tmux it's `tmux attach-session`.
+            let spawned = pty::spawn(
+                &handoff.attach_argv,
+                &handoff.attach_cwd,
+                &handoff.attach_env,
+            )
+            .with_context(|| {
+                format!(
+                    "spawn {} in {}",
+                    handoff.attach_argv.join(" "),
+                    handoff.attach_cwd.display()
+                )
+            })?;
+            let writes_log = handoff.writes_log;
+            let (output_tx, _) = broadcast::channel(BROADCAST_CAP);
+            let ring = Arc::new(tokio::sync::Mutex::new(ByteRing::new()));
+            let last_activity = Arc::new(AtomicI64::new(now_ms()));
+            let activity_notify = Arc::new(Notify::new());
+
+            // Per-session classifier task. Runs only while this Running entry
+            // is in the map; aborted via `Running::Drop` when the session is
+            // stopped, killed, or the daemon shuts down.
+            let classifier_handle = tokio::spawn(classifier_task(ClassifierCtx {
+                mgr: self.clone(),
+                id: session.id.clone(),
+                backend_kind: session.backend,
+                supervisor: session.supervisor,
+                ssh_host: session.ssh_host.clone(),
+                initial_state: session.state,
+                last_activity: last_activity.clone(),
+                activity_notify: activity_notify.clone(),
+                ring: ring.clone(),
+            }));
+
+            let running = Arc::new(Running {
+                pty: spawned.pty,
+                output_tx: output_tx.clone(),
+                ring: ring.clone(),
+                classifier_handle,
+                client_sizes: tokio::sync::Mutex::new(HashMap::new()),
+            });
+            self.running
+                .write()
+                .await
+                .insert(session.id.clone(), running.clone());
+
+            // Log file writer — only when the supervisor isn't doing it for us.
+            // Tmux's pipe-pane writes the same log_path on the host, so a daemon
+            // writer would double-count.
+            let log_file = if matches!(writes_log, WritesLog::Daemon) {
+                tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+
+            // Reader task: pumps PTY bytes into the ring buffer, log file, and
+            // per-session broadcast. PTY output never enters the global events
+            // bus — that channel is for low-volume lifecycle metadata only —
+            // so /ws/events stays cheap regardless of how chatty a backend is.
+            let mut output = spawned.output;
+            tokio::spawn(async move {
+                let mut log_file = log_file;
+                while let Some(chunk) = output.recv().await {
+                    last_activity.store(now_ms(), Ordering::SeqCst);
+                    // Append to ring AND broadcast under the same lock so that
+                    // `subscribe_output_with_snapshot` is atomic w.r.t. live
+                    // bytes: a subscriber that snapshots the ring and creates a
+                    // broadcast receiver while holding this same lock will see
+                    // every chunk exactly once with no gap and no duplicate.
+                    {
+                        let mut ring = ring.lock().await;
+                        ring.push(&chunk);
+                        // Bytes::clone is a refcount bump; broadcast subscribers
+                        // share one allocation with the channel's own slot.
+                        let _ = output_tx.send(chunk.clone());
+                    }
+                    if let Some(f) = log_file.as_mut() {
+                        let _ = f.write_all(&chunk).await;
+                    }
+                    // Wake the classifier. notify_one is a single permit, so a
+                    // burst of chunks coalesces into one wakeup — exactly the
+                    // debouncing the classifier relies on to avoid running its
+                    // (potentially SSH-bound) pane capture per chunk.
+                    activity_notify.notify_one();
+                }
+            });
+
+            // Exit watcher. Under tmux, `spawned` is only the local attach
+            // client; its exit may be a recoverable SSH transport loss rather
+            // than the backend exiting.
+            let id2 = session.id.clone();
+            let mgr2 = self.clone();
+            tokio::spawn(async move {
+                let code = spawned.exit.await.ok().flatten();
+                mgr2.handle_child_exit(id2, running, code).await;
+            });
+
+            // Discover the backend's native session id so we can `--resume`
+            // it if the supervisor is gone next time (remote reboot, user
+            // killed the tmux session). Only runs for local sessions today —
+            // remote discovery would need to scan the remote filesystem over
+            // SSH, which we defer.
+            if matches!(session.location, Location::Local) && session.backend_session_id.is_none() {
+                self.spawn_session_id_discovery(session);
             }
-            let _ = mgr2
-                .store
-                .update_state(&id2, SessionState::Stopped, now_ms())
-                .await;
-            mgr2.emit(SessionEvent::SessionExit {
-                id: id2.clone(),
-                code,
-            });
-            mgr2.emit(SessionEvent::SessionState {
-                id: id2,
-                state: SessionState::Stopped,
-            });
-        });
 
-        // Discover the backend's native session id so we can `--resume`
-        // it if the supervisor is gone next time (remote reboot, user
-        // killed the tmux session). Only runs for local sessions today —
-        // remote discovery would need to scan the remote filesystem over
-        // SSH, which we defer.
-        if matches!(session.location, Location::Local) && session.backend_session_id.is_none() {
-            self.spawn_session_id_discovery(session);
-        }
-
-        Ok(())
+            Ok(())
+        })
     }
 
     fn spawn_session_id_discovery(self: &Arc<Self>, session: &Session) {
@@ -1115,7 +1263,11 @@ fn strip_ansi(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_min_size, remove_if_current, strip_ansi, valid_id, ByteRing, RING_CAP};
+    use super::{
+        effective_min_size, remove_if_current, strip_ansi, tmux_exit_action, valid_id, ByteRing,
+        TmuxExitAction, RING_CAP,
+    };
+    use crate::tmux::SessionProbe;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -1202,6 +1354,27 @@ mod tests {
         assert!(Arc::ptr_eq(running.get("session").unwrap(), &replacement));
         assert!(remove_if_current(&mut running, "session", &replacement));
         assert!(!running.contains_key("session"));
+    }
+
+    #[test]
+    fn live_tmux_backend_is_reattached_after_client_exit() {
+        assert_eq!(
+            tmux_exit_action(SessionProbe::Present),
+            TmuxExitAction::Reattach,
+        );
+    }
+
+    #[test]
+    fn absent_tmux_backend_is_stopped_after_client_exit() {
+        assert_eq!(tmux_exit_action(SessionProbe::Absent), TmuxExitAction::Stop,);
+    }
+
+    #[test]
+    fn unreachable_tmux_host_is_retried_after_client_exit() {
+        assert_eq!(
+            tmux_exit_action(SessionProbe::Unreachable),
+            TmuxExitAction::Retry,
+        );
     }
 
     #[test]

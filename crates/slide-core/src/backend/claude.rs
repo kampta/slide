@@ -22,6 +22,10 @@ impl ClaudeBackend {
     }
 }
 
+fn argv_with_permissions() -> Vec<String> {
+    vec!["claude".into(), "--dangerously-skip-permissions".into()]
+}
+
 /// Patterns observed from `tmux capture-pane -p` against a live Claude
 /// Code session. Working hint is the bottom-row "esc to interrupt" label;
 /// idle hints are the default `? for shortcuts` plus the three `⏵⏵`
@@ -149,7 +153,7 @@ impl Backend for ClaudeBackend {
     }
 
     fn argv(&self, _cwd: &Path) -> Vec<String> {
-        vec!["claude".into(), "--dangerously-skip-permissions".into()]
+        argv_with_permissions()
     }
 
     fn signals(&self) -> &'static Signals {
@@ -157,12 +161,9 @@ impl Backend for ClaudeBackend {
     }
 
     fn resume_argv(&self, _cwd: &Path, session_id: &str) -> Option<Vec<String>> {
-        Some(vec![
-            "claude".into(),
-            "--dangerously-skip-permissions".into(),
-            "--resume".into(),
-            session_id.into(),
-        ])
+        let mut argv = argv_with_permissions();
+        argv.extend(["--resume".into(), session_id.into()]);
+        Some(argv)
     }
 
     fn read_context_usage(&self, cwd: &Path, session_id: &str) -> Option<ContextUsage> {

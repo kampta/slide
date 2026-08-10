@@ -22,6 +22,13 @@ impl CodexBackend {
     }
 }
 
+fn argv_with_permissions() -> Vec<String> {
+    vec![
+        "codex".into(),
+        "--dangerously-bypass-approvals-and-sandbox".into(),
+    ]
+}
+
 /// Classification patterns for codex-cli. The v0.124 prompt is a `›`
 /// followed by placeholder hint text (e.g. `› Write tests for @filename`);
 /// older builds drew `user>`, `>`, or `▌`. All kept so mixed versions
@@ -137,10 +144,7 @@ impl Backend for CodexBackend {
     }
 
     fn argv(&self, _cwd: &Path) -> Vec<String> {
-        vec![
-            "codex".into(),
-            "--dangerously-bypass-approvals-and-sandbox".into(),
-        ]
+        argv_with_permissions()
     }
 
     fn signals(&self) -> &'static Signals {
@@ -148,12 +152,9 @@ impl Backend for CodexBackend {
     }
 
     fn resume_argv(&self, _cwd: &Path, session_id: &str) -> Option<Vec<String>> {
-        Some(vec![
-            "codex".into(),
-            "--dangerously-bypass-approvals-and-sandbox".into(),
-            "resume".into(),
-            session_id.into(),
-        ])
+        let mut argv = argv_with_permissions();
+        argv.extend(["resume".into(), session_id.into()]);
+        Some(argv)
     }
 
     fn discover_session_id(&self, cwd: &Path, since: SystemTime) -> Option<String> {
