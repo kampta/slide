@@ -7,6 +7,7 @@ pub mod ssh;
 pub mod store;
 pub mod supervisor;
 pub mod tmux;
+pub mod turn_diff;
 
 pub use session::manager::SessionManager;
 pub use session::{CreateSessionRequest, Session, SessionEvent, SessionState};

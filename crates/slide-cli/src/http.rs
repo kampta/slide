@@ -18,6 +18,8 @@ pub fn routes() -> Router<AppState> {
         .route("/sessions/:id/log", get(get_log))
         .route("/sessions/:id/context", get(get_context))
         .route("/sessions/:id/subagents", get(get_subagents))
+        .route("/sessions/:id/turn-diffs", get(list_turn_diffs))
+        .route("/sessions/:id/turn-diffs/:turn_diff_id", get(get_turn_diff))
         .route("/ls", get(list_dir))
         .route("/backends", get(list_backends))
         .route("/ssh-hosts", get(list_ssh_hosts))
@@ -126,6 +128,28 @@ async fn get_context(State(state): State<AppState>, Path(id): Path<String>) -> R
 async fn get_subagents(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     match state.manager.subagents(&id).await {
         Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn list_turn_diffs(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    match state.manager.turn_diffs(&id).await {
+        Ok(turns) => Json(turns).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn get_turn_diff(
+    State(state): State<AppState>,
+    Path((id, turn_diff_id)): Path<(String, i64)>,
+) -> Response {
+    match state.manager.turn_diff(&id, turn_diff_id).await {
+        Ok(Some(turn)) => Json(turn).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "turn diff not found" })),
+        )
+            .into_response(),
         Err(error) => server_error(&error),
     }
 }

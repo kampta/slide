@@ -6,6 +6,7 @@ use crate::config;
 use crate::git;
 use crate::store::Store;
 use crate::supervisor::{self, SpawnReq, WritesLog};
+use crate::turn_diff::{self, RepoTarget, TurnDiff, TurnDiffSummary};
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
@@ -14,7 +15,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{broadcast, Notify, RwLock};
+use tokio::sync::{broadcast, mpsc, Notify, RwLock};
 use tokio::task::JoinHandle;
 
 const RING_CAP: usize = 2 * 1024 * 1024; // 2 MB per session
@@ -28,6 +29,16 @@ const ATTACH_RETRY_MAX: Duration = Duration::from_secs(30);
 struct CachedSubagents {
     fetched_at: Instant,
     value: SubagentList,
+}
+
+enum TurnBoundary {
+    Started { at: i64, record_empty: bool },
+    Completed { at: i64 },
+}
+
+struct TurnDiffWorker {
+    sender: mpsc::UnboundedSender<TurnBoundary>,
+    handle: JoinHandle<()>,
 }
 
 /// Bounded terminal history without the repeated 2 MB memmove caused by
@@ -192,6 +203,11 @@ pub struct SessionManager {
     /// Deduplicate cache misses per session without making a slow remote
     /// provider query block metadata requests for unrelated sessions.
     subagent_query_locks: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// One ordered, non-blocking boundary queue per running conversation.
+    /// Workers own the Git/SSH and SQLite work off the terminal/classifier
+    /// paths; keeping the sender here lets a tracker survive a tmux attach
+    /// transport reconnect without combining two turns.
+    turn_diff_workers: StdMutex<HashMap<String, TurnDiffWorker>>,
 }
 
 impl SessionManager {
@@ -207,6 +223,7 @@ impl SessionManager {
             operation_locks: StdMutex::new(HashMap::new()),
             subagent_cache: RwLock::new(HashMap::new()),
             subagent_query_locks: StdMutex::new(HashMap::new()),
+            turn_diff_workers: StdMutex::new(HashMap::new()),
         });
 
         // Cold-start reconciliation. For Direct sessions the backend died
@@ -463,8 +480,110 @@ impl SessionManager {
         Ok(value)
     }
 
+    pub async fn turn_diffs(&self, id: &str) -> Result<Vec<TurnDiffSummary>> {
+        check_id(id)?;
+        self.store.list_turn_diffs(id).await
+    }
+
+    pub async fn turn_diff(&self, id: &str, turn_diff_id: i64) -> Result<Option<TurnDiff>> {
+        check_id(id)?;
+        self.store.get_turn_diff(id, turn_diff_id).await
+    }
+
+    fn ensure_turn_diff_worker(
+        self: &Arc<Self>,
+        session: &Session,
+    ) -> mpsc::UnboundedSender<TurnBoundary> {
+        let mut workers = self
+            .turn_diff_workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(worker) = workers.get(&session.id) {
+            if !worker.sender.is_closed() && !worker.handle.is_finished() {
+                return worker.sender.clone();
+            }
+            if let Some(stale) = workers.remove(&session.id) {
+                stale.handle.abort();
+            }
+        }
+
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let store = self.store.clone();
+        let id = session.id.clone();
+        let target = RepoTarget {
+            path: PathBuf::from(&session.project_path),
+            ssh_host: session.ssh_host.clone(),
+        };
+        let handle = tokio::spawn(turn_diff_worker(store, id, target, receiver));
+        workers.insert(
+            session.id.clone(),
+            TurnDiffWorker {
+                sender: sender.clone(),
+                handle,
+            },
+        );
+        drop(workers);
+        // Backend startup eventually settles on an empty prompt. Do not
+        // persist that bootstrap as a zero-change user turn; later Active
+        // boundaries do record empty turns so ordinals remain truthful.
+        let _ = sender.send(TurnBoundary::Started {
+            at: now_ms(),
+            record_empty: false,
+        });
+        sender
+    }
+
+    async fn complete_turn_diff_worker(&self, id: &str) {
+        let worker = self
+            .turn_diff_workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(id);
+        if let Some(worker) = worker {
+            let _ = worker.sender.send(TurnBoundary::Completed { at: now_ms() });
+            drop(worker.sender);
+            // A completed worker must not race a subsequent delete/resume or
+            // assign its ordinal after the next turn. Boundary work is rare
+            // and command-bounded; wait for its ordered queue to drain.
+            let _ = worker.handle.await;
+        }
+    }
+
+    async fn discard_turn_diff_worker(&self, id: &str) {
+        let worker = self
+            .turn_diff_workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(id);
+        if let Some(worker) = worker {
+            drop(worker.sender);
+            // Used by deletion before removing an owned worktree. Awaiting
+            // guarantees no private-index Git process is still reading it.
+            let _ = worker.handle.await;
+        }
+    }
+
     pub async fn write_input(&self, id: &str, bytes: &[u8]) -> Result<()> {
         check_id(id)?;
+        // A submitted terminal line is the earliest backend-neutral turn
+        // boundary we can observe. Queue the baseline before the PTY sees
+        // Enter; the later Waiting→Active classifier transition is treated
+        // as a duplicate by the worker. This closes the race where a very
+        // fast agent edits a file before its first output bytes arrive.
+        if bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n')) {
+            let sender = self
+                .turn_diff_workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(id)
+                .map(|worker| worker.sender.clone());
+            if let Some(sender) = sender {
+                let _ = sender.send(TurnBoundary::Started {
+                    at: now_ms(),
+                    record_empty: true,
+                });
+            }
+        }
         let running = self.running.read().await;
         let r = running.get(id).context("session not running")?;
         r.pty.write(bytes)?;
@@ -548,6 +667,7 @@ impl SessionManager {
         let s = self.find(id).await?;
         supervisor::for_session(&s).teardown(id).await?;
         self.kill_running(id).await;
+        self.complete_turn_diff_worker(id).await;
         self.store
             .update_state(id, SessionState::Stopped, now_ms())
             .await?;
@@ -567,6 +687,7 @@ impl SessionManager {
         // a remote tmux session is still alive would orphan the backend.
         supervisor::for_session(&session).teardown(id).await?;
         self.kill_running(id).await;
+        self.discard_turn_diff_worker(id).await;
         if session.worktree {
             let base = PathBuf::from(&session.base_dir);
             let wt = PathBuf::from(&session.project_path);
@@ -670,6 +791,7 @@ impl SessionManager {
             // on every WS attach. Also drop the worktree we just created so
             // retrying with the same name isn't blocked by a stale dir.
             let _ = self.store.delete(&session.id).await;
+            self.discard_turn_diff_worker(&session.id).await;
             if worktree_owned {
                 let base = base.clone();
                 let worktree = PathBuf::from(&session.project_path);
@@ -809,6 +931,7 @@ impl SessionManager {
                 .store
                 .update_state(id, SessionState::Stopped, now_ms())
                 .await;
+            self.discard_turn_diff_worker(id).await;
             self.emit(SessionEvent::SessionState {
                 id: id.to_string(),
                 state: SessionState::Stopped,
@@ -831,6 +954,11 @@ impl SessionManager {
     async fn kill_running(&self, id: &str) {
         let running = self.running.write().await.remove(id);
         if let Some(r) = running {
+            // Exit watchers retain an Arc<Running> until the child reports
+            // its status. Abort immediately rather than waiting for Drop so
+            // metadata workers can observe their final sender closing while
+            // stop/delete still holds the per-session operation lock.
+            r.classifier_handle.abort();
             r.pty.kill();
         }
     }
@@ -881,6 +1009,7 @@ impl SessionManager {
     }
 
     async fn mark_exited(&self, id: &str, code: Option<i32>) {
+        self.complete_turn_diff_worker(id).await;
         let _ = self
             .store
             .update_state(id, SessionState::Stopped, now_ms())
@@ -1053,6 +1182,7 @@ impl SessionManager {
             let ring = Arc::new(tokio::sync::Mutex::new(ByteRing::new()));
             let last_activity = Arc::new(AtomicI64::new(now_ms()));
             let activity_notify = Arc::new(Notify::new());
+            let turn_diff_tx = self.ensure_turn_diff_worker(session);
 
             // Per-session classifier task. Runs only while this Running entry
             // is in the map; aborted via `Running::Drop` when the session is
@@ -1067,6 +1197,7 @@ impl SessionManager {
                 last_activity: last_activity.clone(),
                 activity_notify: activity_notify.clone(),
                 ring: ring.clone(),
+                turn_diff_tx,
             }));
 
             let running = Arc::new(Running {
@@ -1191,6 +1322,106 @@ impl SessionManager {
     }
 }
 
+/// Serial Git worker for one session. Turn-boundary sends are non-blocking;
+/// repository hashing, SSH, patch generation, and SQLite persistence all
+/// happen here, never in the terminal reader or classifier loop.
+async fn turn_diff_worker(
+    store: Arc<Store>,
+    session_id: String,
+    target: RepoTarget,
+    mut receiver: mpsc::UnboundedReceiver<TurnBoundary>,
+) {
+    let mut baseline = None;
+    while let Some(boundary) = receiver.recv().await {
+        match boundary {
+            TurnBoundary::Started { at, record_empty } => {
+                // Enter submission precedes the classifier's Active event;
+                // both describe the same turn. Preserve the earlier tree.
+                if baseline.is_some() {
+                    continue;
+                }
+                let target = target.clone();
+                match tokio::task::spawn_blocking(move || turn_diff::capture_snapshot(&target))
+                    .await
+                {
+                    Ok(Ok(snapshot)) => {
+                        baseline = snapshot.map(|snapshot| (snapshot, at, record_empty))
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            session = %session_id,
+                            error = %format!("{error:#}"),
+                            "turn diff baseline failed",
+                        );
+                        baseline = None;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            session = %session_id,
+                            error = %error,
+                            "turn diff baseline task failed",
+                        );
+                        baseline = None;
+                    }
+                }
+            }
+            TurnBoundary::Completed { at } => {
+                let Some((base, started_at, record_empty)) = baseline.take() else {
+                    continue;
+                };
+                let target = target.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let Some(head) = turn_diff::capture_snapshot(&target)? else {
+                        return Ok(None);
+                    };
+                    if base == head {
+                        return Ok(record_empty.then_some(turn_diff::NewTurnDiff {
+                            started_at,
+                            completed_at: at,
+                            files_changed: 0,
+                            additions: 0,
+                            deletions: 0,
+                            truncated: false,
+                            patch: String::new(),
+                        }));
+                    }
+                    let diff = turn_diff::diff_snapshots(&target, &base, &head, started_at, at)?;
+                    anyhow::Ok(Some(diff))
+                })
+                .await;
+                let diff = match result {
+                    Ok(Ok(diff)) => diff,
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            session = %session_id,
+                            error = %format!("{error:#}"),
+                            "turn diff capture failed",
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            session = %session_id,
+                            error = %error,
+                            "turn diff capture task failed",
+                        );
+                        None
+                    }
+                };
+                if let Some(diff) = diff {
+                    if let Err(error) = store.insert_turn_diff(&session_id, diff).await {
+                        tracing::warn!(
+                            session = %session_id,
+                            error = %format!("{error:#}"),
+                            "persist turn diff failed",
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Inputs to [`classifier_task`]. Bundled into a struct because the task
 /// needs almost a dozen pieces of context and a flat signature would be
 /// hard to read at the call site.
@@ -1204,6 +1435,7 @@ struct ClassifierCtx {
     last_activity: Arc<AtomicI64>,
     activity_notify: Arc<Notify>,
     ring: Arc<tokio::sync::Mutex<ByteRing>>,
+    turn_diff_tx: mpsc::UnboundedSender<TurnBoundary>,
 }
 
 /// Per-session classification loop that replaces the old global ticker.
@@ -1231,6 +1463,7 @@ async fn classifier_task(ctx: ClassifierCtx) {
         last_activity,
         activity_notify,
         ring,
+        turn_diff_tx,
     } = ctx;
     let signals = backend::for_kind(backend_kind).signals();
     let mut last_state = initial_state;
@@ -1274,6 +1507,15 @@ async fn classifier_task(ctx: ClassifierCtx) {
         };
         if desired != last_state {
             let _ = mgr.store.update_state(&id, desired, now).await;
+            let boundary = match desired {
+                SessionState::Active => TurnBoundary::Started {
+                    at: now,
+                    record_empty: true,
+                },
+                SessionState::Waiting => TurnBoundary::Completed { at: now },
+                SessionState::Stopped => TurnBoundary::Completed { at: now },
+            };
+            let _ = turn_diff_tx.send(boundary);
             mgr.emit(SessionEvent::SessionState {
                 id: id.clone(),
                 state: desired,
@@ -1350,12 +1592,18 @@ fn strip_ansi(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_min_size, remove_if_current, strip_ansi, tmux_exit_action, valid_id, ByteRing,
-        TmuxExitAction, RING_CAP,
+        effective_min_size, remove_if_current, strip_ansi, tmux_exit_action, turn_diff_worker,
+        valid_id, ByteRing, TmuxExitAction, TurnBoundary, RING_CAP,
     };
+    use crate::backend::BackendKind;
+    use crate::session::{Location, Session, SessionState, SupervisorKind};
+    use crate::store::Store;
     use crate::tmux::SessionProbe;
+    use crate::turn_diff::RepoTarget;
     use std::collections::HashMap;
+    use std::process::Command;
     use std::sync::Arc;
+    use tokio::sync::mpsc;
 
     #[test]
     fn effective_min_size_empty_returns_none() {
@@ -1479,5 +1727,77 @@ mod tests {
     fn strip_ansi_removes_osc_sequences_terminated_by_st() {
         let input = "\u{1b}]0;slide title\u{1b}\\\u{258c}";
         assert_eq!(strip_ansi(input), "\u{258c}");
+    }
+
+    #[tokio::test]
+    async fn turn_diff_worker_skips_bootstrap_and_orders_real_turns() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        let store = Arc::new(Store::open(std::path::Path::new(":memory:")).await.unwrap());
+        store
+            .insert(&Session {
+                id: "turn-worker".to_string(),
+                name: "turn-worker".to_string(),
+                backend: BackendKind::Codex,
+                location: Location::Local,
+                ssh_host: None,
+                base_dir: repo.path().to_string_lossy().into_owned(),
+                project_path: repo.path().to_string_lossy().into_owned(),
+                worktree: false,
+                state: SessionState::Active,
+                created_at: 1,
+                last_activity: 1,
+                supervisor: SupervisorKind::Direct,
+                host_log_path: None,
+                log_offset: 0,
+                backend_session_id: None,
+            })
+            .await
+            .unwrap();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(turn_diff_worker(
+            store.clone(),
+            "turn-worker".to_string(),
+            RepoTarget {
+                path: repo.path().to_path_buf(),
+                ssh_host: None,
+            },
+            receiver,
+        ));
+
+        sender
+            .send(TurnBoundary::Started {
+                at: 10,
+                record_empty: false,
+            })
+            .unwrap();
+        sender.send(TurnBoundary::Completed { at: 20 }).unwrap();
+        sender
+            .send(TurnBoundary::Started {
+                at: 30,
+                record_empty: true,
+            })
+            .unwrap();
+        sender
+            .send(TurnBoundary::Started {
+                at: 35,
+                record_empty: true,
+            })
+            .unwrap();
+        sender.send(TurnBoundary::Completed { at: 40 }).unwrap();
+        drop(sender);
+        worker.await.unwrap();
+
+        let turns = store.list_turn_diffs("turn-worker").await.unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].started_at, 30);
+        assert_eq!(turns[0].completed_at, 40);
+        assert_eq!(turns[0].files_changed, 0);
     }
 }

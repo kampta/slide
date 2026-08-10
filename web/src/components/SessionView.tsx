@@ -6,6 +6,7 @@ import { MobileKeyBar } from "./MobileKeyBar";
 import { useIsMobile } from "../hooks/useMediaQuery";
 import { SessionPath, sessionDisplayPath } from "./SessionPath";
 import { SubagentDock } from "./SubagentDock";
+import { TurnDiffDock } from "./TurnDiffDock";
 
 const TerminalView = lazy(() =>
   import("./Terminal").then((module) => ({ default: module.TerminalView })),
@@ -198,6 +199,7 @@ export function SessionView() {
           live={isRunning}
         />
       )}
+      <TurnDiffDock key={session.id} sessionId={session.id} live={isRunning} />
       <Suspense fallback={<div className="term-host terminal-loading">Loading terminal…</div>}>
         <TerminalView ref={termRef} sessionId={session.id} live={isRunning} />
       </Suspense>
