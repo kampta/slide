@@ -126,6 +126,11 @@ pub struct Session {
     /// supervisor is no longer around.
     #[serde(default)]
     pub backend_session_id: Option<String>,
+    /// Slide session whose provider conversation was branched to create this
+    /// session. Kept separate from the provider-native id so deletion or
+    /// rediscovery never changes lineage.
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
 }
 
 fn default_supervisor() -> SupervisorKind {
@@ -143,6 +148,19 @@ pub struct CreateSessionRequest {
     pub location: Location,
     #[serde(default)]
     pub ssh_host: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ForkSessionRequest {
+    pub name: String,
+    #[serde(default)]
+    pub focus: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HandoffRequest {
+    pub target_session_id: String,
+    pub focus: String,
 }
 
 fn default_local() -> Location {

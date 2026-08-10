@@ -167,6 +167,24 @@ impl Backend for ClaudeBackend {
         Some(argv)
     }
 
+    fn fork_argv(
+        &self,
+        _cwd: &Path,
+        session_id: &str,
+        prompt: Option<&str>,
+    ) -> Option<Vec<String>> {
+        let mut argv = argv_with_permissions();
+        argv.extend([
+            "--resume".into(),
+            session_id.into(),
+            "--fork-session".into(),
+        ]);
+        if let Some(prompt) = prompt.filter(|prompt| !prompt.is_empty()) {
+            argv.push(prompt.into());
+        }
+        Some(argv)
+    }
+
     fn read_context_usage(&self, cwd: &Path, session_id: &str) -> Option<ContextUsage> {
         let path = transcript_dir(cwd)?.join(format!("{session_id}.jsonl"));
         last_assistant_usage(&path)
@@ -227,6 +245,24 @@ mod tests {
                 "--dangerously-skip-permissions",
                 "--resume",
                 "abc-123"
+            ]
+        );
+    }
+
+    #[test]
+    fn fork_argv_creates_a_new_session_with_optional_focus() {
+        let argv = ClaudeBackend::new()
+            .fork_argv(Path::new("/tmp"), "abc-123", Some("try another design"))
+            .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "claude",
+                "--dangerously-skip-permissions",
+                "--resume",
+                "abc-123",
+                "--fork-session",
+                "try another design",
             ]
         );
     }

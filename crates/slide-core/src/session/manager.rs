@@ -1,5 +1,8 @@
 use super::pty::{self, Pty};
-use super::{CreateSessionRequest, Location, Session, SessionEvent, SessionState, SupervisorKind};
+use super::{
+    CreateSessionRequest, ForkSessionRequest, HandoffRequest, Location, Session, SessionEvent,
+    SessionState, SupervisorKind,
+};
 use crate::backend::{self, BackendKind, ContextUsage, SubagentList};
 use crate::classifier;
 use crate::config;
@@ -11,7 +14,7 @@ use crate::turn_diff::{self, RepoTarget, TurnDiff, TurnDiffSummary};
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -27,6 +30,8 @@ const ATTACH_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const ATTACH_RETRY_MAX: Duration = Duration::from_secs(30);
 const UNKNOWN_RECHECK_INITIAL: Duration = Duration::from_secs(5);
 const UNKNOWN_RECHECK_MAX: Duration = Duration::from_secs(30);
+const HANDOFF_TAIL_BYTES: usize = 32 * 1024;
+const HANDOFF_CONTEXT_CHARS: usize = 8_000;
 
 #[derive(Clone)]
 struct CachedSubagents {
@@ -111,6 +116,48 @@ fn check_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+fn normalize_focus(value: Option<&str>, required: bool) -> Result<Option<String>> {
+    let value = value.unwrap_or("");
+    if value
+        .chars()
+        .any(|character| character.is_control() && !character.is_whitespace())
+    {
+        bail!("focus must not contain control characters");
+    }
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() > 2_000 {
+        bail!("focus must be at most 2000 characters");
+    }
+    if compact.is_empty() {
+        if required {
+            bail!("focus is required");
+        }
+        Ok(None)
+    } else {
+        Ok(Some(compact))
+    }
+}
+
+fn newest_chars(value: &str, limit: usize) -> &str {
+    if limit == 0 {
+        return "";
+    }
+    value
+        .char_indices()
+        .rev()
+        .nth(limit)
+        .map_or(value, |(index, character)| {
+            &value[index + character.len_utf8()..]
+        })
+}
+
+fn build_handoff_prompt(source_name: &str, focus: &str, context: &str) -> String {
+    format!(
+        "Slide handoff from session '{}'. Focus: {}. Recent source context: {}. Continue from this context, verify assumptions against the current workspace, and address the focus above.",
+        source_name, focus, context
+    )
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -145,10 +192,14 @@ enum TmuxExitAction {
     Retry,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SpawnIntent {
     Fresh,
     Existing,
+    Fork {
+        provider_session_id: String,
+        prompt: Option<String>,
+    },
 }
 
 /// Losing a tmux *client* is not the same thing as losing the backend that
@@ -792,7 +843,18 @@ impl SessionManager {
         Ok(())
     }
 
-    pub async fn create(self: &Arc<Self>, mut req: CreateSessionRequest) -> Result<Session> {
+    pub async fn create(self: &Arc<Self>, req: CreateSessionRequest) -> Result<Session> {
+        self.create_with_intent(req, SpawnIntent::Fresh, None, None)
+            .await
+    }
+
+    async fn create_with_intent(
+        self: &Arc<Self>,
+        mut req: CreateSessionRequest,
+        intent: SpawnIntent,
+        parent_session_id: Option<String>,
+        worktree_source: Option<PathBuf>,
+    ) -> Result<Session> {
         git::validate_session_name(&req.name)?;
         req.ssh_host = req
             .ssh_host
@@ -825,9 +887,13 @@ impl SessionManager {
                 Location::Local => {
                     let base = base.clone();
                     let name = req.name.clone();
-                    let worktree =
-                        tokio::task::spawn_blocking(move || git::add_worktree(&base, &name))
-                            .await??;
+                    let worktree = tokio::task::spawn_blocking(move || {
+                        worktree_source.as_deref().map_or_else(
+                            || git::add_worktree(&base, &name),
+                            |source| git::add_worktree_from(&base, &name, source),
+                        )
+                    })
+                    .await??;
                     (worktree, true)
                 }
                 // For remote sessions use base_dir as the working directory on
@@ -871,17 +937,21 @@ impl SessionManager {
             host_log_path,
             log_offset: 0,
             backend_session_id: None,
+            parent_session_id,
         };
         if let Err(error) = self.store.insert(&session).await {
             if worktree_owned {
                 let base = base.clone();
                 let worktree = project_path.clone();
-                let _ = tokio::task::spawn_blocking(move || git::remove_worktree(&base, &worktree))
-                    .await;
+                let name = session.name.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    git::rollback_worktree(&base, &worktree, &name)
+                })
+                .await;
             }
             return Err(error);
         }
-        if let Err(e) = self.spawn_process(&session, SpawnIntent::Fresh).await {
+        if let Err(e) = self.spawn_process(&session, intent).await {
             // Roll back so a failed spawn (dead SSH, tmux missing on the
             // remote, …) doesn't leave the row Active in the sidebar — the
             // user would see a green session that hits "session not running"
@@ -894,8 +964,11 @@ impl SessionManager {
             if worktree_owned {
                 let base = base.clone();
                 let worktree = PathBuf::from(&session.project_path);
-                let _ = tokio::task::spawn_blocking(move || git::remove_worktree(&base, &worktree))
-                    .await;
+                let name = session.name.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    git::rollback_worktree(&base, &worktree, &name)
+                })
+                .await;
             }
             return Err(e);
         }
@@ -905,6 +978,99 @@ impl SessionManager {
         self.runtime_diagnostics
             .clear_launch_failure(session.backend, session.ssh_host.as_deref());
         Ok(session)
+    }
+
+    pub async fn fork_session(
+        self: &Arc<Self>,
+        source_id: &str,
+        request: ForkSessionRequest,
+    ) -> Result<Session> {
+        check_id(source_id)?;
+        let source = self.find(source_id).await?;
+        if !matches!(source.location, Location::Local) {
+            bail!("provider-native forks currently require a local source session");
+        }
+        let provider_session_id = source
+            .backend_session_id
+            .clone()
+            .context("the source session has not exposed a provider conversation id yet")?;
+        let prompt = normalize_focus(request.focus.as_deref(), false)?;
+        if backend::for_kind(source.backend)
+            .fork_argv(
+                Path::new(&source.project_path),
+                &provider_session_id,
+                prompt.as_deref(),
+            )
+            .is_none()
+        {
+            bail!(
+                "{} does not support provider-native forks",
+                source.backend.as_str()
+            );
+        }
+        let create = CreateSessionRequest {
+            name: request.name,
+            backend: source.backend,
+            base_dir: source.base_dir.clone(),
+            project_path: None,
+            location: Location::Local,
+            ssh_host: None,
+        };
+        let worktree_source = PathBuf::from(&source.project_path);
+        self.create_with_intent(
+            create,
+            SpawnIntent::Fork {
+                provider_session_id,
+                prompt,
+            },
+            Some(source.id),
+            Some(worktree_source),
+        )
+        .await
+    }
+
+    pub async fn handoff(&self, source_id: &str, request: HandoffRequest) -> Result<Session> {
+        check_id(source_id)?;
+        check_id(&request.target_session_id)?;
+        if source_id == request.target_session_id {
+            bail!("source and target sessions must be different");
+        }
+        let source = self.find(source_id).await?;
+        let target = self.find(&request.target_session_id).await?;
+        if !matches!(target.state, SessionState::Waiting) {
+            bail!("target session must be waiting before a handoff");
+        }
+        let focus = normalize_focus(Some(&request.focus), true)?.context("focus is required")?;
+        let running = self.running.read().await.get(source_id).cloned();
+        let bytes = match running {
+            Some(running) => running.ring.lock().await.tail(HANDOFF_TAIL_BYTES),
+            None => {
+                let source = source.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::history::read_tail(&source, HANDOFF_TAIL_BYTES)
+                })
+                .await
+                .context("join handoff history read")??
+            }
+        };
+        let compact = crate::terminal_text::compact(&String::from_utf8_lossy(&bytes));
+        if compact.is_empty() {
+            bail!("source session has no recent output to hand off");
+        }
+        let context = newest_chars(&compact, HANDOFF_CONTEXT_CHARS);
+        let mut prompt = build_handoff_prompt(&source.name, &focus, context).into_bytes();
+        prompt.push(b'\r');
+        // Context collection can involve disk or SSH I/O. Re-check immediately
+        // before sending so a target that became active in the meantime does not
+        // receive an unsolicited turn.
+        let operation = self.operation_lock(&target.id);
+        let _guard = operation.lock().await;
+        let target = self.find(&target.id).await?;
+        if !matches!(target.state, SessionState::Waiting) {
+            bail!("target session is no longer waiting");
+        }
+        self.write_input(&target.id, &prompt).await?;
+        Ok(target)
     }
 
     /// Re-attach surviving tmux sessions discovered at cold start. One
@@ -1250,16 +1416,21 @@ impl SessionManager {
             // backend may also offer a cwd-scoped latest-session fallback
             // (Codex `resume --last`) so remote conversations without a
             // locally-discovered id survive an explicit stop/resume.
-            let backend_argv = session
-                .backend_session_id
-                .as_deref()
-                .and_then(|sid| backend.resume_argv(&host_cwd, sid))
-                .or_else(|| {
-                    matches!(intent, SpawnIntent::Existing)
-                        .then(|| backend.resume_latest_argv(&host_cwd))
-                        .flatten()
-                })
-                .unwrap_or_else(|| backend.argv(&host_cwd));
+            let backend_argv = match &intent {
+                SpawnIntent::Fresh => backend.argv(&host_cwd),
+                SpawnIntent::Existing => session
+                    .backend_session_id
+                    .as_deref()
+                    .and_then(|session_id| backend.resume_argv(&host_cwd, session_id))
+                    .or_else(|| backend.resume_latest_argv(&host_cwd))
+                    .unwrap_or_else(|| backend.argv(&host_cwd)),
+                SpawnIntent::Fork {
+                    provider_session_id,
+                    prompt,
+                } => backend
+                    .fork_argv(&host_cwd, provider_session_id, prompt.as_deref())
+                    .context("backend does not support provider-native forks")?,
+            };
             let backend_env = backend.env();
 
             if matches!(session.location, Location::Remote) && session.ssh_host.is_none() {
@@ -1697,9 +1868,10 @@ fn strip_ansi(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        classification_turn_boundary, effective_min_size, remove_if_current,
-        state_after_failed_reattach, strip_ansi, tmux_exit_action, turn_diff_worker, valid_id,
-        ByteRing, TmuxExitAction, TurnBoundary, RING_CAP,
+        build_handoff_prompt, classification_turn_boundary, effective_min_size, newest_chars,
+        normalize_focus, remove_if_current, state_after_failed_reattach, strip_ansi,
+        tmux_exit_action, turn_diff_worker, valid_id, ByteRing, TmuxExitAction, TurnBoundary,
+        RING_CAP,
     };
     use crate::backend::BackendKind;
     use crate::session::{Location, Session, SessionState, SupervisorKind};
@@ -1770,6 +1942,29 @@ mod tests {
         ] {
             assert!(!valid_id(bad), "accepted {bad:?}");
         }
+    }
+
+    #[test]
+    fn handoff_focus_is_single_line_bounded_and_control_safe() {
+        assert_eq!(
+            normalize_focus(Some("  inspect\n  auth   failures  "), true).unwrap(),
+            Some("inspect auth failures".to_string()),
+        );
+        assert!(normalize_focus(Some(" \t\n "), true).is_err());
+        assert!(normalize_focus(Some("unsafe\u{1b}escape"), true).is_err());
+        assert!(normalize_focus(Some(&"x".repeat(2_001)), false).is_err());
+        assert_eq!(normalize_focus(None, false).unwrap(), None);
+    }
+
+    #[test]
+    fn handoff_context_keeps_newest_unicode_without_allocating_a_copy() {
+        assert_eq!(newest_chars("aé日🙂", 2), "日🙂");
+        assert_eq!(newest_chars("short", 20), "short");
+        assert_eq!(newest_chars("value", 0), "");
+        let prompt = build_handoff_prompt("source", "check tests", "latest output");
+        assert!(prompt.contains("session 'source'"));
+        assert!(prompt.contains("Focus: check tests"));
+        assert!(!prompt.contains('\n'));
     }
 
     #[test]
@@ -1901,6 +2096,7 @@ mod tests {
                 host_log_path: None,
                 log_offset: 0,
                 backend_session_id: None,
+                parent_session_id: None,
             })
             .await
             .unwrap();

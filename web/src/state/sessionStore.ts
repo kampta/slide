@@ -58,7 +58,8 @@ function sessionsEqual(a: Session, b: Session): boolean {
     a.supervisor === b.supervisor &&
     a.host_log_path === b.host_log_path &&
     a.log_offset === b.log_offset &&
-    a.backend_session_id === b.backend_session_id
+    a.backend_session_id === b.backend_session_id &&
+    a.parent_session_id === b.parent_session_id
   );
 }
 

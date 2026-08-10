@@ -53,6 +53,11 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX turn_diffs_session_turn ON turn_diffs(session_id, turn DESC);
     "#,
+    // v4 → v5: durable Slide-side fork lineage.
+    r#"
+    ALTER TABLE sessions ADD COLUMN parent_session_id TEXT;
+    CREATE INDEX sessions_parent ON sessions(parent_session_id);
+    "#,
 ];
 
 const TURN_DIFF_HISTORY_LIMIT: i64 = 50;
@@ -105,6 +110,7 @@ fn session_from_row(r: &Row<'_>) -> rusqlite::Result<Session> {
         host_log_path: r.get(12)?,
         log_offset: r.get(13)?,
         backend_session_id: r.get(14)?,
+        parent_session_id: r.get(15)?,
     })
 }
 
@@ -123,7 +129,7 @@ fn turn_diff_summary_from_row(r: &Row<'_>) -> rusqlite::Result<TurnDiffSummary> 
 
 const SESSION_COLUMNS: &str =
     "id, name, backend, location, ssh_host, base_dir, project_path, worktree, state, \
-     created_at, last_activity, supervisor, host_log_path, log_offset, backend_session_id";
+     created_at, last_activity, supervisor, host_log_path, log_offset, backend_session_id, parent_session_id";
 
 impl Store {
     pub async fn open(path: &Path) -> Result<Self> {
@@ -142,8 +148,8 @@ impl Store {
                 c.execute(
                     "INSERT INTO sessions \
                      (id, name, backend, location, ssh_host, base_dir, project_path, worktree, state, created_at, last_activity, \
-                      supervisor, host_log_path, log_offset, backend_session_id) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                      supervisor, host_log_path, log_offset, backend_session_id, parent_session_id) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                     params![
                         s.id,
                         s.name,
@@ -160,6 +166,7 @@ impl Store {
                         s.host_log_path,
                         s.log_offset,
                         s.backend_session_id,
+                        s.parent_session_id,
                     ],
                 )?;
                 Ok(())
@@ -412,6 +419,7 @@ mod tests {
             host_log_path: None,
             log_offset: 0,
             backend_session_id: None,
+            parent_session_id: None,
         }
     }
 
@@ -575,6 +583,7 @@ mod tests {
             host_log_path: Some("/home/user/.local/share/slide/logs/abc.log".to_string()),
             log_offset: 12_345,
             backend_session_id: Some("claude-uuid-xyz".to_string()),
+            parent_session_id: Some("source-session".to_string()),
         };
         store.insert(&s).await.unwrap();
         let list = store.list().await.unwrap();
@@ -592,6 +601,7 @@ mod tests {
         );
         assert_eq!(got.log_offset, 12_345);
         assert_eq!(got.backend_session_id.as_deref(), Some("claude-uuid-xyz"));
+        assert_eq!(got.parent_session_id.as_deref(), Some("source-session"));
     }
 
     #[tokio::test]
@@ -639,6 +649,7 @@ mod tests {
         assert!(got.host_log_path.is_none());
         assert_eq!(got.log_offset, 0);
         assert!(got.backend_session_id.is_none());
+        assert!(got.parent_session_id.is_none());
 
         // user_version should now match the current schema.
         let conn = SyncConnection::open(path).unwrap();

@@ -44,3 +44,34 @@ pub(crate) fn strip_ansi(input: &str) -> String {
     }
     out
 }
+
+pub(crate) fn compact(input: &str) -> String {
+    let plain = strip_ansi(input);
+    let mut output = String::with_capacity(plain.len());
+    let mut pending_space = false;
+    for character in plain.chars() {
+        if character.is_control() || character.is_whitespace() {
+            pending_space = !output.is_empty();
+            continue;
+        }
+        if pending_space {
+            output.push(' ');
+            pending_space = false;
+        }
+        output.push(character);
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compact;
+
+    #[test]
+    fn compact_strips_terminal_sequences_and_collapses_whitespace() {
+        assert_eq!(
+            compact("  first\n\u{1b}[31msecond\u{1b}[0m\t third\u{7}  "),
+            "first second third",
+        );
+    }
+}
