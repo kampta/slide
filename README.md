@@ -73,6 +73,10 @@ Slide snapshots the complete Git worktree when an agent turn starts and records 
 
 Open Runtime diagnostics from the diamond button beside **New** to check every backend CLI, authentication state, version, and tmux capability on the local machine or a configured SSH host. Probes mirror Slide's launch environment, are cached for 60 seconds, and never return command output or account identity. Session creation and resume reuse the same snapshot; creation fails before making a worktree when the selected runtime—or remote tmux—is unavailable.
 
+## History search
+
+Open Search beside **New** to find text across the persisted terminal output of every local and SSH session, including stopped sessions. Searches stream local logs with fixed memory and group remote logs into one bounded SSH command per host. Results retain only the newest distinct snippets, strip terminal control sequences, and open the matching session when selected.
+
 ## New session
 
 - **Name** (required) — shown in the left panel and used as the worktree folder / branch if auto-creating one.
