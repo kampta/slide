@@ -20,42 +20,9 @@ impl OpenCodeBackend {
     }
 }
 
-/// OpenCode's documented inline permission override. Omitting a catch-all
-/// preserves the normal approval flow for unspecified shell commands while
-/// pre-approving workspace edits and common daily-development workflows.
-const DEFAULT_PERMISSIONS: &str = r#"{
-  "read":"allow",
-  "edit":"allow",
-  "glob":"allow",
-  "grep":"allow",
-  "list":"allow",
-  "lsp":"allow",
-  "webfetch":"allow",
-  "websearch":"allow",
-  "bash":{
-    "*":"ask",
-    "git":"allow",
-    "git *":"allow",
-    "cargo build*":"allow","cargo check*":"allow","cargo test*":"allow",
-    "cargo fmt*":"allow","cargo clippy*":"allow","cargo fetch*":"allow",
-    "npm install*":"allow","npm ci*":"allow","npm test*":"allow",
-    "npm run build*":"allow","npm run test*":"allow",
-    "npm run lint*":"allow","npm run typecheck*":"allow",
-    "pnpm install*":"allow","pnpm test*":"allow",
-    "pnpm run build*":"allow","pnpm run test*":"allow",
-    "pnpm run lint*":"allow","pnpm run typecheck*":"allow",
-    "yarn install*":"allow","yarn test*":"allow",
-    "yarn run build*":"allow","yarn run test*":"allow",
-    "yarn run lint*":"allow","yarn run typecheck*":"allow",
-    "make build*":"allow","make test*":"allow","make lint*":"allow",
-    "./scripts/dev.sh*":"allow","./scripts/bootstrap.sh*":"allow",
-    "gh pr view*":"allow","gh pr checks*":"allow",
-    "gh run view*":"allow","gh issue view*":"allow",
-    "ps":"allow","ps *":"allow","pgrep":"allow","pgrep *":"allow",
-    "lsof":"allow","lsof *":"allow","kill":"allow","kill *":"allow",
-    "pkill":"allow","pkill *":"allow"
-  }
-}"#;
+/// OpenCode accepts a JSON permission value through this per-process override.
+/// The string value `"allow"` grants every permission category.
+const DEFAULT_PERMISSIONS: &str = r#""allow""#;
 
 /// OpenCode themes change the prompt border but retain either a composer
 /// placeholder or a leading prompt glyph in captured terminal text. The
@@ -127,22 +94,11 @@ mod tests {
     }
 
     #[test]
-    fn environment_preapproves_daily_development_tools() {
+    fn environment_allows_every_permission() {
         let env = OpenCodeBackend::new().env();
         assert_eq!(env.len(), 1);
         assert_eq!(env[0].0, "OPENCODE_PERMISSION");
         let permissions: serde_json::Value = serde_json::from_str(&env[0].1).unwrap();
-        assert_eq!(permissions["read"], "allow");
-        assert_eq!(permissions["edit"], "allow");
-        assert_eq!(permissions["websearch"], "allow");
-        assert_eq!(permissions["bash"]["git *"], "allow");
-        assert_eq!(permissions["bash"]["cargo test*"], "allow");
-        assert_eq!(permissions["bash"]["npm install*"], "allow");
-        assert_eq!(permissions["bash"]["./scripts/dev.sh*"], "allow");
-        assert_eq!(permissions["bash"]["gh pr view*"], "allow");
-        assert_eq!(permissions["bash"]["lsof *"], "allow");
-        assert!(permissions["bash"].get("psql *").is_none());
-        assert_eq!(permissions["bash"]["*"], "ask");
-        assert!(permissions["bash"].get("gh pr merge*").is_none());
+        assert_eq!(permissions, "allow");
     }
 }

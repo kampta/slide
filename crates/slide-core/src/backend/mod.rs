@@ -228,6 +228,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_backend_launches_with_unrestricted_permissions() {
+        for kind in BackendKind::ALL {
+            let backend = for_kind(kind);
+            let argv = backend.argv(Path::new("/some/path"));
+            let unrestricted = match kind {
+                BackendKind::Claude | BackendKind::Antigravity => argv
+                    .iter()
+                    .any(|arg| arg == "--dangerously-skip-permissions"),
+                BackendKind::Codex => argv
+                    .iter()
+                    .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"),
+                BackendKind::Grok => argv.iter().any(|arg| arg == "--always-approve"),
+                BackendKind::OpenCode => backend
+                    .env()
+                    .iter()
+                    .any(|(key, value)| key == "OPENCODE_PERMISSION" && value == r#""allow""#),
+            };
+            assert!(unrestricted, "{kind:?} does not launch unrestricted");
+        }
+    }
+
     /// Smoke test: every backend ships a non-empty `Signals` bundle with a
     /// sensible settle window. Per-pattern assertions live in each backend's
     /// own module.

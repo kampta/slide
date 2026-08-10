@@ -22,30 +22,8 @@ impl AgyBackend {
     }
 }
 
-/// Antigravity can auto-approve commands that remain inside its OS sandbox.
-/// Fine-grained overrides additionally approve every Git command, including
-/// an unsandboxed retry when a Git operation cannot remain contained.
 fn argv_with_permissions() -> Vec<String> {
-    vec![
-        "agy".into(),
-        "--sandbox".into(),
-        "--tool-permission=proceed-in-sandbox".into(),
-        "--permissions.allow=command(git)".into(),
-        "--permissions.allow=unsandboxed(git)".into(),
-        "--permissions.allow=command(cargo (build|check|test|fmt|clippy|fetch))".into(),
-        "--permissions.allow=command(npm (install|ci|test|run))".into(),
-        "--permissions.allow=command(pnpm (install|test|run))".into(),
-        "--permissions.allow=command(yarn (install|test|run))".into(),
-        "--permissions.allow=command(make (build|test|lint))".into(),
-        "--permissions.allow=command(./scripts/(dev\\.sh|bootstrap\\.sh))".into(),
-        "--permissions.allow=command(gh pr (view|checks))".into(),
-        "--permissions.allow=command(gh run view)".into(),
-        "--permissions.allow=command(gh issue view)".into(),
-        "--permissions.allow=command((ps|pgrep|lsof|kill|pkill))".into(),
-        "--permissions.allow=read_url(github.com)".into(),
-        "--permissions.allow=read_url(npmjs.org)".into(),
-        "--permissions.allow=read_url(crates.io)".into(),
-    ]
+    vec!["agy".into(), "--dangerously-skip-permissions".into()]
 }
 
 /// Antigravity descends from the Gemini CLI TUI and keeps its `>` composer.
@@ -106,19 +84,9 @@ mod tests {
     }
 
     #[test]
-    fn launch_argv_auto_approves_sandboxed_operations_and_all_git() {
+    fn launch_argv_skips_all_permission_prompts() {
         let argv = AgyBackend::new().argv(Path::new("/tmp"));
-        for permission in [
-            "--permissions.allow=command(git)",
-            "--permissions.allow=command(cargo (build|check|test|fmt|clippy|fetch))",
-            "--permissions.allow=command(npm (install|ci|test|run))",
-            "--permissions.allow=command(gh pr (view|checks))",
-            "--permissions.allow=command((ps|pgrep|lsof|kill|pkill))",
-            "--permissions.allow=read_url(crates.io)",
-        ] {
-            assert!(argv.iter().any(|arg| arg == permission));
-        }
-        assert!(!argv.iter().any(|arg| arg.contains("gh pr merge")));
+        assert_eq!(argv, vec!["agy", "--dangerously-skip-permissions"]);
     }
 
     #[test]

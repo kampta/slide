@@ -20,72 +20,8 @@ impl GrokBackend {
     }
 }
 
-fn permission_args() -> Vec<String> {
-    let rules = [
-        "Read",
-        "Glob",
-        "Grep",
-        "WebSearch",
-        "WebFetch",
-        "Edit",
-        "Write",
-        "NotebookEdit",
-        "Bash(git*)",
-        "Bash(cargo build*)",
-        "Bash(cargo check*)",
-        "Bash(cargo test*)",
-        "Bash(cargo fmt*)",
-        "Bash(cargo clippy*)",
-        "Bash(cargo fetch*)",
-        "Bash(npm install*)",
-        "Bash(npm ci*)",
-        "Bash(npm test*)",
-        "Bash(npm run build*)",
-        "Bash(npm run test*)",
-        "Bash(npm run lint*)",
-        "Bash(npm run typecheck*)",
-        "Bash(pnpm install*)",
-        "Bash(pnpm test*)",
-        "Bash(pnpm run build*)",
-        "Bash(pnpm run test*)",
-        "Bash(pnpm run lint*)",
-        "Bash(pnpm run typecheck*)",
-        "Bash(yarn install*)",
-        "Bash(yarn test*)",
-        "Bash(yarn run build*)",
-        "Bash(yarn run test*)",
-        "Bash(yarn run lint*)",
-        "Bash(yarn run typecheck*)",
-        "Bash(make build*)",
-        "Bash(make test*)",
-        "Bash(make lint*)",
-        "Bash(./scripts/dev.sh*)",
-        "Bash(./scripts/bootstrap.sh*)",
-        "Bash(gh pr view*)",
-        "Bash(gh pr checks*)",
-        "Bash(gh run view*)",
-        "Bash(gh issue view*)",
-        "Bash(ps)",
-        "Bash(ps *)",
-        "Bash(pgrep)",
-        "Bash(pgrep *)",
-        "Bash(lsof)",
-        "Bash(lsof *)",
-        "Bash(kill)",
-        "Bash(kill *)",
-        "Bash(pkill)",
-        "Bash(pkill *)",
-    ];
-    rules
-        .into_iter()
-        .flat_map(|rule| ["--allow".into(), rule.into()])
-        .collect()
-}
-
 fn argv_with_permissions() -> Vec<String> {
-    let mut argv = vec!["grok".into()];
-    argv.extend(permission_args());
-    argv
+    vec!["grok".into(), "--always-approve".into()]
 }
 
 /// Grok Build's idle composer renders `Type a message...`. Depending on
@@ -141,22 +77,9 @@ mod tests {
     }
 
     #[test]
-    fn launch_argv_preapproves_daily_development_tools() {
+    fn launch_argv_auto_approves_all_tools() {
         let argv = GrokBackend::new().argv(Path::new("/tmp"));
-        for permission in [
-            "Read",
-            "WebSearch",
-            "Edit",
-            "Bash(git*)",
-            "Bash(cargo test*)",
-            "Bash(npm install*)",
-            "Bash(./scripts/dev.sh*)",
-            "Bash(gh pr view*)",
-            "Bash(lsof *)",
-        ] {
-            assert!(argv.iter().any(|arg| arg == permission));
-        }
-        assert!(!argv.iter().any(|arg| arg.contains("gh pr merge")));
+        assert_eq!(argv, vec!["grok", "--always-approve"]);
     }
 
     #[test]

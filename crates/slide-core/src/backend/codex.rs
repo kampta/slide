@@ -22,23 +22,10 @@ impl CodexBackend {
     }
 }
 
-/// Codex permissions are sandbox/profile based rather than per-command. This
-/// per-process profile makes the whole workspace (including Git metadata)
-/// writable and enables network access for arbitrary Git remotes. Approval
-/// prompts remain enabled for operations outside that profile.
 fn argv_with_permissions() -> Vec<String> {
     vec![
         "codex".into(),
-        "--config".into(),
-        r#"default_permissions="slide""#.into(),
-        "--config".into(),
-        r#"permissions.slide.filesystem={":minimal"="read",":workspace_roots"={"."="write"}}"#
-            .into(),
-        "--config".into(),
-        r#"permissions.slide.network={enabled=true,domains={"*"="allow"}}"#.into(),
-        "--ask-for-approval".into(),
-        "on-request".into(),
-        "--search".into(),
+        "--dangerously-bypass-approvals-and-sandbox".into(),
     ]
 }
 
@@ -183,27 +170,26 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn resume_argv_uses_resume_subcommand() {
+    fn argv_bypasses_approvals_and_sandbox() {
         let b = CodexBackend::new();
-        let argv = b.resume_argv(Path::new("/tmp"), "abc-123").unwrap();
-        assert_eq!(&argv[argv.len() - 2..], ["resume", "abc-123"]);
+        let argv = b.argv(Path::new("/tmp"));
+        assert_eq!(
+            argv,
+            vec!["codex", "--dangerously-bypass-approvals-and-sandbox"]
+        );
     }
 
     #[test]
-    fn launch_argv_enables_workspace_git_network_and_search() {
+    fn resume_argv_uses_resume_subcommand_with_full_permissions() {
+        let b = CodexBackend::new();
+        let argv = b.resume_argv(Path::new("/tmp"), "abc-123").unwrap();
         assert_eq!(
-            CodexBackend::new().argv(Path::new("/tmp")),
+            argv,
             vec![
                 "codex",
-                "--config",
-                r#"default_permissions="slide""#,
-                "--config",
-                r#"permissions.slide.filesystem={":minimal"="read",":workspace_roots"={"."="write"}}"#,
-                "--config",
-                r#"permissions.slide.network={enabled=true,domains={"*"="allow"}}"#,
-                "--ask-for-approval",
-                "on-request",
-                "--search",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "resume",
+                "abc-123"
             ]
         );
     }
