@@ -450,6 +450,17 @@ impl SessionManager {
         self.store.list().await
     }
 
+    pub async fn search_history(
+        &self,
+        query: &str,
+    ) -> Result<crate::history::HistorySearchResponse> {
+        let sessions = self.store.list().await?;
+        let query = query.to_string();
+        tokio::task::spawn_blocking(move || crate::history::search(&sessions, &query))
+            .await
+            .context("join history search")?
+    }
+
     /// Read context usage from the backend's transcript for this session.
     /// Returns `None` when the session is unknown, remote (we'd need to SSH
     /// to the host that owns the transcript — deferred), has no discovered
@@ -1680,48 +1691,7 @@ async fn classifier_task(ctx: ClassifierCtx) {
 /// Strip a pragmatic subset of ANSI escape sequences so prompt regexes can
 /// match against rendered text.
 fn strip_ansi(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == 0x1b && i + 1 < bytes.len() {
-            let next = bytes[i + 1];
-            if next == b'[' {
-                // CSI: ESC [ ... letter
-                i += 2;
-                while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
-                    i += 1;
-                }
-                i += 1;
-                continue;
-            } else if next == b']' {
-                // OSC: ESC ] ... BEL or ESC \
-                i += 2;
-                while i < bytes.len() && bytes[i] != 0x07 {
-                    if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
-                        i += 2;
-                        break;
-                    }
-                    i += 1;
-                }
-                if i < bytes.len() && bytes[i] == 0x07 {
-                    i += 1;
-                }
-                continue;
-            } else {
-                i += 2;
-                continue;
-            }
-        }
-        if let Some(ch) = input[i..].chars().next() {
-            out.push(ch);
-            i += ch.len_utf8();
-        } else {
-            break;
-        }
-    }
-    out
+    crate::terminal_text::strip_ansi(input)
 }
 
 #[cfg(test)]

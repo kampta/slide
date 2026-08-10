@@ -2,7 +2,7 @@ use crate::server::AppState;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
@@ -22,6 +22,7 @@ pub fn routes() -> Router<AppState> {
         .route("/sessions/:id/turn-diffs/:turn_diff_id", get(get_turn_diff))
         .route("/ls", get(list_dir))
         .route("/diagnostics", get(get_runtime_diagnostics))
+        .route("/history/search", post(search_history))
         .route("/backends", get(list_backends))
         .route("/ssh-hosts", get(list_ssh_hosts))
 }
@@ -38,6 +39,21 @@ async fn list_sessions(State(state): State<AppState>) -> Response {
     match state.manager.list().await {
         Ok(s) => Json(s).into_response(),
         Err(e) => server_error(&e),
+    }
+}
+
+#[derive(Deserialize)]
+struct HistorySearchRequest {
+    query: String,
+}
+
+async fn search_history(
+    State(state): State<AppState>,
+    Json(request): Json<HistorySearchRequest>,
+) -> Response {
+    match state.manager.search_history(&request.query).await {
+        Ok(results) => Json(results).into_response(),
+        Err(error) => client_error(&error),
     }
 }
 

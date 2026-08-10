@@ -982,6 +982,112 @@ body.is-resizing-panels * {
   text-align: right;
 }
 
+.history-search-modal {
+  width: min(720px, 100%);
+}
+
+.history-search-form {
+  display: flex;
+  gap: 7px;
+}
+
+.history-search-form input {
+  min-width: 0;
+  flex: 1;
+}
+
+.history-search-form button {
+  flex: none;
+}
+
+.history-search-results {
+  display: flex;
+  flex-direction: column;
+  min-height: 80px;
+  max-height: min(480px, 58dvh);
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--canvas);
+}
+
+.history-search-result {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  width: 100%;
+  padding: 9px 10px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+  text-align: left;
+}
+
+.history-search-result:last-child {
+  border-bottom: 0;
+}
+
+.history-search-result:hover,
+.history-search-result:focus-visible {
+  background: var(--surface-raised);
+}
+
+.history-search-result-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.history-search-result-title strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-search-result-title span,
+.history-search-summary,
+.history-search-empty {
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
+.history-search-result-title span {
+  flex: none;
+}
+
+.history-search-snippet {
+  overflow: hidden;
+  color: var(--text-muted);
+  font: 11px/1.45 var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.history-search-snippet mark {
+  padding: 0 1px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--waiting) 28%, transparent);
+  color: var(--text);
+}
+
+.history-search-empty {
+  margin: auto;
+  padding: 24px;
+  text-align: center;
+}
+
+.history-search-summary {
+  margin: 0;
+  text-align: right;
+}
+
+.history-search-error {
+  margin: 0;
+}
+
 .modal label,
 .form-field {
   display: flex;
@@ -1270,6 +1376,12 @@ body.is-resizing-panels * {
 
   .diagnostic-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .history-search-result-title {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
   }
 
   .modal input,

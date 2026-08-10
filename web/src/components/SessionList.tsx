@@ -12,10 +12,12 @@ function loadStoppedCollapsed(): boolean {
 
 export function SessionList({
   onNew,
+  onSearch,
   onDiagnostics,
   onCollapse,
 }: {
   onNew: () => void;
+  onSearch: () => void;
   onDiagnostics: () => void;
   // Optional: when present, header shows a collapse chevron. Omitted on
   // mobile where the sidebar IS the whole screen and there's nothing to
@@ -82,6 +84,18 @@ export function SessionList({
           <span className="brand-name">slide</span>
         </div>
         <div className="session-list-actions">
+          <button
+            type="button"
+            className="btn-icon"
+            onClick={onSearch}
+            aria-label="Search session history"
+            title="Search session history"
+          >
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+              <circle cx="11" cy="11" r="6" />
+              <path d="m16 16 4 4" />
+            </svg>
+          </button>
           <button
             type="button"
             className="btn-icon runtime-diagnostics-btn"
