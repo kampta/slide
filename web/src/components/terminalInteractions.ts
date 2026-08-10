@@ -1,5 +1,24 @@
 import type { Terminal } from "@xterm/xterm";
 
+export type ClipboardAction = "copy" | "native-paste";
+
+/** Identify platform clipboard shortcuts without performing the paste twice. */
+export function clipboardAction(
+  event: Pick<KeyboardEvent, "type" | "key" | "metaKey" | "ctrlKey" | "shiftKey">,
+  isMac: boolean,
+  hasSelection: boolean,
+): ClipboardAction | null {
+  if (event.type !== "keydown") return null;
+  const mod = isMac
+    ? event.metaKey && !event.ctrlKey
+    : event.ctrlKey && event.shiftKey;
+  if (!mod) return null;
+  const key = event.key.toLowerCase();
+  if (key === "c" && hasSelection) return "copy";
+  if (key === "v") return "native-paste";
+  return null;
+}
+
 type Cell = { col: number; row: number };
 type Drag = Cell & { x: number; y: number; moved: boolean };
 
