@@ -1294,14 +1294,32 @@ impl SessionManager {
         }
     }
 
-    pub async fn resume(self: &Arc<Self>, id: &str) -> Result<Session> {
+    /// Resume a stopped session. When `backend` differs from the stored
+    /// backend, the session is switched to that backend first: the prior
+    /// provider conversation id is cleared and the new process starts fresh
+    /// in the same workspace (provider conversation ids are not portable).
+    pub async fn resume(
+        self: &Arc<Self>,
+        id: &str,
+        backend: Option<BackendKind>,
+    ) -> Result<Session> {
         check_id(id)?;
         let operation = self.operation_lock(id);
         let _guard = operation.lock().await;
         let mut session = self.find(id).await?;
-        // If already running, no-op.
+        // If already running, no-op — unless a backend switch was requested.
         if self.running.read().await.contains_key(id) {
+            if backend.is_some_and(|b| b != session.backend) {
+                bail!("cannot switch backend while session is running; stop it first");
+            }
             return Ok(session);
+        }
+        let switch_backend = backend.filter(|b| *b != session.backend);
+        if let Some(new_backend) = switch_backend {
+            self.store.update_backend(id, new_backend).await?;
+            // Provider-scoped metadata is invalid after a backend switch.
+            self.subagent_cache.write().await.remove(id);
+            session = self.find(id).await?;
         }
         self.preflight_runtime(session.backend, session.ssh_host.as_deref())
             .await?;
@@ -1310,7 +1328,14 @@ impl SessionManager {
         self.store
             .update_state(id, SessionState::Active, session.last_activity)
             .await?;
-        if let Err(e) = self.spawn_process(&session, SpawnIntent::Existing).await {
+        // A backend switch always starts a new conversation; same-backend
+        // resume keeps Existing so --resume / resume-latest still apply.
+        let intent = if switch_backend.is_some() {
+            SpawnIntent::Fresh
+        } else {
+            SpawnIntent::Existing
+        };
+        if let Err(e) = self.spawn_process(&session, intent).await {
             // Same rollback as create(): leaving Active here means the
             // sidebar shows green but every WS attach gets "session not
             // running" until the user manually stops it. Emit the state

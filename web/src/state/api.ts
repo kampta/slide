@@ -298,7 +298,7 @@ export const api = {
     req<Session>("POST", "/api/sessions", r),
   updateSession: (
     id: string,
-    patch: { name?: string; action?: "stop" | "resume" },
+    patch: { name?: string; action?: "stop" | "resume"; backend?: Backend },
   ) => req<Session>("PATCH", sessionPath(id), patch),
   deleteSession: (id: string) =>
     req<{ ok: boolean }>("DELETE", sessionPath(id)),

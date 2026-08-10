@@ -1,6 +1,11 @@
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useSessions } from "../state/sessionStore";
-import { api, type ContextUsage } from "../state/api";
+import {
+  api,
+  type Backend,
+  type BackendInfo,
+  type ContextUsage,
+} from "../state/api";
 import type { TerminalHandle } from "./Terminal";
 import { MobileKeyBar } from "./MobileKeyBar";
 import { useIsMobile } from "../hooks/useMediaQuery";
@@ -14,6 +19,26 @@ import { ArtifactDock } from "./ArtifactDock";
 const TerminalView = lazy(() =>
   import("./Terminal").then((module) => ({ default: module.TerminalView })),
 );
+
+/** Primary Resume/Start button label when a stopped session may switch backend. */
+export function resumeActionLabel(current: Backend, selected: Backend): string {
+  return current === selected ? "Resume" : "Start";
+}
+
+/** Tooltip explaining same-backend resume vs fresh start after a backend switch. */
+export function resumeActionTitle(
+  current: Backend,
+  selected: Backend,
+  hasBackendSessionId: boolean,
+): string {
+  if (current !== selected) {
+    return `Start a fresh ${selected} conversation in this workspace. The prior ${current} conversation is not continued.`;
+  }
+  if (hasBackendSessionId) {
+    return "Resume the prior conversation.";
+  }
+  return "Resume the most recent conversation for this workspace when supported; otherwise start fresh.";
+}
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -55,6 +80,8 @@ export function SessionView() {
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [transferOpen, setTransferOpen] = useState(false);
   const [jobsOpen, setJobsOpen] = useState(false);
+  const [backends, setBackends] = useState<BackendInfo[]>([]);
+  const [resumeBackend, setResumeBackend] = useState<Backend | null>(null);
   const termRef = useRef<TerminalHandle>(null);
   const isMobile = useIsMobile();
 
@@ -80,6 +107,28 @@ export function SessionView() {
     };
   }, [session?.id, session?.backend_session_id]);
 
+  // Load backends once for the stopped-session resume picker.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .listBackends()
+      .then((items) => {
+        if (!cancelled) setBackends(items);
+      })
+      .catch(() => {
+        if (!cancelled) setBackends([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Default the picker to the session's stored backend when the active
+  // session changes (or when the store reports a switched backend after start).
+  useEffect(() => {
+    if (session) setResumeBackend(session.backend);
+  }, [session?.id, session?.backend]);
+
   if (!session) {
     return (
       <div className="session-view empty">
@@ -93,13 +142,14 @@ export function SessionView() {
 
   // Unknown means classification is uncertain, not that the process stopped.
   const isRunning = session.state !== "stopped";
-  // Resume re-enters a provider-native conversation when Slide has an id or
-  // the backend supports a cwd-scoped "latest" fallback; otherwise it starts
-  // a fresh conversation.
-  const resumeLabel = "Resume";
-  const resumeTitle = session.backend_session_id
-    ? "Resume the prior conversation."
-    : "Resume the most recent conversation for this workspace when supported; otherwise start fresh.";
+  const selectedBackend = resumeBackend ?? session.backend;
+  const resumeLabel = resumeActionLabel(session.backend, selectedBackend);
+  const resumeTitle = resumeActionTitle(
+    session.backend,
+    selectedBackend,
+    Boolean(session.backend_session_id),
+  );
+  const switchingBackend = selectedBackend !== session.backend;
 
   async function runAction(label: string, action: () => Promise<unknown>) {
     setPendingAction(label);
@@ -180,17 +230,43 @@ export function SessionView() {
               {pendingAction === "Stopping…" ? pendingAction : "Stop"}
             </button>
           ) : (
-            <button
-              title={resumeTitle}
-              disabled={pendingAction !== null}
-              onClick={() =>
-                runAction("Starting…", () =>
-                  api.updateSession(session.id, { action: "resume" }),
-                )
-              }
-            >
-              {pendingAction === "Starting…" ? pendingAction : resumeLabel}
-            </button>
+            <>
+              {backends.length > 0 && (
+                <label className="resume-backend" title="Backend to launch">
+                  <span className="sr-only">Backend</span>
+                  <select
+                    value={selectedBackend}
+                    disabled={pendingAction !== null}
+                    onChange={(event) =>
+                      setResumeBackend(event.target.value as Backend)
+                    }
+                    aria-label="Backend to launch on resume"
+                  >
+                    {backends.map((item) => (
+                      <option key={item.id} value={item.id}>
+                        {item.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              <button
+                title={resumeTitle}
+                disabled={pendingAction !== null}
+                onClick={() =>
+                  runAction("Starting…", () =>
+                    api.updateSession(session.id, {
+                      action: "resume",
+                      ...(switchingBackend
+                        ? { backend: selectedBackend }
+                        : {}),
+                    }),
+                  )
+                }
+              >
+                {pendingAction === "Starting…" ? pendingAction : resumeLabel}
+              </button>
+            </>
           )}
           <button
             className="danger"

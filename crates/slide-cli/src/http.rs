@@ -6,6 +6,7 @@ use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
+use slide_core::backend::BackendKind;
 use slide_core::scheduled::{CreateScheduledJobRequest, UpdateScheduledJobRequest};
 use slide_core::session::{CreateSessionRequest, ForkSessionRequest, HandoffRequest};
 
@@ -102,6 +103,11 @@ struct UpdateReq {
     name: Option<String>,
     #[serde(default)]
     action: Option<String>, // "stop" | "resume"
+    /// When resuming, optionally switch the session's LLM backend. Ignored
+    /// for other actions. A switch starts a fresh conversation in the same
+    /// workspace (provider conversation ids are not portable).
+    #[serde(default)]
+    backend: Option<BackendKind>,
 }
 
 async fn update_session(
@@ -111,13 +117,16 @@ async fn update_session(
 ) -> Response {
     let mgr = &state.manager;
     let result = async {
+        if req.backend.is_some() && req.action.as_deref() != Some("resume") {
+            anyhow::bail!("backend can only be set when action is \"resume\"");
+        }
         let mut session = None;
         if let Some(name) = req.name.as_deref() {
             session = Some(mgr.rename(&id, name).await?);
         }
         match req.action.as_deref() {
             Some("stop") => session = Some(mgr.stop(&id).await?),
-            Some("resume") => session = Some(mgr.resume(&id).await?),
+            Some("resume") => session = Some(mgr.resume(&id, req.backend).await?),
             Some(other) => anyhow::bail!("unknown action: {other}"),
             None => {}
         }

@@ -257,6 +257,40 @@ body.is-resizing-panels * {
   gap: 6px;
 }
 
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.resume-backend {
+  display: inline-flex;
+  align-items: center;
+  margin: 0;
+}
+
+.resume-backend select {
+  max-width: 9.5rem;
+  height: 28px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--canvas);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+
+.resume-backend select:disabled {
+  opacity: 0.55;
+}
+
 .btn-icon {
   width: 28px;
   padding: 0;
