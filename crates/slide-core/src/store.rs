@@ -270,6 +270,25 @@ impl Store {
         Ok(())
     }
 
+    /// Switch the session's LLM backend. Clears `backend_session_id` because
+    /// provider conversation ids are not portable across backends — resume
+    /// after a switch always starts a fresh conversation.
+    pub async fn update_backend(&self, id: &str, backend: BackendKind) -> Result<()> {
+        let id = id.to_string();
+        let backend = backend.as_str().to_string();
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE sessions SET backend=?1, backend_session_id=NULL WHERE id=?2",
+                    params![backend, id],
+                )?;
+                Ok(())
+            })
+            .await
+            .context("update backend")?;
+        Ok(())
+    }
+
     /// Record the backend-native session id (e.g. claude's `--resume`
     /// target) once discovery has found it.
     pub async fn update_backend_session_id(
@@ -871,6 +890,23 @@ mod tests {
         store.update_name("id1", "new-name").await.unwrap();
         let list = store.list().await.unwrap();
         assert_eq!(list[0].name, "new-name");
+    }
+
+    #[tokio::test]
+    async fn update_backend_switches_backend_and_clears_provider_session_id() {
+        let store = mem_store().await;
+        let mut session = make_session("id1", "s1");
+        session.backend = BackendKind::Claude;
+        session.backend_session_id = Some("claude-uuid".to_string());
+        store.insert(&session).await.unwrap();
+
+        store
+            .update_backend("id1", BackendKind::Codex)
+            .await
+            .unwrap();
+        let got = store.get("id1").await.unwrap().unwrap();
+        assert_eq!(got.backend, BackendKind::Codex);
+        assert!(got.backend_session_id.is_none());
     }
 
     #[tokio::test]

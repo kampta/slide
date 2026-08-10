@@ -120,7 +120,7 @@ Every running session has its own classifier task that wakes on byte activity (v
 - **Active** — bytes observed in the last ~1.5 s, or the backend's "working" regex matched the rendered pane.
 - **Waiting** — an approval/authentication modal, explicit idle hint, or settled prompt matched.
 - **Unknown** — the backend is running, but the settled pane has no reliable working or input signal. Slide periodically rechecks it.
-- **Stopped** — child process ended, or the user stopped the session. Resume continues the prior backend conversation when Slide has discovered its native conversation ID; otherwise it starts fresh.
+- **Stopped** — child process ended, or the user stopped the session. Resume continues the prior backend conversation when Slide has discovered its native conversation ID; otherwise it starts fresh. From a stopped session you can also pick a different backend before starting: that keeps the same workspace but clears the provider conversation id and launches a fresh agent (use **Branch → Hand off** if you need prior context on the new backend).
 
 ## Layout
 
