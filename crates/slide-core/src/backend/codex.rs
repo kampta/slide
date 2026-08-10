@@ -159,6 +159,12 @@ impl Backend for CodexBackend {
         Some(argv)
     }
 
+    fn resume_latest_argv(&self, _cwd: &Path) -> Option<Vec<String>> {
+        let mut argv = argv_with_permissions();
+        argv.extend(["resume".into(), "--last".into()]);
+        Some(argv)
+    }
+
     fn discover_session_id(&self, cwd: &Path, since: SystemTime) -> Option<String> {
         let root = transcript_root()?;
         discover_session_id_in(&root, cwd, since)
@@ -201,6 +207,22 @@ mod tests {
                 "--dangerously-bypass-approvals-and-sandbox",
                 "resume",
                 "abc-123"
+            ]
+        );
+    }
+
+    #[test]
+    fn resume_latest_keeps_full_permissions() {
+        let argv = CodexBackend::new()
+            .resume_latest_argv(Path::new("/tmp"))
+            .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "resume",
+                "--last",
             ]
         );
     }

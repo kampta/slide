@@ -145,6 +145,12 @@ enum TmuxExitAction {
     Retry,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnIntent {
+    Fresh,
+    Existing,
+}
+
 /// Losing a tmux *client* is not the same thing as losing the backend that
 /// tmux owns. Remote sessions hit this whenever their SSH transport blips;
 /// local sessions can hit it when an attach client is detached. Only tmux
@@ -155,6 +161,17 @@ fn tmux_exit_action(probe: crate::tmux::SessionProbe) -> TmuxExitAction {
         crate::tmux::SessionProbe::Present => TmuxExitAction::Reattach,
         crate::tmux::SessionProbe::Absent => TmuxExitAction::Stop,
         crate::tmux::SessionProbe::Unreachable => TmuxExitAction::Retry,
+    }
+}
+
+/// A failed attach is not proof that a tmux-owned backend stopped. Keep the
+/// session recoverable unless tmux itself authoritatively reports it absent.
+fn state_after_failed_reattach(probe: crate::tmux::SessionProbe) -> SessionState {
+    match probe {
+        crate::tmux::SessionProbe::Absent => SessionState::Stopped,
+        crate::tmux::SessionProbe::Present | crate::tmux::SessionProbe::Unreachable => {
+            SessionState::Unknown
+        }
     }
 }
 
@@ -313,6 +330,11 @@ impl SessionManager {
                         host = ?s.ssh_host,
                         "host unreachable at cold start; deferring reattach",
                     );
+                    mgr.persist_unattached_state(
+                        &s,
+                        state_after_failed_reattach(crate::tmux::SessionProbe::Unreachable),
+                    )
+                    .await;
                     deferred.push(s);
                 }
             }
@@ -350,6 +372,20 @@ impl SessionManager {
     /// to add metrics or filtering later.
     fn emit(&self, ev: SessionEvent) {
         let _ = self.events.send(Arc::new(ev));
+    }
+
+    async fn persist_unattached_state(&self, session: &Session, state: SessionState) {
+        if session.state == state {
+            return;
+        }
+        let _ = self
+            .store
+            .update_state(&session.id, state, session.last_activity)
+            .await;
+        self.emit(SessionEvent::SessionState {
+            id: session.id.clone(),
+            state,
+        });
     }
 
     fn operation_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -834,7 +870,7 @@ impl SessionManager {
             }
             return Err(error);
         }
-        if let Err(e) = self.spawn_process(&session).await {
+        if let Err(e) = self.spawn_process(&session, SpawnIntent::Fresh).await {
             // Roll back so a failed spawn (dead SSH, tmux missing on the
             // remote, …) doesn't leave the row Active in the sidebar — the
             // user would see a green session that hits "session not running"
@@ -861,21 +897,21 @@ impl SessionManager {
     }
 
     /// Re-attach surviving tmux sessions discovered at cold start. One
-    /// failure must not abort the whole batch — each session gets its own
-    /// spawn attempt, and on failure the row is marked Stopped so the UI
-    /// offers Resume instead of presenting a broken "running" session.
+    /// failure must not abort the whole batch. A failed attach is marked
+    /// Unknown and handed to the same bounded recovery loop used for a lost
+    /// SSH attach process; only an authoritative absent probe may stop it.
     async fn reattach_survivors(self: Arc<Self>, survivors: Vec<Session>) {
         for s in survivors {
-            if let Err(e) = self.spawn_process(&s).await {
-                tracing::warn!(session = %s.id, error = %format!("{e:#}"), "reattach failed");
-                let _ = self
-                    .store
-                    .update_state(&s.id, SessionState::Stopped, now_ms())
-                    .await;
-                self.emit(SessionEvent::SessionState {
-                    id: s.id.clone(),
-                    state: SessionState::Stopped,
-                });
+            if let Err(e) = self.spawn_process(&s, SpawnIntent::Existing).await {
+                tracing::warn!(session = %s.id, error = %format!("{e:#}"), "reattach failed; retrying");
+                self.persist_unattached_state(
+                    &s,
+                    state_after_failed_reattach(crate::tmux::SessionProbe::Present),
+                )
+                .await;
+                let mgr = self.clone();
+                let id = s.id.clone();
+                tokio::spawn(async move { mgr.recover_tmux_attachment(id, None).await });
             }
         }
     }
@@ -903,7 +939,11 @@ impl SessionManager {
                     continue;
                 }
                 let s = match self.find(&s.id).await {
-                    Ok(s) => s,
+                    Ok(s) if !matches!(s.state, SessionState::Stopped) => s,
+                    Ok(_) => {
+                        resolved_any = true;
+                        continue;
+                    }
                     Err(_) => {
                         resolved_any = true;
                         continue;
@@ -921,20 +961,18 @@ impl SessionManager {
                 match probe {
                     crate::tmux::SessionProbe::Present => {
                         resolved_any = true;
-                        if let Err(e) = self.spawn_process(&s).await {
+                        if let Err(e) = self.spawn_process(&s, SpawnIntent::Existing).await {
                             tracing::warn!(
                                 session = %s.id,
                                 error = %format!("{e:#}"),
-                                "deferred reattach failed",
+                                "deferred reattach failed; retrying",
                             );
-                            let _ = self
-                                .store
-                                .update_state(&s.id, SessionState::Stopped, now_ms())
-                                .await;
-                            self.emit(SessionEvent::SessionState {
-                                id: s.id.clone(),
-                                state: SessionState::Stopped,
-                            });
+                            self.persist_unattached_state(
+                                &s,
+                                state_after_failed_reattach(crate::tmux::SessionProbe::Present),
+                            )
+                            .await;
+                            still_pending.push(s);
                         } else {
                             self.emit(SessionEvent::SessionUpdated { session: s.clone() });
                         }
@@ -950,7 +988,14 @@ impl SessionManager {
                             state: SessionState::Stopped,
                         });
                     }
-                    crate::tmux::SessionProbe::Unreachable => still_pending.push(s),
+                    crate::tmux::SessionProbe::Unreachable => {
+                        self.persist_unattached_state(
+                            &s,
+                            state_after_failed_reattach(crate::tmux::SessionProbe::Unreachable),
+                        )
+                        .await;
+                        still_pending.push(s);
+                    }
                 }
             }
             pending = still_pending;
@@ -978,7 +1023,7 @@ impl SessionManager {
         self.store
             .update_state(id, SessionState::Active, session.last_activity)
             .await?;
-        if let Err(e) = self.spawn_process(&session).await {
+        if let Err(e) = self.spawn_process(&session, SpawnIntent::Existing).await {
             // Same rollback as create(): leaving Active here means the
             // sidebar shows green but every WS attach gets "session not
             // running" until the user manually stops it. Emit the state
@@ -1116,24 +1161,26 @@ impl SessionManager {
             .unwrap_or(crate::tmux::SessionProbe::Unreachable);
 
             match tmux_exit_action(probe) {
-                TmuxExitAction::Reattach => match self.spawn_process(&session).await {
-                    Ok(()) => {
-                        tracing::info!(
-                            session = %id,
-                            host = ?session.ssh_host,
-                            "reattached after tmux client exited",
-                        );
-                        return;
+                TmuxExitAction::Reattach => {
+                    match self.spawn_process(&session, SpawnIntent::Existing).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                session = %id,
+                                host = ?session.ssh_host,
+                                "reattached after tmux client exited",
+                            );
+                            return;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                session = %id,
+                                host = ?session.ssh_host,
+                                error = %format!("{error:#}"),
+                                "tmux session is alive but reattach failed; retrying",
+                            );
+                        }
                     }
-                    Err(error) => {
-                        tracing::warn!(
-                            session = %id,
-                            host = ?session.ssh_host,
-                            error = %format!("{error:#}"),
-                            "tmux session is alive but reattach failed; retrying",
-                        );
-                    }
-                },
+                }
                 TmuxExitAction::Stop => {
                     self.mark_exited(&id, code).await;
                     return;
@@ -1180,6 +1227,7 @@ impl SessionManager {
     fn spawn_process<'a>(
         self: &'a Arc<Self>,
         session: &'a Session,
+        intent: SpawnIntent,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             let backend = backend::for_kind(session.backend);
@@ -1187,14 +1235,19 @@ impl SessionManager {
             // the backend*. The supervisor is responsible for wrapping this in
             // whatever transport is needed (direct exec, tmux, ssh+tmux).
             let host_cwd = PathBuf::from(&session.project_path);
-            // If we've previously discovered the backend's native session id
-            // and this backend supports resume (e.g. `claude --resume <id>`),
-            // prefer that argv so a fresh tmux invocation continues the same
-            // conversation rather than starting over.
+            // Existing sessions prefer a discovered provider-native id. A
+            // backend may also offer a cwd-scoped latest-session fallback
+            // (Codex `resume --last`) so remote conversations without a
+            // locally-discovered id survive an explicit stop/resume.
             let backend_argv = session
                 .backend_session_id
                 .as_deref()
                 .and_then(|sid| backend.resume_argv(&host_cwd, sid))
+                .or_else(|| {
+                    matches!(intent, SpawnIntent::Existing)
+                        .then(|| backend.resume_latest_argv(&host_cwd))
+                        .flatten()
+                })
                 .unwrap_or_else(|| backend.argv(&host_cwd));
             let backend_env = backend.env();
 
@@ -1674,9 +1727,9 @@ fn strip_ansi(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        classification_turn_boundary, effective_min_size, remove_if_current, strip_ansi,
-        tmux_exit_action, turn_diff_worker, valid_id, ByteRing, TmuxExitAction, TurnBoundary,
-        RING_CAP,
+        classification_turn_boundary, effective_min_size, remove_if_current,
+        state_after_failed_reattach, strip_ansi, tmux_exit_action, turn_diff_worker, valid_id,
+        ByteRing, TmuxExitAction, TurnBoundary, RING_CAP,
     };
     use crate::backend::BackendKind;
     use crate::session::{Location, Session, SessionState, SupervisorKind};
@@ -1791,6 +1844,30 @@ mod tests {
         assert_eq!(
             tmux_exit_action(SessionProbe::Unreachable),
             TmuxExitAction::Retry,
+        );
+    }
+
+    #[test]
+    fn failed_reattach_does_not_stop_a_present_tmux_backend() {
+        assert_eq!(
+            state_after_failed_reattach(SessionProbe::Present),
+            SessionState::Unknown,
+        );
+    }
+
+    #[test]
+    fn failed_reattach_does_not_stop_an_unreachable_remote_backend() {
+        assert_eq!(
+            state_after_failed_reattach(SessionProbe::Unreachable),
+            SessionState::Unknown,
+        );
+    }
+
+    #[test]
+    fn authoritative_absence_stops_a_tmux_backend() {
+        assert_eq!(
+            state_after_failed_reattach(SessionProbe::Absent),
+            SessionState::Stopped,
         );
     }
 

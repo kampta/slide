@@ -88,19 +88,13 @@ export function SessionView() {
 
   // Unknown means classification is uncertain, not that the process stopped.
   const isRunning = session.state !== "stopped";
-  const canContinue = !!session.backend_session_id;
-  // Three labels for the resume button:
-  //   Attach      — tmux still has it (running). No button: the terminal IS
-  //                 the attach.
-  //   Continue    — tmux is gone but we recorded the backend's native
-  //                 session id; next spawn uses the backend's native
-  //                 resume command.
-  //   Start fresh — tmux is gone and we never recorded an id; next spawn
-  //                 starts a new conversation.
-  const resumeLabel = canContinue ? "Continue" : "Start fresh";
-  const resumeTitle = canContinue
+  // Resume re-enters a provider-native conversation when Slide has an id or
+  // the backend supports a cwd-scoped "latest" fallback; otherwise it starts
+  // a fresh conversation.
+  const resumeLabel = "Resume";
+  const resumeTitle = session.backend_session_id
     ? "Resume the prior conversation."
-    : "Start a new conversation. No prior transcript is available to resume.";
+    : "Resume the most recent conversation for this workspace when supported; otherwise start fresh.";
 
   async function runAction(label: string, action: () => Promise<unknown>) {
     setPendingAction(label);
