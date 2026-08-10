@@ -144,7 +144,7 @@ export function SessionList({
           <div className="empty">
             No sessions yet.<br />
             <span className="desktop-only">
-              Press <kbd>Alt</kbd>+<kbd>N</kbd> to create one.
+              Select New session to create one.
             </span>
             <span className="mobile-only">Tap + to create one.</span>
           </div>

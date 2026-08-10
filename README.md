@@ -1,6 +1,6 @@
 # slide
 
-A lightweight IDE for juggling coding-agent sessions (Claude Code, Codex, …) at once. The session list keeps live work first and stopped work collapsed. Each local session runs in an auto-created git worktree so concurrent agents don't stomp on each other.
+A lightweight IDE for juggling Claude Code, Codex, Grok, Google Antigravity, and OpenCode sessions at once. The session list keeps live work first and stopped work collapsed. Each local session runs in an auto-created git worktree so concurrent agents don't stomp on each other.
 
 Architecture: a small Rust daemon (`slide serve`) hosts an HTTP+WebSocket API and serves a React SPA. Open it in any browser.
 
@@ -15,6 +15,8 @@ cd slide
 ```
 
 The bootstrap script installs the pinned Rust toolchain, Node.js, and the web dependencies. Run it once per machine.
+
+Slide launches agent CLIs already installed on the daemon host. Install and authenticate whichever backends you plan to use: `claude`, `codex`, `grok`, Antigravity's `agy`, or `opencode`. For remote sessions, install the selected CLI on the remote host.
 
 ## Development mode
 
@@ -64,17 +66,18 @@ When a backend exposes structured child-agent metadata, Slide shows a collapsibl
 ## New session
 
 - **Name** (required) — shown in the left panel and used as the worktree folder / branch if auto-creating one.
-- **Backend** — reported by the daemon (`claude` and `codex` today). Additions implement the `Backend` trait and metadata in `crates/slide-core/src/backend/`; the UI needs no new hardcoded option.
+- **Backend** — reported by the daemon rather than hardcoded in the dialog. Current choices are Claude, Codex, Grok, Antigravity, and OpenCode.
 - **Base directory** (required) — a git repo. Remembered across dialogs.
 - **Location** — Local or Remote (SSH host).
 
 ## State model
 
-Every running session has its own classifier task that wakes on byte activity (via `tokio::sync::Notify`) or a per-session settle deadline. No global polling ticker.
+Every running session has its own classifier task that wakes on byte activity (via `tokio::sync::Notify`) or a per-session deadline. Unknown states use a bounded retry timer; there is no global polling ticker.
 
 - **Active** — bytes observed in the last ~1.5 s, or the backend's "working" regex matched the rendered pane.
-- **Waiting** — bytes have settled AND the backend's prompt regex matched (or an explicit idle hint).
-- **Stopped** — child process ended, or the user stopped the session. Resume spawns a fresh backend that, when supported, continues the previous conversation via `--resume`.
+- **Waiting** — an approval/authentication modal, explicit idle hint, or settled prompt matched.
+- **Unknown** — the backend is running, but the settled pane has no reliable working or input signal. Slide periodically rechecks it.
+- **Stopped** — child process ended, or the user stopped the session. Resume continues the prior backend conversation when Slide has discovered its native conversation ID; otherwise it starts fresh.
 
 ## Layout
 

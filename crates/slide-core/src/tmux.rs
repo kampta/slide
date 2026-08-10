@@ -162,7 +162,7 @@ pub fn new_session(
 /// - `set -g mouse on` is required for tmux to react to wheel events
 ///   (its default `WheelUpPane` binding enters `copy-mode -e` and pages
 ///   through pane history — the only scroll mechanism that works inside
-///   an alt-screen TUI like Claude / Codex, since xterm.js's own
+///   an alt-screen agent TUI, since xterm.js's own
 ///   scrollback is empty in that buffer).
 ///
 /// - The `unbind-key` calls keep tmux from consuming drag events for its
