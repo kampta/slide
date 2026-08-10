@@ -1,5 +1,5 @@
 use super::{Backend, BackendKind};
-use crate::classifier::Signals;
+use crate::classifier::{common_needs_input_signals, Signals};
 use regex::Regex;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -30,6 +30,7 @@ const DEFAULT_PERMISSIONS: &str = r#""allow""#;
 /// still streaming.
 fn signals() -> &'static Signals {
     SIGNALS.get_or_init(|| Signals {
+        needs_input: common_needs_input_signals(),
         working: vec![Regex::new(
             r"(?mi)\b(?:esc|ctrl[\s+-]*c)\s+(?:to\s+)?(?:interrupt|stop|cancel)\b",
         )

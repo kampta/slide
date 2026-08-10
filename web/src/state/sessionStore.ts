@@ -30,8 +30,8 @@ interface Store {
 }
 
 function sortOrder(a: Session, b: Session): number {
-  // Stopped always sinks to the bottom; live sessions (active+waiting) interleave
-  // by recency so a session bouncing between the two states keeps its position.
+  // Stopped always sinks to the bottom; every live state interleaves by
+  // recency so classification changes do not move a session around.
   const aStopped = a.state === "stopped" ? 1 : 0;
   const bStopped = b.state === "stopped" ? 1 : 0;
   if (aStopped !== bStopped) return aStopped - bStopped;

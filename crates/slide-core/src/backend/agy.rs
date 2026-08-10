@@ -1,5 +1,5 @@
 use super::{Backend, BackendKind};
-use crate::classifier::Signals;
+use crate::classifier::{common_needs_input_signals, Signals};
 use regex::Regex;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -31,6 +31,7 @@ fn argv_with_permissions() -> Vec<String> {
 /// have changed from Esc to Ctrl+C, so accept both documented key labels.
 fn signals() -> &'static Signals {
     SIGNALS.get_or_init(|| Signals {
+        needs_input: common_needs_input_signals(),
         working: vec![Regex::new(
             r"(?mi)\b(?:esc|ctrl[\s+-]*c)\s+(?:to\s+)?(?:interrupt|stop|cancel)\b",
         )

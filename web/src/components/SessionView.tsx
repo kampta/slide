@@ -80,23 +80,15 @@ export function SessionView() {
       <div className="session-view empty">
         <div>
           <h1>slide</h1>
-          <p>Pick a session on the left, or press <kbd>Alt</kbd>+<kbd>N</kbd> to create one.</p>
-          <p className="hint">
-            <kbd>Alt</kbd>+<kbd>J</kbd>/<kbd>K</kbd> next/prev •{" "}
-            <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd> cycle waiting •{" "}
-            <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> cycle active
-          </p>
+          <p>Pick a session on the left, or create a new one.</p>
         </div>
       </div>
     );
   }
 
-  const isRunning = session.state === "active" || session.state === "waiting";
+  // Unknown means classification is uncertain, not that the process stopped.
+  const isRunning = session.state !== "stopped";
   const canContinue = !!session.backend_session_id;
-  const resumeCommand =
-    session.backend === "codex"
-      ? `${session.backend} resume`
-      : `${session.backend} --resume`;
   // Three labels for the resume button:
   //   Attach      — tmux still has it (running). No button: the terminal IS
   //                 the attach.
@@ -107,7 +99,7 @@ export function SessionView() {
   //                 starts a new conversation.
   const resumeLabel = canContinue ? "Continue" : "Start fresh";
   const resumeTitle = canContinue
-    ? `Resume the prior conversation (${resumeCommand}).`
+    ? "Resume the prior conversation."
     : "Start a new conversation. No prior transcript is available to resume.";
 
   async function runAction(label: string, action: () => Promise<unknown>) {
