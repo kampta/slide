@@ -23,6 +23,8 @@ const BROADCAST_CAP: usize = 256;
 const SUBAGENT_CACHE_TTL: Duration = Duration::from_secs(3);
 const ATTACH_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const ATTACH_RETRY_MAX: Duration = Duration::from_secs(30);
+const UNKNOWN_RECHECK_INITIAL: Duration = Duration::from_secs(5);
+const UNKNOWN_RECHECK_MAX: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct CachedSubagents {
@@ -1215,11 +1217,11 @@ struct ClassifierCtx {
 /// pure [`classifier::classify`] on it. State changes are persisted and
 /// broadcast.
 ///
-/// The cost shape is the win: a stable Waiting session sits in
-/// `notified().await` indefinitely (no CPU, no SSH), and a steady-output
-/// session captures pane at most every `settle_ms` instead of every 500ms
-/// regardless of activity. Aborted via `Running::Drop` when the session
-/// stops or the daemon goes down.
+/// A stable Waiting or positively-identified Active session sits in
+/// `notified().await` indefinitely. Unknown panes and capture failures are
+/// retried with a 5–30 second backoff, preventing a transient SSH/tmux failure
+/// or an unrecognized modal from leaving a stale state forever. Aborted via
+/// `Running::Drop` when the session stops or the daemon goes down.
 async fn classifier_task(ctx: ClassifierCtx) {
     let ClassifierCtx {
         mgr,
@@ -1234,6 +1236,7 @@ async fn classifier_task(ctx: ClassifierCtx) {
     } = ctx;
     let signals = backend::for_kind(backend_kind).signals();
     let mut last_state = initial_state;
+    let mut unknown_recheck = UNKNOWN_RECHECK_INITIAL;
 
     loop {
         let activity = last_activity.load(Ordering::SeqCst);
@@ -1241,9 +1244,9 @@ async fn classifier_task(ctx: ClassifierCtx) {
         let elapsed = now.saturating_sub(activity);
         let settle_ms = signals.settle_ms as i64;
 
-        // Pane snapshot. Failure (e.g. tmux session torn down between read
-        // and capture) leaves state unchanged — the exit watcher will mark
-        // Stopped when the PTY actually ends.
+        // Pane snapshot. A capture failure is uncertain rather than evidence
+        // that the last state is still true. The exit watcher remains the
+        // authority for transitioning to Stopped.
         let pane = match supervisor {
             SupervisorKind::Tmux => {
                 let host = ssh_host.clone();
@@ -1262,7 +1265,7 @@ async fn classifier_task(ctx: ClassifierCtx) {
             }
         };
 
-        let desired = match pane {
+        let classification = match pane {
             Some(pane) => classifier::classify(
                 &classifier::Snapshot {
                     pane: &pane,
@@ -1270,14 +1273,27 @@ async fn classifier_task(ctx: ClassifierCtx) {
                 },
                 signals,
             ),
-            None => last_state,
+            None => classifier::Classification {
+                state: SessionState::Unknown,
+                reason: classifier::ClassificationReason::CaptureFailed,
+            },
         };
+        let desired = classification.state;
         if desired != last_state {
-            let _ = mgr.store.update_state(&id, desired, now).await;
+            // Classification is not terminal activity. Preserve the actual
+            // last byte timestamp so sorting and the next settle calculation
+            // remain meaningful.
+            let _ = mgr.store.update_state(&id, desired, activity).await;
             mgr.emit(SessionEvent::SessionState {
                 id: id.clone(),
                 state: desired,
             });
+            tracing::debug!(
+                session = %id,
+                state = desired.as_str(),
+                reason = ?classification.reason,
+                "classified session state"
+            );
             last_state = desired;
         }
 
@@ -1285,16 +1301,28 @@ async fn classifier_task(ctx: ClassifierCtx) {
         // - Inside the settle window: wait for the window to expire (so the
         //   prompt regex gets its fair shot) OR for fresh bytes (which will
         //   reset the window on the next iteration).
-        // - Past the settle window: there's nothing more to learn until
-        //   bytes arrive. Park indefinitely on `notified()` — no timer, no
-        //   tmux capture, no SSH round trip.
-        if elapsed < settle_ms {
+        // - Unknown/capture failure: retry with bounded backoff, since silence
+        //   alone cannot make the state more certain and remote capture can
+        //   recover without PTY bytes arriving.
+        // - Known and settled: park until fresh bytes arrive.
+        if desired == SessionState::Unknown {
+            let delay = unknown_recheck;
+            unknown_recheck = std::cmp::min(unknown_recheck.saturating_mul(2), UNKNOWN_RECHECK_MAX);
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = activity_notify.notified() => {
+                    unknown_recheck = UNKNOWN_RECHECK_INITIAL;
+                }
+            }
+        } else if elapsed < settle_ms {
+            unknown_recheck = UNKNOWN_RECHECK_INITIAL;
             let remaining = (settle_ms - elapsed).max(1) as u64;
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(remaining)) => {}
                 _ = activity_notify.notified() => {}
             }
         } else {
+            unknown_recheck = UNKNOWN_RECHECK_INITIAL;
             activity_notify.notified().await;
         }
     }

@@ -169,7 +169,7 @@ pub trait Backend: Send + Sync {
     }
 
     /// The patterns this backend exposes for session-state classification.
-    /// See [`crate::classifier`] for how they combine into Active/Waiting.
+    /// See [`crate::classifier`] for how they combine into session state.
     /// One `Signals` per backend, built lazily into a `OnceLock`, so calls
     /// are cheap and the regex compile cost is paid once.
     fn signals(&self) -> &'static Signals;
@@ -314,6 +314,10 @@ mod tests {
             assert!(
                 !s.prompt.is_empty() || !s.idle_hints.is_empty(),
                 "{kind:?} has no way to signal Waiting",
+            );
+            assert!(
+                !s.needs_input.is_empty(),
+                "{kind:?} has no way to recognize approval prompts",
             );
             assert!(s.settle_ms > 0, "{kind:?} settle_ms must be > 0");
         }

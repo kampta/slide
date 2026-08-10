@@ -17,7 +17,11 @@ export function SessionItem({
       onClick={onClick}
       aria-current={active ? "page" : undefined}
     >
-      <span className={`dot dot-${session.state}`} />
+      <span
+        className={`dot dot-${session.state}`}
+        title={session.state === "unknown" ? "State unknown — session is still running" : session.state}
+        aria-label={`Session state: ${session.state}`}
+      />
       <SessionPath session={session} />
       <span className="badge">{session.backend}</span>
     </button>

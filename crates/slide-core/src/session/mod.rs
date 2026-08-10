@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 pub enum SessionState {
     Active,
     Waiting,
+    /// The backend is running, but the rendered pane has no reliable working
+    /// or input signal. Kept distinct from Active so uncertainty is visible.
+    Unknown,
     /// Backend is not running. Covers both "process exited on its own" and
     /// "user stopped it" — previously split as Exited/Archived. Resume
     /// brings it back.
@@ -20,6 +23,7 @@ impl SessionState {
         match self {
             SessionState::Active => "active",
             SessionState::Waiting => "waiting",
+            SessionState::Unknown => "unknown",
             SessionState::Stopped => "stopped",
         }
     }
@@ -29,6 +33,7 @@ impl SessionState {
         match s {
             "active" => Some(Self::Active),
             "waiting" => Some(Self::Waiting),
+            "unknown" => Some(Self::Unknown),
             // Migrate legacy names in case a row slips through without the
             // SQL migration (e.g. a test harness writing raw strings).
             "stopped" | "exited" | "archived" => Some(Self::Stopped),
@@ -163,6 +168,7 @@ mod tests {
         let cases = [
             (SessionState::Active, "active"),
             (SessionState::Waiting, "waiting"),
+            (SessionState::Unknown, "unknown"),
             (SessionState::Stopped, "stopped"),
         ];
         for (state, s) in cases {
@@ -186,8 +192,8 @@ mod tests {
     }
 
     #[test]
-    fn session_state_unknown_returns_none() {
-        assert_eq!(SessionState::from_str("unknown"), None);
+    fn session_state_invalid_returns_none() {
+        assert_eq!(SessionState::from_str("busy"), None);
         assert_eq!(SessionState::from_str(""), None);
     }
 

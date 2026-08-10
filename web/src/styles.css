@@ -13,6 +13,7 @@
   --danger: #f08a9b;
   --active: #8fcf9b;
   --waiting: #e8bd70;
+  --unknown: #9aa7b8;
   --stopped: #69717d;
   --radius: 6px;
   --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -370,6 +371,11 @@ body.is-resizing-panels * {
 
 .dot-waiting {
   background: var(--waiting);
+}
+
+.dot-unknown {
+  border: 1.5px solid var(--unknown);
+  background: transparent;
 }
 
 .session-path {
