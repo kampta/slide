@@ -32,7 +32,7 @@ pub struct Signals {
     /// the pane stops moving.
     pub prompt: Vec<Regex>,
     /// Byte-silence gate before `prompt` is consulted. 1500 ms comfortably
-    /// clears Claude/Codex per-second spinner redraws.
+    /// clears the supported TUIs' periodic spinner redraws.
     pub settle_ms: u64,
 }
 
