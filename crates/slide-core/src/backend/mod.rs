@@ -3,11 +3,17 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::SystemTime;
 
+mod agy;
 mod claude;
 mod codex;
+mod grok;
+mod opencode;
 
+pub use agy::AgyBackend;
 pub use claude::ClaudeBackend;
 pub use codex::CodexBackend;
+pub use grok::GrokBackend;
+pub use opencode::OpenCodeBackend;
 
 /// Per-turn context snapshot for a backend, read from the transcript the
 /// backend writes to disk. `used_tokens` is what the model ingested on the
@@ -29,6 +35,10 @@ pub struct ContextUsage {
 pub enum BackendKind {
     Claude,
     Codex,
+    Grok,
+    #[serde(rename = "agy", alias = "antigravity")]
+    Antigravity,
+    OpenCode,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -39,12 +49,21 @@ pub struct BackendInfo {
 }
 
 impl BackendKind {
-    pub const ALL: [Self; 2] = [Self::Claude, Self::Codex];
+    pub const ALL: [Self; 5] = [
+        Self::Claude,
+        Self::Codex,
+        Self::Grok,
+        Self::Antigravity,
+        Self::OpenCode,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             BackendKind::Claude => "claude",
             BackendKind::Codex => "codex",
+            BackendKind::Grok => "grok",
+            BackendKind::Antigravity => "agy",
+            BackendKind::OpenCode => "opencode",
         }
     }
 
@@ -53,6 +72,9 @@ impl BackendKind {
         match s {
             "claude" => Some(BackendKind::Claude),
             "codex" => Some(BackendKind::Codex),
+            "grok" => Some(BackendKind::Grok),
+            "agy" | "antigravity" => Some(BackendKind::Antigravity),
+            "opencode" => Some(BackendKind::OpenCode),
             _ => None,
         }
     }
@@ -69,6 +91,21 @@ impl BackendKind {
                 label: "Codex",
                 context_usage: false,
             },
+            Self::Grok => BackendInfo {
+                id: self,
+                label: "Grok",
+                context_usage: false,
+            },
+            Self::Antigravity => BackendInfo {
+                id: self,
+                label: "Antigravity",
+                context_usage: false,
+            },
+            Self::OpenCode => BackendInfo {
+                id: self,
+                label: "OpenCode",
+                context_usage: false,
+            },
         }
     }
 }
@@ -83,6 +120,13 @@ pub fn available() -> Vec<BackendInfo> {
 pub trait Backend: Send + Sync {
     fn kind(&self) -> BackendKind;
     fn argv(&self, cwd: &Path) -> Vec<String>;
+
+    /// Environment overrides applied only to the backend process. This is
+    /// preferable to editing a user's global CLI configuration when a backend
+    /// exposes per-process configuration through environment variables.
+    fn env(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
 
     /// The patterns this backend exposes for session-state classification.
     /// See [`crate::classifier`] for how they combine into Active/Waiting.
@@ -119,6 +163,9 @@ pub fn for_kind(kind: BackendKind) -> Box<dyn Backend> {
     match kind {
         BackendKind::Claude => Box::new(ClaudeBackend::new()),
         BackendKind::Codex => Box::new(CodexBackend::new()),
+        BackendKind::Grok => Box::new(GrokBackend::new()),
+        BackendKind::Antigravity => Box::new(AgyBackend::new()),
+        BackendKind::OpenCode => Box::new(OpenCodeBackend::new()),
     }
 }
 
@@ -132,6 +179,9 @@ mod tests {
         let cases = [
             (BackendKind::Claude, "claude"),
             (BackendKind::Codex, "codex"),
+            (BackendKind::Grok, "grok"),
+            (BackendKind::Antigravity, "agy"),
+            (BackendKind::OpenCode, "opencode"),
         ];
         for (kind, s) in cases {
             assert_eq!(kind.as_str(), s);
@@ -143,24 +193,39 @@ mod tests {
     fn backend_kind_unknown_returns_none() {
         assert_eq!(BackendKind::from_str("gpt"), None);
         assert_eq!(BackendKind::from_str(""), None);
+        assert_eq!(
+            BackendKind::from_str("antigravity"),
+            Some(BackendKind::Antigravity)
+        );
     }
 
     #[test]
-    fn claude_backend_argv_starts_with_claude() {
-        let b = for_kind(BackendKind::Claude);
-        let argv = b.argv(Path::new("/some/path"));
-        assert!(!argv.is_empty());
-        assert_eq!(argv[0], "claude");
-        assert_eq!(b.kind(), BackendKind::Claude);
+    fn antigravity_serializes_as_its_cli_id_and_accepts_product_name() {
+        assert_eq!(
+            serde_json::to_string(&BackendKind::Antigravity).unwrap(),
+            "\"agy\""
+        );
+        assert_eq!(
+            serde_json::from_str::<BackendKind>("\"antigravity\"").unwrap(),
+            BackendKind::Antigravity
+        );
     }
 
     #[test]
-    fn codex_backend_argv_starts_with_codex() {
-        let b = for_kind(BackendKind::Codex);
-        let argv = b.argv(Path::new("/some/path"));
-        assert!(!argv.is_empty());
-        assert_eq!(argv[0], "codex");
-        assert_eq!(b.kind(), BackendKind::Codex);
+    fn every_backend_argv_starts_with_its_command() {
+        let cases = [
+            (BackendKind::Claude, "claude"),
+            (BackendKind::Codex, "codex"),
+            (BackendKind::Grok, "grok"),
+            (BackendKind::Antigravity, "agy"),
+            (BackendKind::OpenCode, "opencode"),
+        ];
+        for (kind, command) in cases {
+            let backend = for_kind(kind);
+            let argv = backend.argv(Path::new("/some/path"));
+            assert_eq!(argv.first().map(String::as_str), Some(command));
+            assert_eq!(backend.kind(), kind);
+        }
     }
 
     /// Smoke test: every backend ships a non-empty `Signals` bundle with a

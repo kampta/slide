@@ -49,6 +49,8 @@ pub struct SpawnReq {
     pub id: String,
     /// Argv for the backend (the thing that runs inside the supervisor).
     pub argv: Vec<String>,
+    /// Environment overrides for the backend process only.
+    pub env: Vec<(String, String)>,
     /// Working directory for the backend, on the host that runs it.
     pub cwd: PathBuf,
     /// Absolute path where captured output should land. Under tmux this
@@ -66,6 +68,9 @@ pub struct Spawned {
     /// the backend. For direct: the backend argv itself. For tmux:
     /// `tmux attach-session -t slide-<id>` (or its ssh-wrapped form).
     pub attach_argv: Vec<String>,
+    /// Environment for the local attach process. Direct supervision starts
+    /// the backend here; tmux already applied its environment in the pane.
+    pub attach_env: Vec<(String, String)>,
     /// cwd for the attach process. For direct: the backend cwd. For tmux:
     /// any valid directory (tmux doesn't use it).
     pub attach_cwd: PathBuf,
@@ -118,6 +123,7 @@ impl Supervisor for DirectPtySupervisor {
     async fn spawn(&self, req: &SpawnReq) -> Result<Spawned> {
         Ok(Spawned {
             attach_argv: req.argv.clone(),
+            attach_env: req.env.clone(),
             attach_cwd: req.cwd.clone(),
             writes_log: WritesLog::Daemon,
         })
@@ -172,6 +178,7 @@ impl Supervisor for TmuxSupervisor {
         let id = req.id.clone();
         let cwd = req.cwd.clone();
         let argv = req.argv.clone();
+        let env = req.env.clone();
         let log_path = req.log_path.clone();
         let cols = req.cols;
         let rows = req.rows;
@@ -203,8 +210,19 @@ impl Supervisor for TmuxSupervisor {
                     // running" if the backend exits immediately on exec —
                     // the same race the old separate-calls path papered
                     // over by ordering set-mouse before new-session.
-                    tmux::create_session_with_log(host, &id, &cwd, &argv, cols, rows, &log_path)
-                        .map_err(|e| translate_dead_session_err(e, &backend_name))?;
+                    tmux::create_session_with_log(
+                        host,
+                        &id,
+                        &cwd,
+                        tmux::PaneCommand {
+                            argv: &argv,
+                            env: &env,
+                        },
+                        cols,
+                        rows,
+                        &log_path,
+                    )
+                    .map_err(|e| translate_dead_session_err(e, &backend_name))?;
                 }
                 tmux::SessionProbe::Unreachable => {
                     // Don't blindly create-new on an unreachable host: we
@@ -220,6 +238,7 @@ impl Supervisor for TmuxSupervisor {
 
         Ok(Spawned {
             attach_argv: tmux::attach_argv(self.host.as_deref(), &req.id),
+            attach_env: Vec::new(),
             // The attach process itself just needs a valid cwd; it doesn't
             // matter what since tmux owns the backend's real cwd.
             attach_cwd: dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")),
@@ -331,6 +350,7 @@ mod tests {
         let req = SpawnReq {
             id: "abc".into(),
             argv: vec!["claude".into(), "--arg".into()],
+            env: vec![("SLIDE_TEST".into(), "value".into())],
             cwd: PathBuf::from("/tmp"),
             log_path: PathBuf::from("/tmp/abc.log"),
             cols: 80,
@@ -338,6 +358,7 @@ mod tests {
         };
         let s = sup.spawn(&req).await.unwrap();
         assert_eq!(s.attach_argv, req.argv);
+        assert_eq!(s.attach_env, req.env);
         assert_eq!(s.attach_cwd, req.cwd);
         assert_eq!(s.writes_log, WritesLog::Daemon);
     }
@@ -360,6 +381,7 @@ mod tests {
         let req = SpawnReq {
             id: id.clone(),
             argv: vec!["sleep".into(), "60".into()],
+            env: Vec::new(),
             cwd: tmp.path().to_path_buf(),
             log_path: tmp.path().join(format!("{id}.log")),
             cols: 80,

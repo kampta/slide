@@ -55,7 +55,7 @@ impl Pty {
     }
 }
 
-pub fn spawn(argv: &[String], cwd: &Path) -> Result<Spawned> {
+pub fn spawn(argv: &[String], cwd: &Path, env: &[(String, String)]) -> Result<Spawned> {
     let pty_system = portable_pty::native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -74,6 +74,9 @@ pub fn spawn(argv: &[String], cwd: &Path) -> Result<Spawned> {
     cmd.cwd(cwd);
     // Make sure the child sees a sensible TERM and forwards env.
     cmd.env("TERM", "xterm-256color");
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
 
     let child = pair
         .slave

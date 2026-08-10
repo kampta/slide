@@ -22,6 +22,26 @@ impl CodexBackend {
     }
 }
 
+/// Codex permissions are sandbox/profile based rather than per-command. This
+/// per-process profile makes the whole workspace (including Git metadata)
+/// writable and enables network access for arbitrary Git remotes. Approval
+/// prompts remain enabled for operations outside that profile.
+fn argv_with_permissions() -> Vec<String> {
+    vec![
+        "codex".into(),
+        "--config".into(),
+        r#"default_permissions="slide""#.into(),
+        "--config".into(),
+        r#"permissions.slide.filesystem={":minimal"="read",":workspace_roots"={"."="write"}}"#
+            .into(),
+        "--config".into(),
+        r#"permissions.slide.network={enabled=true,domains={"*"="allow"}}"#.into(),
+        "--ask-for-approval".into(),
+        "on-request".into(),
+        "--search".into(),
+    ]
+}
+
 /// Classification patterns for codex-cli. The v0.124 prompt is a `›`
 /// followed by placeholder hint text (e.g. `› Write tests for @filename`);
 /// older builds drew `user>`, `>`, or `▌`. All kept so mixed versions
@@ -137,7 +157,7 @@ impl Backend for CodexBackend {
     }
 
     fn argv(&self, _cwd: &Path) -> Vec<String> {
-        vec!["codex".into()]
+        argv_with_permissions()
     }
 
     fn signals(&self) -> &'static Signals {
@@ -145,7 +165,9 @@ impl Backend for CodexBackend {
     }
 
     fn resume_argv(&self, _cwd: &Path, session_id: &str) -> Option<Vec<String>> {
-        Some(vec!["codex".into(), "resume".into(), session_id.into()])
+        let mut argv = argv_with_permissions();
+        argv.extend(["resume".into(), session_id.into()]);
+        Some(argv)
     }
 
     fn discover_session_id(&self, cwd: &Path, since: SystemTime) -> Option<String> {
@@ -164,7 +186,26 @@ mod tests {
     fn resume_argv_uses_resume_subcommand() {
         let b = CodexBackend::new();
         let argv = b.resume_argv(Path::new("/tmp"), "abc-123").unwrap();
-        assert_eq!(argv, vec!["codex", "resume", "abc-123"]);
+        assert_eq!(&argv[argv.len() - 2..], ["resume", "abc-123"]);
+    }
+
+    #[test]
+    fn launch_argv_enables_workspace_git_network_and_search() {
+        assert_eq!(
+            CodexBackend::new().argv(Path::new("/tmp")),
+            vec![
+                "codex",
+                "--config",
+                r#"default_permissions="slide""#,
+                "--config",
+                r#"permissions.slide.filesystem={":minimal"="read",":workspace_roots"={"."="write"}}"#,
+                "--config",
+                r#"permissions.slide.network={enabled=true,domains={"*"="allow"}}"#,
+                "--ask-for-approval",
+                "on-request",
+                "--search",
+            ]
+        );
     }
 
     fn any(regs: &[Regex], s: &str) -> bool {

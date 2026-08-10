@@ -1,4 +1,4 @@
-export type Backend = "claude" | "codex";
+export type Backend = "claude" | "codex" | "grok" | "agy" | "opencode";
 export type Location = "local" | "remote";
 export type SessionState = "active" | "waiting" | "stopped";
 export type Supervisor = "direct" | "tmux";
