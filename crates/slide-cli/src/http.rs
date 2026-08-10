@@ -21,6 +21,7 @@ pub fn routes() -> Router<AppState> {
         .route("/sessions/:id/turn-diffs", get(list_turn_diffs))
         .route("/sessions/:id/turn-diffs/:turn_diff_id", get(get_turn_diff))
         .route("/ls", get(list_dir))
+        .route("/diagnostics", get(get_runtime_diagnostics))
         .route("/backends", get(list_backends))
         .route("/ssh-hosts", get(list_ssh_hosts))
 }
@@ -151,6 +152,24 @@ async fn get_turn_diff(
         )
             .into_response(),
         Err(error) => server_error(&error),
+    }
+}
+
+#[derive(Deserialize)]
+struct DiagnosticsQuery {
+    host: Option<String>,
+    #[serde(default)]
+    refresh: bool,
+}
+
+async fn get_runtime_diagnostics(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<DiagnosticsQuery>,
+) -> Response {
+    let host = query.host.as_deref().filter(|host| !host.is_empty());
+    match state.manager.runtime_diagnostics(host, query.refresh).await {
+        Ok(diagnostics) => Json(diagnostics).into_response(),
+        Err(error) => client_error(&error),
     }
 }
 

@@ -69,6 +69,10 @@ When a backend exposes structured child-agent metadata, Slide shows a collapsibl
 
 Slide snapshots the complete Git worktree when an agent turn starts and records the incremental patch when the session returns to Waiting (or stops). The collapsible Changes dock shows per-turn file/addition/deletion counts and loads a patch only when selected. Snapshots use a private temporary Git index, so staged work is never modified; local and SSH sessions share the same behavior. History is bounded to 50 turns per session and each stored patch to 256 KiB.
 
+## Runtime diagnostics
+
+Open Runtime diagnostics from the diamond button beside **New** to check every backend CLI, authentication state, version, and tmux capability on the local machine or a configured SSH host. Probes mirror Slide's launch environment, are cached for 60 seconds, and never return command output or account identity. Session creation and resume reuse the same snapshot; creation fails before making a worktree when the selected runtime—or remote tmux—is unavailable.
+
 ## New session
 
 - **Name** (required) — shown in the left panel and used as the worktree folder / branch if auto-creating one.

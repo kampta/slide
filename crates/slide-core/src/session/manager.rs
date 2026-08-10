@@ -4,6 +4,7 @@ use crate::backend::{self, BackendKind, ContextUsage, SubagentList};
 use crate::classifier;
 use crate::config;
 use crate::git;
+use crate::runtime::{RuntimeDiagnosticsCache, RuntimeDiagnosticsSnapshot};
 use crate::store::Store;
 use crate::supervisor::{self, SpawnReq, WritesLog};
 use crate::turn_diff::{self, RepoTarget, TurnDiff, TurnDiffSummary};
@@ -240,6 +241,10 @@ pub struct SessionManager {
     /// paths; keeping the sender here lets a tracker survive a tmux attach
     /// transport reconnect without combining two turns.
     turn_diff_workers: StdMutex<HashMap<String, TurnDiffWorker>>,
+    /// Cached runtime/toolchain health per local or SSH target. The same
+    /// snapshot powers the diagnostics UI and create-time preflight, so
+    /// health polling does not duplicate version/auth probes.
+    runtime_diagnostics: Arc<RuntimeDiagnosticsCache>,
 }
 
 impl SessionManager {
@@ -256,6 +261,7 @@ impl SessionManager {
             subagent_cache: RwLock::new(HashMap::new()),
             subagent_query_locks: StdMutex::new(HashMap::new()),
             turn_diff_workers: StdMutex::new(HashMap::new()),
+            runtime_diagnostics: Arc::new(RuntimeDiagnosticsCache::default()),
         });
 
         // Cold-start reconciliation. For Direct sessions the backend died
@@ -541,6 +547,26 @@ impl SessionManager {
         self.store.get_turn_diff(id, turn_diff_id).await
     }
 
+    pub async fn runtime_diagnostics(
+        &self,
+        host: Option<&str>,
+        refresh: bool,
+    ) -> Result<RuntimeDiagnosticsSnapshot> {
+        let cache = self.runtime_diagnostics.clone();
+        let host = host.map(str::to_string);
+        tokio::task::spawn_blocking(move || cache.get(host.as_deref(), refresh))
+            .await
+            .context("join runtime diagnostics probe")?
+    }
+
+    async fn preflight_runtime(&self, backend: BackendKind, host: Option<&str>) -> Result<()> {
+        let cache = self.runtime_diagnostics.clone();
+        let host = host.map(str::to_string);
+        tokio::task::spawn_blocking(move || cache.preflight(backend, host.as_deref()))
+            .await
+            .context("join runtime preflight")?
+    }
+
     fn ensure_turn_diff_worker(
         self: &Arc<Self>,
         session: &Session,
@@ -755,22 +781,31 @@ impl SessionManager {
         Ok(())
     }
 
-    pub async fn create(self: &Arc<Self>, req: CreateSessionRequest) -> Result<Session> {
+    pub async fn create(self: &Arc<Self>, mut req: CreateSessionRequest) -> Result<Session> {
         git::validate_session_name(&req.name)?;
+        req.ssh_host = req
+            .ssh_host
+            .take()
+            .map(|host| host.trim().to_string())
+            .filter(|host| !host.is_empty());
         // Validate ssh_host early: it eventually ends up as an argv element
         // passed to `ssh`, and a leading `-` would be parsed as an option
         // (`-oProxyCommand=…` → arbitrary local code execution). Do this
         // before we touch the filesystem to keep error ordering clean.
-        if let Some(h) = req.ssh_host.as_deref().map(str::trim) {
-            if !h.is_empty() {
-                crate::ssh::validate_host(h)?;
-            }
+        if let Some(host) = req.ssh_host.as_deref() {
+            crate::ssh::validate_host(host)?;
         }
-        if matches!(req.location, Location::Remote)
-            && req.ssh_host.as_deref().unwrap_or("").trim().is_empty()
-        {
+        if matches!(req.location, Location::Remote) && req.ssh_host.is_none() {
             bail!("ssh_host is required for remote sessions");
         }
+        // Fail before creating a branch/worktree when the selected runtime
+        // cannot launch. This reuses the diagnostics cache populated by the
+        // UI, so the common path is only an in-memory lookup.
+        let diagnostic_host = req
+            .ssh_host
+            .as_deref()
+            .filter(|_| matches!(req.location, Location::Remote));
+        self.preflight_runtime(req.backend, diagnostic_host).await?;
         let id = uuid::Uuid::new_v4().to_string();
         let base = PathBuf::from(&req.base_dir);
         let (project_path, worktree_owned) = match req.project_path.as_deref() {
@@ -843,6 +878,8 @@ impl SessionManager {
             // retrying with the same name isn't blocked by a stale dir.
             let _ = self.store.delete(&session.id).await;
             self.discard_turn_diff_worker(&session.id).await;
+            self.runtime_diagnostics
+                .record_launch_failure(session.backend, session.ssh_host.as_deref());
             if worktree_owned {
                 let base = base.clone();
                 let worktree = PathBuf::from(&session.project_path);
@@ -854,6 +891,8 @@ impl SessionManager {
         self.emit(SessionEvent::SessionAdded {
             session: session.clone(),
         });
+        self.runtime_diagnostics
+            .clear_launch_failure(session.backend, session.ssh_host.as_deref());
         Ok(session)
     }
 
@@ -977,6 +1016,8 @@ impl SessionManager {
         if self.running.read().await.contains_key(id) {
             return Ok(session);
         }
+        self.preflight_runtime(session.backend, session.ssh_host.as_deref())
+            .await?;
         session.state = SessionState::Active;
         session.last_activity = now_ms();
         self.store
@@ -992,6 +1033,8 @@ impl SessionManager {
                 .update_state(id, SessionState::Stopped, now_ms())
                 .await;
             self.discard_turn_diff_worker(id).await;
+            self.runtime_diagnostics
+                .record_launch_failure(session.backend, session.ssh_host.as_deref());
             self.emit(SessionEvent::SessionState {
                 id: id.to_string(),
                 state: SessionState::Stopped,
@@ -1001,6 +1044,8 @@ impl SessionManager {
         self.emit(SessionEvent::SessionUpdated {
             session: session.clone(),
         });
+        self.runtime_diagnostics
+            .clear_launch_failure(session.backend, session.ssh_host.as_deref());
         Ok(session)
     }
 

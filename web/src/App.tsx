@@ -9,6 +9,7 @@ import {
 import { SessionList } from "./components/SessionList";
 import { SessionView } from "./components/SessionView";
 import { NewSessionDialog } from "./components/NewSessionDialog";
+import { DiagnosticsModal } from "./components/DiagnosticsModal";
 import { useSessions } from "./state/sessionStore";
 import { useIsMobile } from "./hooks/useMediaQuery";
 import { setToken } from "./state/api";
@@ -47,6 +48,7 @@ function loadSidebarCollapsed(): boolean {
 
 export function App() {
   const [newOpen, setNewOpen] = useState(false);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(loadSidebarCollapsed);
   const connect = useSessions((s) => s.connect);
@@ -164,13 +166,17 @@ export function App() {
             <SessionView />
           </main>
         ) : (
-          <SessionList onNew={() => setNewOpen(true)} />
+          <SessionList
+            onNew={() => setNewOpen(true)}
+            onDiagnostics={() => setDiagnosticsOpen(true)}
+          />
         )}
         <NewSessionDialog
           open={newOpen}
           onClose={() => setNewOpen(false)}
           onCreated={(id) => setActive(id)}
         />
+        <DiagnosticsModal open={diagnosticsOpen} onClose={() => setDiagnosticsOpen(false)} />
       </div>
     );
   }
@@ -187,6 +193,7 @@ export function App() {
       {!sidebarCollapsed && (
         <SessionList
           onNew={() => setNewOpen(true)}
+          onDiagnostics={() => setDiagnosticsOpen(true)}
           onCollapse={collapseSidebar}
         />
       )}
@@ -223,6 +230,7 @@ export function App() {
         onClose={() => setNewOpen(false)}
         onCreated={(id) => setActive(id)}
       />
+      <DiagnosticsModal open={diagnosticsOpen} onClose={() => setDiagnosticsOpen(false)} />
     </div>
   );
 }

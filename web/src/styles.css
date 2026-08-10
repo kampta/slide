@@ -256,6 +256,11 @@ body.is-resizing-panels * {
   color: var(--text-faint);
 }
 
+.runtime-diagnostics-btn {
+  font-size: 18px;
+  line-height: 1;
+}
+
 .disconnect-banner,
 .error-banner {
   border-bottom: 1px solid #4b2d34;
@@ -873,6 +878,110 @@ body.is-resizing-panels * {
   font-size: 17px;
 }
 
+.diagnostics-modal {
+  width: min(680px, 100%);
+}
+
+.diagnostics-heading,
+.diagnostic-card-title {
+  display: flex;
+  align-items: center;
+}
+
+.diagnostics-heading {
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.diagnostics-heading h2 {
+  margin-bottom: 3px;
+}
+
+.diagnostics-heading p,
+.diagnostic-card p,
+.diagnostics-loading,
+.diagnostics-checked {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.diagnostic-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.diagnostic-card {
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: var(--radius);
+  background: var(--canvas);
+}
+
+.diagnostic-card.diagnostic-ok {
+  border-left-color: var(--active);
+}
+
+.diagnostic-card.diagnostic-warn {
+  border-left-color: var(--waiting);
+}
+
+.diagnostic-card.diagnostic-danger {
+  border-left-color: var(--danger);
+}
+
+.diagnostic-card-title {
+  min-width: 0;
+  gap: 7px;
+  margin-bottom: 4px;
+}
+
+.diagnostic-card-title strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.diagnostic-card-title span {
+  padding: 1px 5px;
+  border-radius: 8px;
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  font-size: 9px;
+  text-transform: uppercase;
+}
+
+.diagnostic-card-title code {
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  color: var(--text-faint);
+  font: 9px var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diagnostic-card .diagnostic-action {
+  margin-top: 5px;
+  color: var(--waiting);
+}
+
+.diagnostic-card .diagnostic-last-error {
+  margin-top: 5px;
+  color: var(--danger);
+}
+
+.diagnostics-error {
+  margin: 0;
+}
+
+.diagnostics-checked {
+  text-align: right;
+}
+
 .modal label,
 .form-field {
   display: flex;
@@ -1157,6 +1266,10 @@ body.is-resizing-panels * {
       calc(18px + env(safe-area-inset-bottom));
     border: 0;
     border-radius: 0;
+  }
+
+  .diagnostic-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .modal input,
