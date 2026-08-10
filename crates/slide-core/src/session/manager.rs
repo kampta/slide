@@ -8,6 +8,9 @@ use crate::classifier;
 use crate::config;
 use crate::git;
 use crate::runtime::{RuntimeDiagnosticsCache, RuntimeDiagnosticsSnapshot};
+use crate::scheduled::{
+    self, CreateScheduledJobRequest, ScheduledJob, UpdateScheduledJobRequest, MAX_JOBS_PER_SESSION,
+};
 use crate::store::Store;
 use crate::supervisor::{self, SpawnReq, WritesLog};
 use crate::turn_diff::{self, RepoTarget, TurnDiff, TurnDiffSummary};
@@ -15,8 +18,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, mpsc, Notify, RwLock};
@@ -32,6 +35,9 @@ const UNKNOWN_RECHECK_INITIAL: Duration = Duration::from_secs(5);
 const UNKNOWN_RECHECK_MAX: Duration = Duration::from_secs(30);
 const HANDOFF_TAIL_BYTES: usize = 32 * 1024;
 const HANDOFF_CONTEXT_CHARS: usize = 8_000;
+const SCHEDULED_JOB_RETRY_MS: i64 = 30_000;
+const SCHEDULED_JOB_BATCH: i64 = 32;
+const SCHEDULER_ERROR_RETRY: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 struct CachedSubagents {
@@ -296,6 +302,9 @@ pub struct SessionManager {
     /// snapshot powers the diagnostics UI and create-time preflight, so
     /// health polling does not duplicate version/auth probes.
     runtime_diagnostics: Arc<RuntimeDiagnosticsCache>,
+    /// Deadline changes wake the scheduler without a periodic polling tick.
+    scheduled_job_notify: Arc<Notify>,
+    shutting_down: AtomicBool,
 }
 
 impl SessionManager {
@@ -313,6 +322,8 @@ impl SessionManager {
             subagent_query_locks: StdMutex::new(HashMap::new()),
             turn_diff_workers: StdMutex::new(HashMap::new()),
             runtime_diagnostics: Arc::new(RuntimeDiagnosticsCache::default()),
+            scheduled_job_notify: Arc::new(Notify::new()),
+            shutting_down: AtomicBool::new(false),
         });
 
         // Cold-start reconciliation. For Direct sessions the backend died
@@ -405,6 +416,7 @@ impl SessionManager {
             let mgr2 = mgr.clone();
             tokio::spawn(async move { mgr2.retry_deferred(deferred).await });
         }
+        tokio::spawn(scheduled_job_loop(Arc::downgrade(&mgr)));
 
         // No global ticker: each session's `classifier_task` (spawned in
         // `spawn_process`) reacts to byte arrivals via its own `Notify`
@@ -607,6 +619,100 @@ impl SessionManager {
     pub async fn turn_diff(&self, id: &str, turn_diff_id: i64) -> Result<Option<TurnDiff>> {
         check_id(id)?;
         self.store.get_turn_diff(id, turn_diff_id).await
+    }
+
+    pub async fn scheduled_jobs(&self, session_id: &str) -> Result<Vec<ScheduledJob>> {
+        check_id(session_id)?;
+        self.find(session_id).await?;
+        self.store.list_scheduled_jobs(session_id).await
+    }
+
+    pub async fn create_scheduled_job(
+        &self,
+        session_id: &str,
+        request: CreateScheduledJobRequest,
+    ) -> Result<ScheduledJob> {
+        check_id(session_id)?;
+        self.find(session_id).await?;
+        if self.store.list_scheduled_jobs(session_id).await?.len() >= MAX_JOBS_PER_SESSION as usize
+        {
+            bail!("a session may have at most {MAX_JOBS_PER_SESSION} scheduled jobs");
+        }
+        let job = scheduled::build_job(session_id, request, now_ms())?;
+        let job = self
+            .store
+            .insert_scheduled_job(job)
+            .await?
+            .context("scheduled job could not be created")?;
+        self.scheduled_job_notify.notify_one();
+        Ok(job)
+    }
+
+    pub async fn update_scheduled_job(
+        &self,
+        session_id: &str,
+        job_id: &str,
+        request: UpdateScheduledJobRequest,
+    ) -> Result<ScheduledJob> {
+        check_id(session_id)?;
+        check_id(job_id)?;
+        self.find(session_id).await?;
+        let job = self
+            .store
+            .set_scheduled_job_enabled(session_id, job_id, request.enabled, now_ms())
+            .await?
+            .context("scheduled job not found")?;
+        self.scheduled_job_notify.notify_one();
+        Ok(job)
+    }
+
+    pub async fn delete_scheduled_job(&self, session_id: &str, job_id: &str) -> Result<()> {
+        check_id(session_id)?;
+        check_id(job_id)?;
+        if !self.store.delete_scheduled_job(session_id, job_id).await? {
+            bail!("scheduled job not found");
+        }
+        self.scheduled_job_notify.notify_one();
+        Ok(())
+    }
+
+    pub async fn run_scheduled_job_now(
+        &self,
+        session_id: &str,
+        job_id: &str,
+    ) -> Result<ScheduledJob> {
+        check_id(session_id)?;
+        check_id(job_id)?;
+        let job = self
+            .store
+            .get_scheduled_job(session_id, job_id)
+            .await?
+            .context("scheduled job not found")?;
+        self.submit_scheduled_job(&job, false).await?;
+        self.store
+            .get_scheduled_job(session_id, job_id)
+            .await?
+            .context("scheduled job not found")
+    }
+
+    pub async fn artifacts(&self, session_id: &str) -> Result<crate::artifacts::ArtifactList> {
+        check_id(session_id)?;
+        let session = self.find(session_id).await?;
+        tokio::task::spawn_blocking(move || crate::artifacts::list(&session))
+            .await
+            .context("join artifact listing")?
+    }
+
+    pub async fn artifact(
+        &self,
+        session_id: &str,
+        artifact_id: usize,
+    ) -> Result<crate::artifacts::ArtifactPayload> {
+        check_id(session_id)?;
+        let session = self.find(session_id).await?;
+        tokio::task::spawn_blocking(move || crate::artifacts::load(&session, artifact_id))
+            .await
+            .context("join artifact read")?
     }
 
     pub async fn runtime_diagnostics(
@@ -839,6 +945,10 @@ impl SessionManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(id);
         let _ = tokio::fs::remove_file(config::logs_dir().join(format!("{id}.log"))).await;
+        if matches!(session.location, Location::Local) {
+            let _ = tokio::fs::remove_file(config::artifact_manifest_path(id)).await;
+        }
+        self.scheduled_job_notify.notify_one();
         self.emit(SessionEvent::SessionRemoved { id: id.to_string() });
         Ok(())
     }
@@ -1385,6 +1495,8 @@ impl SessionManager {
     /// purpose: they're detached from the daemon by design and survive
     /// across daemon restarts.
     pub async fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        self.scheduled_job_notify.notify_waiters();
         let ids: Vec<String> = {
             let running = self.running.read().await;
             running.keys().cloned().collect()
@@ -1395,6 +1507,57 @@ impl SessionManager {
                 self.kill_running(&id).await;
             }
         }
+    }
+
+    async fn submit_scheduled_job(&self, job: &ScheduledJob, claim_due: bool) -> Result<()> {
+        let operation = self.operation_lock(&job.session_id);
+        let _guard = operation.lock().await;
+        let session = self.find(&job.session_id).await?;
+        let running = self.running.read().await.contains_key(&job.session_id);
+        if !matches!(session.state, SessionState::Waiting) || !running {
+            if claim_due {
+                let now = now_ms();
+                let _ = self
+                    .store
+                    .defer_scheduled_job(
+                        job,
+                        now.saturating_add(SCHEDULED_JOB_RETRY_MS),
+                        "waiting for the session to become idle",
+                        now,
+                    )
+                    .await?;
+                self.scheduled_job_notify.notify_one();
+                return Ok(());
+            }
+            bail!("session must be running and Waiting before this job can run");
+        }
+
+        let now = now_ms();
+        if claim_due {
+            if !self.store.claim_scheduled_job(job, now).await? {
+                return Ok(());
+            }
+        } else if !self.store.claim_manual_scheduled_job(job, now).await? {
+            bail!("scheduled job changed before it could run");
+        }
+        let mut prompt = scheduled::dispatch_prompt(job).into_bytes();
+        prompt.push(b'\r');
+        if let Err(error) = self.write_input(&job.session_id, &prompt).await {
+            let rolled_back = self
+                .store
+                .rollback_scheduled_job_claim(job, now, "terminal submission failed")
+                .await
+                .unwrap_or(false);
+            if !rolled_back {
+                let _ = self
+                    .store
+                    .record_scheduled_job_error(&job.id, "terminal submission failed", now)
+                    .await;
+            }
+            return Err(error);
+        }
+        self.scheduled_job_notify.notify_one();
+        Ok(())
     }
 
     /// Boxed because the exit watcher can recover a tmux attachment by
@@ -1431,7 +1594,12 @@ impl SessionManager {
                     .fork_argv(&host_cwd, provider_session_id, prompt.as_deref())
                     .context("backend does not support provider-native forks")?,
             };
-            let backend_env = backend.env();
+            let mut backend_env = backend.env();
+            backend_env.push(("SLIDE_SESSION_ID".to_string(), session.id.clone()));
+            backend_env.push((
+                "SLIDE_ARTIFACT_MANIFEST".to_string(),
+                crate::artifacts::manifest_path(session),
+            ));
 
             if matches!(session.location, Location::Remote) && session.ssh_host.is_none() {
                 bail!("remote session missing ssh_host");
@@ -1614,6 +1782,89 @@ impl SessionManager {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         });
+    }
+}
+
+/// One scheduler task for the daemon, sleeping until the earliest persisted
+/// deadline. CRUD wakes it through Notify; there is no fixed polling tick.
+async fn scheduled_job_loop(manager: Weak<SessionManager>) {
+    loop {
+        let Some(manager) = manager.upgrade() else {
+            return;
+        };
+        if manager.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+        let now = now_ms();
+        match manager
+            .store
+            .due_scheduled_jobs(now, SCHEDULED_JOB_BATCH)
+            .await
+        {
+            Ok(jobs) if !jobs.is_empty() => {
+                for job in jobs {
+                    if manager.shutting_down.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if let Err(error) = manager.submit_scheduled_job(&job, true).await {
+                        tracing::warn!(
+                            job = %job.id,
+                            session = %job.session_id,
+                            error = %format!("{error:#}"),
+                            "scheduled job submission failed",
+                        );
+                        let retry_now = now_ms();
+                        let _ = manager
+                            .store
+                            .defer_scheduled_job(
+                                &job,
+                                retry_now.saturating_add(SCHEDULED_JOB_RETRY_MS),
+                                "scheduled submission failed",
+                                retry_now,
+                            )
+                            .await;
+                    }
+                }
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "scheduled job query failed");
+                let notify = manager.scheduled_job_notify.clone();
+                drop(manager);
+                tokio::select! {
+                    _ = notify.notified() => {}
+                    _ = tokio::time::sleep(SCHEDULER_ERROR_RETRY) => {}
+                }
+                continue;
+            }
+        }
+
+        let wake = match manager.store.next_scheduled_wake().await {
+            Ok(wake) => wake,
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "scheduled wake query failed");
+                let notify = manager.scheduled_job_notify.clone();
+                drop(manager);
+                tokio::select! {
+                    _ = notify.notified() => {}
+                    _ = tokio::time::sleep(SCHEDULER_ERROR_RETRY) => {}
+                }
+                continue;
+            }
+        };
+        let notify = manager.scheduled_job_notify.clone();
+        drop(manager);
+        match wake {
+            Some(wake) => {
+                let delay = Duration::from_millis(wake.saturating_sub(now_ms()).max(0) as u64);
+                tokio::select! {
+                    _ = notify.notified() => {}
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+            None => notify.notified().await,
+        }
     }
 }
 

@@ -200,6 +200,47 @@ export interface TurnDiff extends TurnDiffSummary {
   patch: string;
 }
 
+export interface ScheduledJob {
+  id: string;
+  session_id: string;
+  title: string;
+  prompt: string;
+  schedule_kind: "once" | "interval";
+  interval_seconds: number | null;
+  next_run_at: number;
+  retry_at: number | null;
+  enabled: boolean;
+  last_run_at: number | null;
+  last_error: string | null;
+  run_count: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface CreateScheduledJobRequest {
+  title: string;
+  prompt: string;
+  schedule_kind: "once" | "interval";
+  interval_seconds?: number;
+  next_run_at: number;
+  enabled: boolean;
+}
+
+export interface Artifact {
+  id: number;
+  filename: string;
+  title: string | null;
+  text: string | null;
+  content_type: string;
+  size: number;
+}
+
+export interface ArtifactList {
+  manifest_present: boolean;
+  artifacts: Artifact[];
+  unavailable: number;
+}
+
 export type RuntimeStatus =
   | "ready"
   | "missing"
@@ -301,6 +342,44 @@ export const api = {
     sourceId: string,
     request: { target_session_id: string; focus: string },
   ) => req<Session>("POST", sessionPath(sourceId, "/handoff"), request),
+  listScheduledJobs: (sessionId: string) =>
+    req<ScheduledJob[]>("GET", sessionPath(sessionId, "/jobs")),
+  createScheduledJob: (sessionId: string, request: CreateScheduledJobRequest) =>
+    req<ScheduledJob>("POST", sessionPath(sessionId, "/jobs"), request),
+  updateScheduledJob: (sessionId: string, jobId: string, enabled: boolean) =>
+    req<ScheduledJob>(
+      "PATCH",
+      sessionPath(sessionId, `/jobs/${encodeURIComponent(jobId)}`),
+      { enabled },
+    ),
+  deleteScheduledJob: (sessionId: string, jobId: string) =>
+    req<{ ok: boolean }>(
+      "DELETE",
+      sessionPath(sessionId, `/jobs/${encodeURIComponent(jobId)}`),
+    ),
+  runScheduledJobNow: (sessionId: string, jobId: string) =>
+    req<ScheduledJob>(
+      "POST",
+      sessionPath(sessionId, `/jobs/${encodeURIComponent(jobId)}/run`),
+    ),
+  listArtifacts: (sessionId: string) =>
+    req<ArtifactList>("GET", sessionPath(sessionId, "/artifacts")),
+  getArtifactBlob: async (sessionId: string, artifactId: number) => {
+    const response = await fetch(
+      sessionPath(sessionId, `/artifacts/${encodeURIComponent(artifactId)}`),
+      { headers: authHeaders() },
+    );
+    if (response.status === 401) {
+      setToken("");
+      throw new Error(STALE_TOKEN_MESSAGE);
+    }
+    if (!response.ok) {
+      throw new Error(
+        `artifact fetch failed: ${response.status} ${await response.text()}`.trim(),
+      );
+    }
+    return response.blob();
+  },
   getLog: async (id: string) => {
     const res = await fetch(sessionPath(id, "/log"), {
       headers: authHeaders(),
