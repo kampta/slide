@@ -2,6 +2,8 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::turn_diff::{self, RepoTarget};
+
 pub fn is_git_repo(path: &Path) -> bool {
     // `--is-inside-work-tree` exits 0 with stdout "false" when the cwd is
     // inside a .git/ directory — checking only the exit status would let
@@ -76,6 +78,56 @@ pub fn validate_session_name(name: &str) -> Result<()> {
 /// Create a worktree rooted at `<base>/.slide-worktrees/<slug>` on branch
 /// `slide/<slug>`. Returns the worktree path.
 pub fn add_worktree(base: &Path, session_name: &str) -> Result<PathBuf> {
+    add_worktree_at(base, session_name, None)
+}
+
+/// Create an isolated worktree at the source session's current commit, then
+/// reproduce its complete Git-visible tracked/untracked file state without
+/// reading or changing the source index. The fork starts with the same files
+/// as its conversation while retaining ordinary uncommitted changes in the
+/// target. Ignored files remain local to the source worktree.
+pub fn add_worktree_from(base: &Path, session_name: &str, source: &Path) -> Result<PathBuf> {
+    if !is_git_repo(source) {
+        bail!("{} is not a git repo", source.display());
+    }
+    let source_head = revision(source, "HEAD^{commit}")?;
+    let snapshot = turn_diff::capture_snapshot(&RepoTarget {
+        path: source.to_path_buf(),
+        ssh_host: None,
+    })?
+    .context("source session is not in a Git worktree")?;
+    let worktree = add_worktree_at(base, session_name, Some(&source_head))?;
+
+    let seed = (|| -> Result<()> {
+        checked_git(
+            Command::new("git").arg("-C").arg(&worktree).args([
+                "read-tree",
+                "--reset",
+                "-u",
+                snapshot.tree_id(),
+            ]),
+            "restore source session snapshot",
+        )?;
+        // Keep the source's file contents but do not imply that its staging
+        // choices belong to the new agent. This turns snapshot-only paths
+        // back into untracked files and leaves modifications unstaged.
+        checked_git(
+            Command::new("git")
+                .arg("-C")
+                .arg(&worktree)
+                .args(["reset", "--mixed", "--quiet", "HEAD"]),
+            "reset fork worktree index",
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = seed {
+        rollback_worktree(base, &worktree, session_name);
+        return Err(error);
+    }
+    Ok(worktree)
+}
+
+fn add_worktree_at(base: &Path, session_name: &str, start_point: Option<&str>) -> Result<PathBuf> {
     if !is_git_repo(base) {
         bail!("{} is not a git repo", base.display());
     }
@@ -88,13 +140,16 @@ pub fn add_worktree(base: &Path, session_name: &str) -> Result<PathBuf> {
         bail!("worktree already exists: {}", wt.display());
     }
 
-    let out = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(&top)
         .args(["worktree", "add", "-b", &branch])
-        .arg(&wt)
-        .output()
-        .context("spawning git worktree add")?;
+        .arg(&wt);
+    if let Some(start_point) = start_point {
+        command.arg(start_point);
+    }
+    let out = command.output().context("spawning git worktree add")?;
     if !out.status.success() {
         bail!(
             "git worktree add failed: {}",
@@ -102,6 +157,52 @@ pub fn add_worktree(base: &Path, session_name: &str) -> Result<PathBuf> {
         );
     }
     Ok(wt)
+}
+
+fn revision(path: &Path, revision: &str) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--verify", revision])
+        .output()
+        .context("running git rev-parse")?;
+    if !output.status.success() {
+        bail!("source session has no commit to fork from");
+    }
+    let value = String::from_utf8(output.stdout)?.trim().to_string();
+    if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("git returned an invalid revision");
+    }
+    Ok(value)
+}
+
+fn checked_git(command: &mut Command, action: &str) -> Result<()> {
+    let output = command.output().with_context(|| action.to_string())?;
+    if !output.status.success() {
+        bail!(
+            "{action} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// Remove a worktree whose session never finished creating, including the
+/// branch Slide just created so an immediate retry can reuse the same name.
+pub fn rollback_worktree(base: &Path, worktree: &Path, session_name: &str) {
+    let Ok(top) = toplevel(base) else { return };
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(&top)
+        .args(["worktree", "remove", "--force"])
+        .arg(worktree)
+        .output();
+    let branch = format!("slide/{}", slugify(session_name));
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(top)
+        .args(["branch", "-D", &branch])
+        .output();
 }
 
 pub fn remove_worktree(base: &Path, worktree: &Path) -> Result<()> {
@@ -125,6 +226,22 @@ pub fn remove_worktree(base: &Path, worktree: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_git(path: &Path, args: &[&str]) -> std::process::Output {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        output
+    }
 
     #[test]
     fn validate_accepts_clean_names() {
@@ -156,5 +273,49 @@ mod tests {
         ] {
             assert!(validate_session_name(bad).is_err(), "accepted {bad:?}");
         }
+    }
+
+    #[test]
+    fn fork_worktree_copies_file_state_without_touching_source_index() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-q"]);
+        std::fs::write(repo.path().join("tracked.txt"), "original\n").unwrap();
+        run_git(repo.path(), &["add", "tracked.txt"]);
+        run_git(
+            repo.path(),
+            &[
+                "-c",
+                "user.name=Slide Test",
+                "-c",
+                "user.email=slide@example.invalid",
+                "commit",
+                "-qm",
+                "initial",
+            ],
+        );
+
+        let source = add_worktree(repo.path(), "source").unwrap();
+        std::fs::write(source.join("tracked.txt"), "source change\n").unwrap();
+        std::fs::write(source.join("untracked.txt"), "source only\n").unwrap();
+        run_git(&source, &["add", "tracked.txt"]);
+        let source_status = run_git(&source, &["status", "--short"]).stdout;
+
+        let fork = add_worktree_from(repo.path(), "fork", &source).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(fork.join("tracked.txt")).unwrap(),
+            "source change\n",
+        );
+        assert_eq!(
+            std::fs::read_to_string(fork.join("untracked.txt")).unwrap(),
+            "source only\n",
+        );
+        assert_eq!(
+            run_git(&source, &["status", "--short"]).stdout,
+            source_status,
+        );
+        assert_eq!(
+            String::from_utf8(run_git(&fork, &["status", "--short"]).stdout).unwrap(),
+            " M tracked.txt\n?? untracked.txt\n",
+        );
     }
 }

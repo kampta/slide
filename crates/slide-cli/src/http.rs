@@ -6,7 +6,7 @@ use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
-use slide_core::session::CreateSessionRequest;
+use slide_core::session::{CreateSessionRequest, ForkSessionRequest, HandoffRequest};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -16,6 +16,8 @@ pub fn routes() -> Router<AppState> {
             patch(update_session).delete(delete_session),
         )
         .route("/sessions/:id/log", get(get_log))
+        .route("/sessions/:id/fork", post(fork_session))
+        .route("/sessions/:id/handoff", post(handoff_session))
         .route("/sessions/:id/context", get(get_context))
         .route("/sessions/:id/subagents", get(get_subagents))
         .route("/sessions/:id/turn-diffs", get(list_turn_diffs))
@@ -126,6 +128,28 @@ async fn delete_session(State(state): State<AppState>, Path(id): Path<String>) -
     match state.manager.delete(&id).await {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
         Err(e) => server_error(&e),
+    }
+}
+
+async fn fork_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ForkSessionRequest>,
+) -> Response {
+    match state.manager.fork_session(&id, request).await {
+        Ok(session) => Json(session).into_response(),
+        Err(error) => client_error(&error),
+    }
+}
+
+async fn handoff_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<HandoffRequest>,
+) -> Response {
+    match state.manager.handoff(&id, request).await {
+        Ok(session) => Json(session).into_response(),
+        Err(error) => client_error(&error),
     }
 }
 

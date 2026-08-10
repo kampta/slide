@@ -165,6 +165,20 @@ impl Backend for CodexBackend {
         Some(argv)
     }
 
+    fn fork_argv(
+        &self,
+        _cwd: &Path,
+        session_id: &str,
+        prompt: Option<&str>,
+    ) -> Option<Vec<String>> {
+        let mut argv = argv_with_permissions();
+        argv.extend(["fork".into(), session_id.into()]);
+        if let Some(prompt) = prompt.filter(|prompt| !prompt.is_empty()) {
+            argv.push(prompt.into());
+        }
+        Some(argv)
+    }
+
     fn discover_session_id(&self, cwd: &Path, since: SystemTime) -> Option<String> {
         let root = transcript_root()?;
         discover_session_id_in(&root, cwd, since)
@@ -223,6 +237,23 @@ mod tests {
                 "--dangerously-bypass-approvals-and-sandbox",
                 "resume",
                 "--last",
+            ]
+        );
+    }
+
+    #[test]
+    fn fork_argv_uses_provider_fork_with_full_permissions() {
+        let argv = CodexBackend::new()
+            .fork_argv(Path::new("/tmp"), "abc-123", Some("try another design"))
+            .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "fork",
+                "abc-123",
+                "try another design",
             ]
         );
     }

@@ -8,6 +8,7 @@ export interface BackendInfo {
   label: string;
   context_usage: boolean;
   subagents: boolean;
+  fork: boolean;
 }
 
 export interface SshHost {
@@ -33,6 +34,7 @@ export interface Session {
   host_log_path?: string | null;
   log_offset: number;
   backend_session_id?: string | null;
+  parent_session_id?: string | null;
 }
 
 export interface CreateSessionRequest {
@@ -293,6 +295,12 @@ export const api = {
   },
   searchHistory: (query: string) =>
     req<HistorySearchResponse>("POST", "/api/history/search", { query }),
+  forkSession: (id: string, request: { name: string; focus?: string }) =>
+    req<Session>("POST", sessionPath(id, "/fork"), request),
+  handoffSession: (
+    sourceId: string,
+    request: { target_session_id: string; focus: string },
+  ) => req<Session>("POST", sessionPath(sourceId, "/handoff"), request),
   getLog: async (id: string) => {
     const res = await fetch(sessionPath(id, "/log"), {
       headers: authHeaders(),

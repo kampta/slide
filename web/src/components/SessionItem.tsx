@@ -23,6 +23,9 @@ export function SessionItem({
         aria-label={`Session state: ${session.state}`}
       />
       <SessionPath session={session} />
+      {session.parent_session_id && (
+        <span className="fork-lineage" title="Forked session" aria-label="Forked session">↳</span>
+      )}
       <span className="badge">{session.backend}</span>
     </button>
   );

@@ -51,6 +51,10 @@ pub struct RepoSnapshot {
 }
 
 impl RepoSnapshot {
+    pub(crate) fn tree_id(&self) -> &str {
+        &self.tree
+    }
+
     #[cfg(test)]
     fn new(tree: impl Into<String>) -> Self {
         Self { tree: tree.into() }

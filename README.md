@@ -77,6 +77,12 @@ Open Runtime diagnostics from the diamond button beside **New** to check every b
 
 Open Search beside **New** to find text across the persisted terminal output of every local and SSH session, including stopped sessions. Searches stream local logs with fixed memory and group remote logs into one bounded SSH command per host. Results retain only the newest distinct snippets, strip terminal control sequences, and open the matching session when selected.
 
+## Forks and handoffs
+
+Open **Branch** on a session to take work in a new direction. A native fork creates a separate provider conversation in a new Slide-managed Git worktree, copies the source worktree's current committed and uncommitted Git-visible file state without touching its index, and records its source-session lineage. Ignored files stay local to the source worktree. Native forks currently require a local Claude or Codex session whose provider conversation ID Slide has discovered; the source conversation and worktree remain unchanged.
+
+A handoff works across backends and local or SSH sessions. Choose another Waiting session and a required focus: Slide reads at most 32 KiB of recent source output, removes terminal control sequences, collapses it to one line, keeps the newest 8,000 characters, and submits it as one turn to the target. Context is transferred only by this explicit action, and the target is checked again immediately before submission so an agent that has resumed working is not interrupted.
+
 ## New session
 
 - **Name** (required) — shown in the left panel and used as the worktree folder / branch if auto-creating one.

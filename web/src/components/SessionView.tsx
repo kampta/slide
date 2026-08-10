@@ -7,6 +7,7 @@ import { useIsMobile } from "../hooks/useMediaQuery";
 import { SessionPath, sessionDisplayPath } from "./SessionPath";
 import { SubagentDock } from "./SubagentDock";
 import { TurnDiffDock } from "./TurnDiffDock";
+import { SessionTransferModal } from "./SessionTransferModal";
 
 const TerminalView = lazy(() =>
   import("./Terminal").then((module) => ({ default: module.TerminalView })),
@@ -50,6 +51,7 @@ export function SessionView() {
   const reportError = useSessions((s) => s.reportError);
   const [usage, setUsage] = useState<ContextUsage | null>(null);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [transferOpen, setTransferOpen] = useState(false);
   const termRef = useRef<TerminalHandle>(null);
   const isMobile = useIsMobile();
 
@@ -130,6 +132,12 @@ export function SessionView() {
             <span>{session.state}</span>
             <span className="sep">·</span>
             <span>{session.backend}</span>
+            {session.parent_session_id && (
+              <>
+                <span className="sep">·</span>
+                <span>fork</span>
+              </>
+            )}
             <span className="sep">·</span>
             <code title={session.project_path}>{session.project_path}</code>
             {usage && (
@@ -141,6 +149,14 @@ export function SessionView() {
           </div>
         </div>
         <div className="hdr-actions">
+          <button
+            type="button"
+            disabled={pendingAction !== null}
+            onClick={() => setTransferOpen(true)}
+            title="Fork this session or hand context to another waiting session"
+          >
+            Branch
+          </button>
           {isRunning ? (
             <button
               disabled={pendingAction !== null}
@@ -178,6 +194,12 @@ export function SessionView() {
           </button>
         </div>
       </header>
+      <SessionTransferModal
+        open={transferOpen}
+        source={session}
+        onClose={() => setTransferOpen(false)}
+        onSelect={setActive}
+      />
       {session.backend_session_id && (
         <SubagentDock
           sessionId={session.id}

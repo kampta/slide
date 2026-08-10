@@ -81,6 +81,7 @@ pub struct BackendInfo {
     pub label: &'static str,
     pub context_usage: bool,
     pub subagents: bool,
+    pub fork: bool,
 }
 
 impl BackendKind {
@@ -121,30 +122,35 @@ impl BackendKind {
                 label: "Claude",
                 context_usage: true,
                 subagents: false,
+                fork: true,
             },
             Self::Codex => BackendInfo {
                 id: self,
                 label: "Codex",
                 context_usage: false,
                 subagents: true,
+                fork: true,
             },
             Self::Grok => BackendInfo {
                 id: self,
                 label: "Grok",
                 context_usage: false,
                 subagents: false,
+                fork: false,
             },
             Self::Antigravity => BackendInfo {
                 id: self,
                 label: "Antigravity",
                 context_usage: false,
                 subagents: false,
+                fork: false,
             },
             Self::OpenCode => BackendInfo {
                 id: self,
                 label: "OpenCode",
                 context_usage: false,
                 subagents: false,
+                fork: false,
             },
         }
     }
@@ -186,6 +192,18 @@ pub trait Backend: Send + Sync {
     /// provider-native id. Used only for an existing session being relaunched,
     /// never for a newly-created session.
     fn resume_latest_argv(&self, _cwd: &Path) -> Option<Vec<String>> {
+        None
+    }
+
+    /// Start a provider-native branch of an existing conversation. The
+    /// returned process must create a new provider session id rather than
+    /// attaching both Slide sessions to the same transcript.
+    fn fork_argv(
+        &self,
+        _cwd: &Path,
+        _session_id: &str,
+        _prompt: Option<&str>,
+    ) -> Option<Vec<String>> {
         None
     }
 
@@ -335,5 +353,11 @@ mod tests {
         let available = available();
         assert_eq!(available.len(), BackendKind::ALL.len());
         assert!(available.iter().all(|backend| !backend.label.is_empty()));
+        let fork_backends = available
+            .iter()
+            .filter(|backend| backend.fork)
+            .map(|backend| backend.id)
+            .collect::<Vec<_>>();
+        assert_eq!(fork_backends, [BackendKind::Claude, BackendKind::Codex]);
     }
 }

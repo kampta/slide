@@ -1,10 +1,10 @@
 use crate::backend::BackendKind;
 use crate::session::{Location, Session, SessionState};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::{ErrorKind, Read};
+use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -123,6 +123,61 @@ pub fn search(sessions: &[Session], query: &str) -> Result<HistorySearchResponse
         unavailable_sessions,
         truncated,
     })
+}
+
+pub(crate) fn read_tail(session: &Session, limit: usize) -> Result<Vec<u8>> {
+    match session.location {
+        Location::Local => {
+            let path = session
+                .host_log_path
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| crate::config::logs_dir().join(format!("{}.log", session.id)));
+            let mut file = File::open(path)?;
+            let len = file.metadata()?.len();
+            file.seek(SeekFrom::Start(len.saturating_sub(limit as u64)))?;
+            let mut bytes = Vec::with_capacity(limit.min(len as usize));
+            file.take(limit as u64).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        }
+        Location::Remote => {
+            let host = session
+                .ssh_host
+                .as_deref()
+                .context("remote session missing SSH host")?;
+            crate::ssh::validate_host(host)?;
+            let path = session
+                .host_log_path
+                .clone()
+                .unwrap_or_else(|| format!("/tmp/slide-{}.log", session.id));
+            let remote = [
+                "tail".to_string(),
+                "-c".to_string(),
+                limit.to_string(),
+                path,
+            ]
+            .iter()
+            .map(|part| shell_quote(part))
+            .collect::<Vec<_>>()
+            .join(" ");
+            let mut command = Command::new("ssh");
+            command
+                .args(["-o", "BatchMode=yes"])
+                .args(crate::ssh::ssh_args())
+                .arg(host)
+                .arg(remote);
+            let output =
+                crate::process::run_bounded(command, limit, REMOTE_STDERR_LIMIT, REMOTE_TIMEOUT)?;
+            if output.timed_out
+                || output.stdout_truncated
+                || output.stderr_truncated
+                || !output.success
+            {
+                bail!("remote session history is unavailable");
+            }
+            Ok(output.stdout)
+        }
+    }
 }
 
 fn append_results(
@@ -270,20 +325,7 @@ fn fold_ascii(byte: u8) -> u8 {
 
 fn compact_snippet(bytes: &[u8], prefix: bool, suffix: bool) -> String {
     let raw = String::from_utf8_lossy(bytes);
-    let plain = crate::terminal_text::strip_ansi(&raw);
-    let compact = plain
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let compact = crate::terminal_text::compact(&raw);
     match (prefix, suffix, compact.is_empty()) {
         (_, _, true) => compact,
         (true, true, false) => format!("…{compact}…"),
@@ -431,6 +473,7 @@ mod tests {
             host_log_path: Some(format!("/tmp/{id}.log")),
             log_offset: 0,
             backend_session_id: None,
+            parent_session_id: None,
         }
     }
 
@@ -446,6 +489,20 @@ mod tests {
         assert_eq!(matches.items.len(), 1);
         assert!(matches.items[0].1.contains("NEEdle result"));
         assert!(!matches.items[0].1.contains("\x1b"));
+    }
+
+    #[test]
+    fn local_tail_reads_only_the_requested_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.log");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let mut source = session("tail");
+        source.location = Location::Local;
+        source.ssh_host = None;
+        source.host_log_path = Some(path.to_string_lossy().into_owned());
+
+        assert_eq!(read_tail(&source, 4).unwrap(), b"6789");
+        assert_eq!(read_tail(&source, 20).unwrap(), b"0123456789");
     }
 
     #[test]
