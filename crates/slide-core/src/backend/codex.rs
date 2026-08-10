@@ -23,6 +23,13 @@ impl CodexBackend {
     }
 }
 
+fn argv_with_permissions() -> Vec<String> {
+    vec![
+        "codex".into(),
+        "--dangerously-bypass-approvals-and-sandbox".into(),
+    ]
+}
+
 /// Classification patterns for codex-cli. The v0.124 prompt is a `›`
 /// followed by placeholder hint text (e.g. `› Write tests for @filename`);
 /// older builds drew `user>`, `>`, or `▌`. All kept so mixed versions
@@ -138,7 +145,7 @@ impl Backend for CodexBackend {
     }
 
     fn argv(&self, _cwd: &Path) -> Vec<String> {
-        vec!["codex".into()]
+        argv_with_permissions()
     }
 
     fn signals(&self) -> &'static Signals {
@@ -146,7 +153,9 @@ impl Backend for CodexBackend {
     }
 
     fn resume_argv(&self, _cwd: &Path, session_id: &str) -> Option<Vec<String>> {
-        Some(vec!["codex".into(), "resume".into(), session_id.into()])
+        let mut argv = argv_with_permissions();
+        argv.extend(["resume".into(), session_id.into()]);
+        Some(argv)
     }
 
     fn discover_session_id(&self, cwd: &Path, since: SystemTime) -> Option<String> {
@@ -171,10 +180,28 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn resume_argv_uses_resume_subcommand() {
+    fn argv_bypasses_approvals_and_sandbox() {
+        let b = CodexBackend::new();
+        let argv = b.argv(Path::new("/tmp"));
+        assert_eq!(
+            argv,
+            vec!["codex", "--dangerously-bypass-approvals-and-sandbox"]
+        );
+    }
+
+    #[test]
+    fn resume_argv_uses_resume_subcommand_with_full_permissions() {
         let b = CodexBackend::new();
         let argv = b.resume_argv(Path::new("/tmp"), "abc-123").unwrap();
-        assert_eq!(argv, vec!["codex", "resume", "abc-123"]);
+        assert_eq!(
+            argv,
+            vec![
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "resume",
+                "abc-123"
+            ]
+        );
     }
 
     fn any(regs: &[Regex], s: &str) -> bool {
