@@ -654,6 +654,143 @@ body.is-resizing-panels * {
   background: var(--surface);
 }
 
+.artifact-dock {
+  flex: none;
+  overflow: hidden;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.artifact-dock-header {
+  display: flex;
+  min-height: 30px;
+}
+
+.artifact-dock-header > button:first-child {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 14px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-align: left;
+  text-transform: uppercase;
+}
+
+.artifact-refresh {
+  width: 34px;
+  border: 0;
+  border-left: 1px solid var(--border);
+  border-radius: 0;
+}
+
+.artifact-body {
+  max-height: min(400px, 42dvh);
+  padding: 8px;
+  overflow-y: auto;
+  border-top: 1px solid var(--border);
+}
+
+.artifact-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 8px;
+}
+
+.artifact-card {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--canvas);
+}
+
+.artifact-preview {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 110px;
+  max-height: 240px;
+  overflow: hidden;
+  background: #07090b;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.artifact-preview img,
+.artifact-preview video {
+  display: block;
+  width: 100%;
+  max-height: 240px;
+  object-fit: contain;
+}
+
+.artifact-preview audio {
+  width: calc(100% - 20px);
+}
+
+.artifact-document {
+  font: 700 26px var(--font-mono);
+  color: var(--text-muted);
+}
+
+.artifact-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 9px;
+}
+
+.artifact-meta strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.artifact-meta p,
+.artifact-meta span,
+.artifact-empty,
+.artifact-unavailable {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.artifact-meta p {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.artifact-meta a {
+  width: fit-content;
+  color: var(--active);
+  font-size: 11px;
+}
+
+.artifact-empty,
+.artifact-unavailable {
+  padding: 9px;
+  text-align: center;
+}
+
+.artifact-empty code {
+  font: inherit;
+  color: var(--text-muted);
+}
+
+.artifact-unavailable {
+  color: var(--waiting);
+}
+
 .turn-diff-header {
   display: flex;
   align-items: center;
@@ -1121,6 +1258,118 @@ body.is-resizing-panels * {
   margin: 0;
 }
 
+.jobs-modal {
+  width: min(760px, 100%);
+}
+
+.jobs-create {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--canvas);
+}
+
+.jobs-create > label:first-child,
+.jobs-create > label:nth-child(2),
+.jobs-schedule-row,
+.jobs-interval-row {
+  grid-column: 1 / -1;
+}
+
+.jobs-schedule-row,
+.jobs-interval-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.jobs-create > button {
+  grid-column: 3;
+  align-self: end;
+}
+
+.jobs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-height: 44px;
+  max-height: min(330px, 38dvh);
+  overflow-y: auto;
+}
+
+.jobs-empty,
+.jobs-error {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 11px;
+  text-align: center;
+}
+
+.job-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--active);
+  border-radius: var(--radius);
+  background: var(--canvas);
+}
+
+.job-card.job-disabled {
+  border-left-color: var(--stopped);
+  opacity: 0.72;
+}
+
+.job-card-main {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.job-card-main strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.job-card-main span,
+.job-card-main small {
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
+.job-card-main p {
+  margin: 3px 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.job-card-main em {
+  color: var(--waiting);
+  font-size: 10px;
+  font-style: normal;
+}
+
+.job-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.job-card-actions button {
+  min-height: 28px;
+  padding: 4px 7px;
+  font-size: 10px;
+}
+
 .fork-lineage {
   color: var(--text-faint);
   font-size: 11px;
@@ -1368,6 +1617,14 @@ body.is-resizing-panels * {
     gap: 7px;
   }
 
+  .artifact-dock-header {
+    min-height: 36px;
+  }
+
+  .artifact-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .mobile-keybar {
     position: fixed;
     right: 0;
@@ -1414,6 +1671,21 @@ body.is-resizing-panels * {
 
   .diagnostic-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .jobs-create,
+  .jobs-schedule-row,
+  .jobs-interval-row,
+  .job-card {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .jobs-create > button {
+    grid-column: 1;
+  }
+
+  .job-card-actions {
+    flex-wrap: wrap;
   }
 
   .history-search-result-title {

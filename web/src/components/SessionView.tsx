@@ -8,6 +8,8 @@ import { SessionPath, sessionDisplayPath } from "./SessionPath";
 import { SubagentDock } from "./SubagentDock";
 import { TurnDiffDock } from "./TurnDiffDock";
 import { SessionTransferModal } from "./SessionTransferModal";
+import { JobsModal } from "./JobsModal";
+import { ArtifactDock } from "./ArtifactDock";
 
 const TerminalView = lazy(() =>
   import("./Terminal").then((module) => ({ default: module.TerminalView })),
@@ -52,6 +54,7 @@ export function SessionView() {
   const [usage, setUsage] = useState<ContextUsage | null>(null);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [transferOpen, setTransferOpen] = useState(false);
+  const [jobsOpen, setJobsOpen] = useState(false);
   const termRef = useRef<TerminalHandle>(null);
   const isMobile = useIsMobile();
 
@@ -152,6 +155,14 @@ export function SessionView() {
           <button
             type="button"
             disabled={pendingAction !== null}
+            onClick={() => setJobsOpen(true)}
+            title="Schedule prompts for this session"
+          >
+            Schedule
+          </button>
+          <button
+            type="button"
+            disabled={pendingAction !== null}
             onClick={() => setTransferOpen(true)}
             title="Fork this session or hand context to another waiting session"
           >
@@ -200,6 +211,7 @@ export function SessionView() {
         onClose={() => setTransferOpen(false)}
         onSelect={setActive}
       />
+      <JobsModal open={jobsOpen} session={session} onClose={() => setJobsOpen(false)} />
       {session.backend_session_id && (
         <SubagentDock
           sessionId={session.id}
@@ -207,6 +219,7 @@ export function SessionView() {
           live={isRunning}
         />
       )}
+      <ArtifactDock session={session} />
       <TurnDiffDock key={session.id} sessionId={session.id} live={isRunning} />
       <Suspense fallback={<div className="term-host terminal-loading">Loading terminal…</div>}>
         <TerminalView ref={termRef} sessionId={session.id} live={isRunning} />

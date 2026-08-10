@@ -13,6 +13,14 @@ pub fn logs_dir() -> PathBuf {
     data_dir().join("logs")
 }
 
+pub fn artifacts_dir() -> PathBuf {
+    data_dir().join("artifacts")
+}
+
+pub fn artifact_manifest_path(session_id: &str) -> PathBuf {
+    artifacts_dir().join(format!("{session_id}.json"))
+}
+
 pub fn db_path() -> PathBuf {
     data_dir().join("slide.db")
 }
@@ -30,6 +38,7 @@ pub fn lock_path() -> PathBuf {
 pub fn ensure_dirs() -> std::io::Result<()> {
     create_secure_dir(&data_dir())?;
     create_secure_dir(&logs_dir())?;
+    create_secure_dir(&artifacts_dir())?;
     Ok(())
 }
 
