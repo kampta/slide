@@ -1,5 +1,5 @@
 use super::{codex_subagents, Backend, BackendKind, SubagentSnapshot};
-use crate::classifier::Signals;
+use crate::classifier::{common_needs_input_signals, Signals};
 use anyhow::Result;
 use regex::Regex;
 use std::io::{BufRead, BufReader};
@@ -42,6 +42,7 @@ fn argv_with_permissions() -> Vec<String> {
 /// status string.
 fn signals() -> &'static Signals {
     SIGNALS.get_or_init(|| Signals {
+        needs_input: common_needs_input_signals(),
         working: vec![
             // Covers `Esc to interrupt`, `Ctrl+C to interrupt`, and the
             // space-separated `Ctrl C` variant some TUIs use. Case-

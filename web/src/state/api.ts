@@ -1,6 +1,6 @@
 export type Backend = "claude" | "codex" | "grok" | "agy" | "opencode";
 export type Location = "local" | "remote";
-export type SessionState = "active" | "waiting" | "stopped";
+export type SessionState = "active" | "waiting" | "unknown" | "stopped";
 export type Supervisor = "direct" | "tmux";
 
 export interface BackendInfo {

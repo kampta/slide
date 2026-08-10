@@ -1,5 +1,5 @@
 use super::{Backend, BackendKind, ContextUsage};
-use crate::classifier::Signals;
+use crate::classifier::{common_needs_input_signals, Signals};
 use regex::Regex;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -33,6 +33,7 @@ fn argv_with_permissions() -> Vec<String> {
 /// installs still classify.
 fn signals() -> &'static Signals {
     SIGNALS.get_or_init(|| Signals {
+        needs_input: common_needs_input_signals(),
         // De-anchored: newer Claude Code renders the bottom row as a single
         // `·`-separated line where the mode banner sits to the left of `esc
         // to interrupt`, so requiring start-of-line lets the idle-hint
@@ -264,7 +265,7 @@ mod tests {
             idle_ms: 5_000,
         };
         assert_eq!(
-            crate::classifier::classify(&snap, s),
+            crate::classifier::classify(&snap, s).state,
             crate::session::SessionState::Active,
         );
     }

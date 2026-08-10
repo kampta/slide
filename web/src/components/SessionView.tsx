@@ -90,7 +90,8 @@ export function SessionView() {
     );
   }
 
-  const isRunning = session.state === "active" || session.state === "waiting";
+  // Unknown means classification is uncertain, not that the process stopped.
+  const isRunning = session.state !== "stopped";
   const canContinue = !!session.backend_session_id;
   const resumeCommand =
     session.backend === "codex"
