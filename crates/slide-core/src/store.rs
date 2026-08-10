@@ -1,5 +1,6 @@
 use crate::backend::BackendKind;
 use crate::session::{Location, Session, SessionState, SupervisorKind};
+use crate::turn_diff::{NewTurnDiff, TurnDiff, TurnDiffSummary};
 use anyhow::{Context, Result};
 use rusqlite::{params, OptionalExtension, Row};
 use std::path::Path;
@@ -35,7 +36,26 @@ const MIGRATIONS: &[&str] = &[
     r#"
     UPDATE sessions SET state='stopped' WHERE state IN ('exited', 'archived');
     "#,
+    // v3 → v4: bounded, per-session Git changes captured at turn boundaries.
+    r#"
+    CREATE TABLE turn_diffs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        turn INTEGER NOT NULL,
+        started_at INTEGER NOT NULL,
+        completed_at INTEGER NOT NULL,
+        files_changed INTEGER NOT NULL,
+        additions INTEGER NOT NULL,
+        deletions INTEGER NOT NULL,
+        truncated INTEGER NOT NULL DEFAULT 0,
+        patch TEXT NOT NULL,
+        UNIQUE(session_id, turn)
+    );
+    CREATE INDEX turn_diffs_session_turn ON turn_diffs(session_id, turn DESC);
+    "#,
 ];
+
+const TURN_DIFF_HISTORY_LIMIT: i64 = 50;
 
 async fn migrate(conn: &Connection) -> Result<()> {
     conn.call(|conn| {
@@ -85,6 +105,19 @@ fn session_from_row(r: &Row<'_>) -> rusqlite::Result<Session> {
         host_log_path: r.get(12)?,
         log_offset: r.get(13)?,
         backend_session_id: r.get(14)?,
+    })
+}
+
+fn turn_diff_summary_from_row(r: &Row<'_>) -> rusqlite::Result<TurnDiffSummary> {
+    Ok(TurnDiffSummary {
+        id: r.get(0)?,
+        turn: r.get(1)?,
+        started_at: r.get(2)?,
+        completed_at: r.get(3)?,
+        files_changed: r.get::<_, i64>(4)?.max(0) as u64,
+        additions: r.get::<_, i64>(5)?.max(0) as u64,
+        deletions: r.get::<_, i64>(6)?.max(0) as u64,
+        truncated: r.get::<_, i64>(7)? != 0,
     })
 }
 
@@ -195,7 +228,10 @@ impl Store {
         let id = id.to_string();
         self.conn
             .call(move |c| {
-                c.execute("DELETE FROM sessions WHERE id=?1", params![id])?;
+                let tx = c.transaction()?;
+                tx.execute("DELETE FROM turn_diffs WHERE session_id=?1", params![id])?;
+                tx.execute("DELETE FROM sessions WHERE id=?1", params![id])?;
+                tx.commit()?;
                 Ok(())
             })
             .await
@@ -234,6 +270,117 @@ impl Store {
             .context("list sessions")?;
         Ok(rows)
     }
+
+    /// Persist one completed turn and prune old patch bodies in the same
+    /// transaction. The conditional session lookup prevents a queued diff
+    /// worker from recreating history after its session was deleted.
+    pub async fn insert_turn_diff(
+        &self,
+        session_id: &str,
+        diff: NewTurnDiff,
+    ) -> Result<Option<TurnDiffSummary>> {
+        let session_id = session_id.to_string();
+        let files_changed = to_sql_count(diff.files_changed);
+        let additions = to_sql_count(diff.additions);
+        let deletions = to_sql_count(diff.deletions);
+        self.conn
+            .call(move |c| {
+                let tx = c.transaction()?;
+                let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)",
+                    params![session_id],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    return Ok(None);
+                }
+                let turn: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(turn), 0) + 1 FROM turn_diffs WHERE session_id=?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )?;
+                tx.execute(
+                    "INSERT INTO turn_diffs
+                     (session_id, turn, started_at, completed_at, files_changed, additions, deletions, truncated, patch)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    params![
+                        session_id,
+                        turn,
+                        diff.started_at,
+                        diff.completed_at,
+                        files_changed,
+                        additions,
+                        deletions,
+                        diff.truncated as i32,
+                        diff.patch,
+                    ],
+                )?;
+                let id = tx.last_insert_rowid();
+                tx.execute(
+                    "DELETE FROM turn_diffs
+                     WHERE session_id=?1 AND turn <= ?2 - ?3",
+                    params![session_id, turn, TURN_DIFF_HISTORY_LIMIT],
+                )?;
+                tx.commit()?;
+                Ok(Some(TurnDiffSummary {
+                    id,
+                    turn,
+                    started_at: diff.started_at,
+                    completed_at: diff.completed_at,
+                    files_changed: files_changed as u64,
+                    additions: additions as u64,
+                    deletions: deletions as u64,
+                    truncated: diff.truncated,
+                }))
+            })
+            .await
+            .context("insert turn diff")
+    }
+
+    pub async fn list_turn_diffs(&self, session_id: &str) -> Result<Vec<TurnDiffSummary>> {
+        let session_id = session_id.to_string();
+        self.conn
+            .call(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT id, turn, started_at, completed_at, files_changed, additions, deletions, truncated
+                     FROM turn_diffs WHERE session_id=?1 ORDER BY turn DESC LIMIT ?2",
+                )?;
+                let rows = stmt
+                    .query_map(
+                        params![session_id, TURN_DIFF_HISTORY_LIMIT],
+                        turn_diff_summary_from_row,
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .context("list turn diffs")
+    }
+
+    pub async fn get_turn_diff(&self, session_id: &str, id: i64) -> Result<Option<TurnDiff>> {
+        let session_id = session_id.to_string();
+        self.conn
+            .call(move |c| {
+                Ok(c.query_row(
+                    "SELECT id, turn, started_at, completed_at, files_changed, additions, deletions, truncated, patch
+                     FROM turn_diffs WHERE session_id=?1 AND id=?2",
+                    params![session_id, id],
+                    |row| {
+                        Ok(TurnDiff {
+                            summary: turn_diff_summary_from_row(row)?,
+                            patch: row.get(8)?,
+                        })
+                    },
+                )
+                .optional()?)
+            })
+            .await
+            .context("get turn diff")
+    }
+}
+
+fn to_sql_count(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
 }
 
 #[cfg(test)]
@@ -265,6 +412,18 @@ mod tests {
             host_log_path: None,
             log_offset: 0,
             backend_session_id: None,
+        }
+    }
+
+    fn make_diff(n: i64) -> NewTurnDiff {
+        NewTurnDiff {
+            started_at: n * 10,
+            completed_at: n * 10 + 5,
+            files_changed: 2,
+            additions: n.max(0) as u64,
+            deletions: 1,
+            truncated: false,
+            patch: format!("diff {n}"),
         }
     }
 
@@ -333,6 +492,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn turn_diffs_roundtrip_and_are_scoped_to_their_session() {
+        let store = mem_store().await;
+        store.insert(&make_session("id1", "first")).await.unwrap();
+        store.insert(&make_session("id2", "second")).await.unwrap();
+        let inserted = store
+            .insert_turn_diff("id1", make_diff(7))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(inserted.turn, 1);
+        assert_eq!(inserted.additions, 7);
+        assert!(store.list_turn_diffs("id2").await.unwrap().is_empty());
+        let detail = store
+            .get_turn_diff("id1", inserted.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.summary, inserted);
+        assert_eq!(detail.patch, "diff 7");
+    }
+
+    #[tokio::test]
+    async fn turn_diff_history_is_bounded_and_removed_with_session() {
+        let store = mem_store().await;
+        store.insert(&make_session("id1", "first")).await.unwrap();
+        for n in 1..=TURN_DIFF_HISTORY_LIMIT + 2 {
+            store.insert_turn_diff("id1", make_diff(n)).await.unwrap();
+        }
+
+        let turns = store.list_turn_diffs("id1").await.unwrap();
+        assert_eq!(turns.len(), TURN_DIFF_HISTORY_LIMIT as usize);
+        assert_eq!(turns.first().unwrap().turn, TURN_DIFF_HISTORY_LIMIT + 2);
+        assert_eq!(turns.last().unwrap().turn, 3);
+
+        store.delete("id1").await.unwrap();
+        assert!(store.list_turn_diffs("id1").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_turn_diff_cannot_outlive_deleted_session() {
+        let store = mem_store().await;
+        assert!(store
+            .insert_turn_diff("missing", make_diff(1))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store.list_turn_diffs("missing").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn list_ordered_by_last_activity_desc() {
         let store = mem_store().await;
         let mut s1 = make_session("id1", "older");
@@ -385,7 +595,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_v0_to_v2_preserves_rows_and_defaults_new_columns() {
+    async fn migration_from_legacy_preserves_rows_and_defaults_new_columns() {
         // Simulate a database on v0 schema (pre-migration framework): a
         // fresh SQLite file with only the v1-shape table and user_version=0.
         // We use the synchronous rusqlite::Connection here intentionally —
@@ -430,7 +640,7 @@ mod tests {
         assert_eq!(got.log_offset, 0);
         assert!(got.backend_session_id.is_none());
 
-        // user_version should now be 2.
+        // user_version should now match the current schema.
         let conn = SyncConnection::open(path).unwrap();
         let v: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))

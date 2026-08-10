@@ -63,6 +63,10 @@ The terminal uses standard terminal controls. Drag to select text, use the platf
 
 When a backend exposes structured child-agent metadata, Slide shows a collapsible dock above the terminal with each descendant's name, role, state, hierarchy, and elapsed time. Codex sessions use the CLI's app-server metadata API; the snapshot is bounded and excludes prompts, tool arguments, command output, and transcript paths. Unsupported backends continue to render as ordinary terminal sessions with no empty dock.
 
+## Changes by turn
+
+Slide snapshots the complete Git worktree when an agent turn starts and records the incremental patch when the session returns to Waiting (or stops). The collapsible Changes dock shows per-turn file/addition/deletion counts and loads a patch only when selected. Snapshots use a private temporary Git index, so staged work is never modified; local and SSH sessions share the same behavior. History is bounded to 50 turns per session and each stored patch to 256 KiB.
+
 ## New session
 
 - **Name** (required) — shown in the left panel and used as the worktree folder / branch if auto-creating one.
