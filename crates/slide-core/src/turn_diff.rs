@@ -1,10 +1,8 @@
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 const MAX_PATCH_BYTES: usize = 256 * 1024;
 const MAX_STAT_BYTES: usize = 8 * 1024 * 1024;
@@ -59,14 +57,7 @@ impl RepoSnapshot {
     }
 }
 
-struct CommandOutput {
-    success: bool,
-    code: Option<i32>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    truncated: bool,
-    timed_out: bool,
-}
+type CommandOutput = crate::process::BoundedOutput;
 
 /// Snapshot the complete Git worktree through a private temporary index.
 /// The user's real index is never read or modified, while `git add -A`
@@ -127,7 +118,7 @@ pub fn diff_snapshots(
         "git diff",
     )?;
     let mut patch = String::from_utf8_lossy(&patch_output.stdout).into_owned();
-    let truncated = stat_output.truncated || patch_output.truncated;
+    let truncated = stat_output.stdout_truncated || patch_output.stdout_truncated;
     if truncated {
         if !patch.ends_with('\n') {
             patch.push('\n');
@@ -300,7 +291,7 @@ fn validate_tree(tree: &str) -> Result<()> {
 
 fn checked(command: Command, limit: usize, label: &str) -> Result<CommandOutput> {
     let output = run_raw_bounded(command, limit).with_context(|| label.to_string())?;
-    if output.truncated {
+    if output.stdout_truncated || output.stderr_truncated {
         bail!("{label} produced too much output");
     }
     ensure_success(&output, label)?;
@@ -311,7 +302,8 @@ fn run_bounded(command: Command, limit: usize, label: &str) -> Result<CommandOut
     let output = run_raw_bounded(command, limit).with_context(|| label.to_string())?;
     // Reaching the output bound intentionally kills Git. The prefix is still
     // valid data and the caller records `truncated`, so that is a success.
-    if output.timed_out || (!output.success && !output.truncated) {
+    if output.timed_out || output.stderr_truncated || (!output.success && !output.stdout_truncated)
+    {
         ensure_success(&output, label)?;
     }
     Ok(output)
@@ -332,62 +324,8 @@ fn ensure_success(output: &CommandOutput, label: &str) -> Result<()> {
     bail!("{label} failed ({status}): {}", detail.trim());
 }
 
-fn run_raw_bounded(mut command: Command, limit: usize) -> Result<CommandOutput> {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn().context("spawn command")?;
-    let mut stdout = child.stdout.take().context("capture command stdout")?;
-    let mut stderr = child.stderr.take().context("capture command stderr")?;
-    let (truncated_tx, truncated_rx) = mpsc::sync_channel(1);
-    let stdout_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
-        let _ = stdout
-            .by_ref()
-            .take((limit + 1) as u64)
-            .read_to_end(&mut bytes);
-        let truncated = bytes.len() > limit;
-        bytes.truncate(limit);
-        if truncated {
-            let _ = truncated_tx.send(());
-        }
-        (bytes, truncated)
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stderr
-            .by_ref()
-            .take((MAX_STDERR_BYTES + 1) as u64)
-            .read_to_end(&mut bytes);
-        bytes.truncate(MAX_STDERR_BYTES);
-        bytes
-    });
-
-    let deadline = Instant::now() + COMMAND_TIMEOUT;
-    let mut timed_out = false;
-    let status = loop {
-        if truncated_rx.try_recv().is_ok() {
-            let _ = child.kill();
-            break child.wait().context("wait for bounded command")?;
-        }
-        if let Some(status) = child.try_wait().context("poll command")? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            timed_out = true;
-            let _ = child.kill();
-            break child.wait().context("wait for timed out command")?;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let (bytes, truncated) = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
-    Ok(CommandOutput {
-        success: status.success(),
-        code: status.code(),
-        stdout: bytes,
-        stderr,
-        truncated,
-        timed_out,
-    })
+fn run_raw_bounded(command: Command, limit: usize) -> Result<CommandOutput> {
+    crate::process::run_bounded(command, limit, MAX_STDERR_BYTES, COMMAND_TIMEOUT)
 }
 
 fn shell_quote(value: &str) -> String {

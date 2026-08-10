@@ -12,9 +12,11 @@ function loadStoppedCollapsed(): boolean {
 
 export function SessionList({
   onNew,
+  onDiagnostics,
   onCollapse,
 }: {
   onNew: () => void;
+  onDiagnostics: () => void;
   // Optional: when present, header shows a collapse chevron. Omitted on
   // mobile where the sidebar IS the whole screen and there's nothing to
   // collapse to.
@@ -80,6 +82,15 @@ export function SessionList({
           <span className="brand-name">slide</span>
         </div>
         <div className="session-list-actions">
+          <button
+            type="button"
+            className="btn-icon runtime-diagnostics-btn"
+            onClick={onDiagnostics}
+            aria-label="Runtime diagnostics"
+            title="Runtime diagnostics"
+          >
+            ◇
+          </button>
           <button className="btn-primary" onClick={onNew}>
             + New
           </button>

@@ -198,6 +198,39 @@ export interface TurnDiff extends TurnDiffSummary {
   patch: string;
 }
 
+export type RuntimeStatus =
+  | "ready"
+  | "missing"
+  | "unauthenticated"
+  | "broken";
+
+export interface RuntimeDiagnostic {
+  backend: Backend;
+  status: RuntimeStatus;
+  available: boolean;
+  installed: boolean;
+  authenticated: boolean | null;
+  version: string | null;
+  message: string;
+  action: string | null;
+  last_error: string | null;
+}
+
+export interface RuntimeCapability {
+  available: boolean;
+  required: boolean;
+  version: string | null;
+  message: string;
+  action: string | null;
+}
+
+export interface RuntimeDiagnosticsSnapshot {
+  target: string;
+  checked_at: number;
+  backends: RuntimeDiagnostic[];
+  tmux: RuntimeCapability;
+}
+
 export const api = {
   listSessions: () => req<Session[]>("GET", "/api/sessions"),
   listBackends: () => req<BackendInfo[]>("GET", "/api/backends"),
@@ -231,6 +264,16 @@ export const api = {
       "GET",
       sessionPath(id, `/turn-diffs/${encodeURIComponent(turnDiffId)}`),
     ),
+  getRuntimeDiagnostics: (opts: { host?: string; refresh?: boolean } = {}) => {
+    const params = new URLSearchParams();
+    if (opts.host) params.set("host", opts.host);
+    if (opts.refresh) params.set("refresh", "true");
+    const query = params.toString();
+    return req<RuntimeDiagnosticsSnapshot>(
+      "GET",
+      `/api/diagnostics${query ? `?${query}` : ""}`,
+    );
+  },
   getLog: async (id: string) => {
     const res = await fetch(sessionPath(id, "/log"), {
       headers: authHeaders(),
