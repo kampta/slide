@@ -203,6 +203,7 @@ body.is-resizing-panels * {
 .session-list-header {
   display: flex;
   align-items: center;
+  gap: 10px;
   justify-content: space-between;
   min-height: 54px;
   padding: 10px 12px 10px 16px;
@@ -221,6 +222,7 @@ body.is-resizing-panels * {
 .brand {
   gap: 8px;
   min-width: 0;
+  flex: 1;
 }
 
 .brand-mark {
@@ -255,6 +257,10 @@ body.is-resizing-panels * {
 .session-list-actions,
 .hdr-actions {
   gap: 6px;
+}
+
+.session-list-actions {
+  flex: none;
 }
 
 .sr-only {
@@ -299,9 +305,12 @@ body.is-resizing-panels * {
   color: var(--text-faint);
 }
 
-.runtime-diagnostics-btn {
-  font-size: 18px;
-  line-height: 1;
+.session-new-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  white-space: nowrap;
 }
 
 .disconnect-banner,
@@ -340,6 +349,31 @@ body.is-resizing-panels * {
   min-height: 0;
   padding: 6px;
   overflow-y: auto;
+}
+
+.session-list-footer {
+  flex: none;
+  padding: 7px 8px 8px;
+  border-top: 1px solid var(--border);
+}
+
+.session-list-footer button {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  width: 100%;
+  min-height: 32px;
+  padding: 5px 8px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 12px;
+  text-align: left;
+}
+
+.session-list-footer button:hover:not(:disabled) {
+  border-color: transparent;
 }
 
 .group-bottom {
@@ -1305,6 +1339,11 @@ body.is-resizing-panels * {
   .session-list-header .btn-primary,
   .desktop-only {
     display: none;
+  }
+
+  .session-list-footer {
+    padding-right: 76px;
+    padding-bottom: calc(8px + env(safe-area-inset-bottom));
   }
 
   .mobile-only {

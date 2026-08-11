@@ -96,17 +96,11 @@ export function SessionList({
               <path d="m16 16 4 4" />
             </svg>
           </button>
-          <button
-            type="button"
-            className="btn-icon runtime-diagnostics-btn"
-            onClick={onDiagnostics}
-            aria-label="Runtime diagnostics"
-            title="Runtime diagnostics"
-          >
-            ◇
-          </button>
-          <button className="btn-primary" onClick={onNew}>
-            + New
+          <button className="btn-primary session-new-btn" onClick={onNew}>
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2.25" aria-hidden="true">
+              <path d="M12 5v14M5 12h14" />
+            </svg>
+            <span>New</span>
           </button>
           {onCollapse && (
             <button
@@ -115,7 +109,9 @@ export function SessionList({
               aria-label="Hide session list"
               title="Hide session list"
             >
-              ‹
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                <path d="M15 18l-6-6 6-6" />
+              </svg>
             </button>
           )}
         </div>
@@ -175,6 +171,14 @@ export function SessionList({
           </div>
         )}
       </div>
+      <footer className="session-list-footer">
+        <button type="button" onClick={onDiagnostics}>
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+            <path d="M3 12h4l2.5-6 5 12 2.5-6h4" />
+          </svg>
+          <span>Runtime diagnostics</span>
+        </button>
+      </footer>
       {/* FAB is always rendered but only visible on mobile (via CSS); keeps
           markup simple and avoids subscribing this component to a media
           query just to flip a single button. */}
