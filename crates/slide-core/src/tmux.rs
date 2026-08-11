@@ -98,13 +98,18 @@ fn build_pane_command(cwd: &Path, argv: &[String], env: &[(String, String)]) -> 
     let quoted: Vec<String> = argv.iter().map(|a| shell_quote(a)).collect();
     let assignments = env
         .iter()
-        .map(|(key, value)| shell_quote(&format!("{key}={value}")))
+        .map(|(key, value)| format!("{key}={}", shell_quote(value)))
         .collect::<Vec<_>>()
         .join(" ");
     let env_prefix = if assignments.is_empty() {
         String::new()
     } else {
-        format!("env {assignments} ")
+        // `exec` is a shell builtin, not an executable for `/usr/bin/env`.
+        // Keep the environment setup in the shell, then let the shell's
+        // `exec` replace itself with the backend. The previous `env ...
+        // exec ...` form made every backend exit with `env: exec: No such
+        // file or directory` as soon as it received any environment vars.
+        format!("export {assignments} && ")
     };
     let inner = format!(
         "cd {} && {}exec {}",
@@ -592,8 +597,45 @@ mod tests {
                 r#"{"read":"allow"}"#.to_string(),
             )],
         );
-        assert!(cmd.contains("OPENCODE_PERMISSION="), "missing env: {cmd}");
+        assert!(
+            cmd.contains("export OPENCODE_PERMISSION="),
+            "missing env: {cmd}"
+        );
+        assert!(
+            cmd.contains("&& exec opencode"),
+            "missing backend exec: {cmd}"
+        );
+        assert!(
+            !cmd.contains("env OPENCODE_PERMISSION"),
+            "env must not run shell builtin: {cmd}"
+        );
         assert!(cmd.contains("opencode"), "missing backend: {cmd}");
+    }
+
+    #[test]
+    fn build_pane_command_environment_reaches_backend() {
+        let cmd = build_pane_command(
+            Path::new("/tmp"),
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf '%s' \"$SLIDE_TMUX_ENV_TEST\"".to_string(),
+            ],
+            &[(
+                "SLIDE_TMUX_ENV_TEST".to_string(),
+                "value with spaces".to_string(),
+            )],
+        );
+        let output = Command::new("/bin/sh")
+            .args(["-c", &cmd])
+            .env("SHELL", "/bin/sh")
+            .output()
+            .expect("run generated pane command");
+        assert!(
+            output.status.success(),
+            "generated command failed: {output:?}"
+        );
+        assert_eq!(output.stdout, b"value with spaces");
     }
 
     #[test]
