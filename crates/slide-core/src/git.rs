@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use crate::turn_diff::{self, RepoTarget};
+use crate::git_snapshot::{self, RepoTarget};
 
 const REMOTE_GIT_OUTPUT_LIMIT: usize = 64 * 1024;
 const REMOTE_GIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -95,7 +95,7 @@ pub fn add_worktree_from(base: &Path, session_name: &str, source: &Path) -> Resu
         bail!("{} is not a git repo", source.display());
     }
     let source_head = revision(source, "HEAD^{commit}")?;
-    let snapshot = turn_diff::capture_snapshot(&RepoTarget {
+    let snapshot = git_snapshot::capture_snapshot(&RepoTarget {
         path: source.to_path_buf(),
         ssh_host: None,
     })?

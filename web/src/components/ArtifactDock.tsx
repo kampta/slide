@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, type Artifact, type ArtifactList, type Session } from "../state/api";
+import { api, type Artifact, type ArtifactList } from "../state/api";
 
 type ArtifactKind = "image" | "video" | "audio" | "document";
 
@@ -89,42 +89,28 @@ function ArtifactPreview({ sessionId, artifact }: { sessionId: string; artifact:
   );
 }
 
-export function ArtifactDock({ session }: { session: Session }) {
+export function ArtifactDock({ sessionId }: { sessionId: string }) {
   const [snapshot, setSnapshot] = useState<ArtifactList | null>(null);
+  const [failed, setFailed] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [refreshNonce, setRefreshNonce] = useState(0);
 
   useEffect(() => {
+    if (!expanded) return;
     let cancelled = false;
-    let timer: number | null = null;
-    let autoExpanded = false;
-    setSnapshot(null);
-    setExpanded(false);
-
-    const poll = async () => {
-      let delay = 30_000;
-      try {
-        const next = await api.listArtifacts(session.id);
-        if (cancelled) return;
-        setSnapshot(next);
-        if (!autoExpanded && next.artifacts.length > 0) {
-          autoExpanded = true;
-          setExpanded(true);
-        }
-        delay = next.manifest_present ? 10_000 : 30_000;
-      } catch {
-        delay = 30_000;
-      }
-      if (!cancelled && session.state !== "stopped") {
-        timer = window.setTimeout(poll, delay);
-      }
-    };
-    void poll();
+    setFailed(false);
+    void api.listArtifacts(sessionId).then(
+      (next) => {
+        if (!cancelled) setSnapshot(next);
+      },
+      () => {
+        if (!cancelled) setFailed(true);
+      },
+    );
     return () => {
       cancelled = true;
-      if (timer !== null) window.clearTimeout(timer);
     };
-  }, [refreshNonce, session.id, session.state]);
+  }, [expanded, refreshNonce, sessionId]);
 
   const artifacts = snapshot?.artifacts ?? [];
   return (
@@ -147,12 +133,14 @@ export function ArtifactDock({ session }: { session: Session }) {
       </div>
       {expanded && (
         <div className="artifact-body">
-          {artifacts.length > 0 ? (
+          {failed ? (
+            <p className="artifact-empty">Artifacts unavailable.</p>
+          ) : artifacts.length > 0 ? (
             <div className="artifact-grid">
               {artifacts.map((artifact) => (
                 <ArtifactPreview
                   key={`${artifact.id}:${artifact.filename}:${artifact.size}`}
-                  sessionId={session.id}
+                  sessionId={sessionId}
                   artifact={artifact}
                 />
               ))}

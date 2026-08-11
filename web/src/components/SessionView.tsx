@@ -11,7 +11,6 @@ import { MobileKeyBar } from "./MobileKeyBar";
 import { useIsMobile } from "../hooks/useMediaQuery";
 import { SessionPath, sessionDisplayPath } from "./SessionPath";
 import { SubagentDock } from "./SubagentDock";
-import { TurnDiffDock } from "./TurnDiffDock";
 import { SessionTransferModal } from "./SessionTransferModal";
 import { ArtifactDock } from "./ArtifactDock";
 
@@ -284,8 +283,7 @@ export function SessionView() {
           live={isRunning}
         />
       )}
-      <ArtifactDock session={session} />
-      <TurnDiffDock key={session.id} sessionId={session.id} live={isRunning} />
+      <ArtifactDock key={session.id} sessionId={session.id} />
       <Suspense fallback={<div className="term-host terminal-loading">Loading terminal…</div>}>
         <TerminalView
           ref={termRef}

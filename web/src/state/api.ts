@@ -185,21 +185,6 @@ export interface SubagentList {
   agents: Subagent[];
 }
 
-export interface TurnDiffSummary {
-  id: number;
-  turn: number;
-  started_at: number;
-  completed_at: number;
-  files_changed: number;
-  additions: number;
-  deletions: number;
-  truncated: boolean;
-}
-
-export interface TurnDiff extends TurnDiffSummary {
-  patch: string;
-}
-
 export interface Artifact {
   id: number;
   filename: string;
@@ -291,13 +276,6 @@ export const api = {
     req<ContextUsage | null>("GET", sessionPath(id, "/context")),
   getSubagents: (id: string) =>
     req<SubagentList>("GET", sessionPath(id, "/subagents")),
-  listTurnDiffs: (id: string) =>
-    req<TurnDiffSummary[]>("GET", sessionPath(id, "/turn-diffs")),
-  getTurnDiff: (id: string, turnDiffId: number) =>
-    req<TurnDiff>(
-      "GET",
-      sessionPath(id, `/turn-diffs/${encodeURIComponent(turnDiffId)}`),
-    ),
   getRuntimeDiagnostics: (opts: { host?: string; refresh?: boolean } = {}) => {
     const params = new URLSearchParams();
     if (opts.host) params.set("host", opts.host);
