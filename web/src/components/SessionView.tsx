@@ -298,7 +298,12 @@ export function SessionView() {
       <ArtifactDock session={session} />
       <TurnDiffDock key={session.id} sessionId={session.id} live={isRunning} />
       <Suspense fallback={<div className="term-host terminal-loading">Loading terminal…</div>}>
-        <TerminalView ref={termRef} sessionId={session.id} live={isRunning} />
+        <TerminalView
+          ref={termRef}
+          sessionId={session.id}
+          live={isRunning}
+          supervisor={session.supervisor}
+        />
       </Suspense>
       {isMobile && isRunning && (
         <MobileKeyBar

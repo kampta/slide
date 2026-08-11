@@ -1,6 +1,24 @@
 import type { Terminal } from "@xterm/xterm";
+import type { Supervisor } from "../state/api";
 
 export type ClipboardAction = "copy" | "native-paste";
+
+const TMUX_HANDLED_DEVICE_ATTRIBUTES = new Set([
+  "\x1b[?1;2c",
+  "\x1b[>0;276;0c",
+]);
+
+/**
+ * xterm.js emits these replies when it parses a device-attributes query from
+ * the backend. A tmux-backed session has already handled that negotiation in
+ * the PTY's terminal emulator, so forwarding xterm.js's duplicate reply can
+ * make the backend line editor echo the printable tail (for example,
+ * `0;276;0c`) into the prompt.
+ */
+export function filterTerminalResponse(data: string, supervisor: Supervisor): string {
+  if (supervisor === "tmux" && TMUX_HANDLED_DEVICE_ATTRIBUTES.has(data)) return "";
+  return data;
+}
 
 /** Identify platform clipboard shortcuts without performing the paste twice. */
 export function clipboardAction(

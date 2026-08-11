@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { clipboardAction } from "./terminalInteractions";
+import { clipboardAction, filterTerminalResponse } from "./terminalInteractions";
 
 function key(
   value: string,
@@ -40,5 +40,19 @@ describe("clipboardAction", () => {
     expect(
       clipboardAction({ ...key("v", { metaKey: true }), type: "keyup" }, true, false),
     ).toBeNull();
+  });
+});
+
+describe("filterTerminalResponse", () => {
+  it("drops duplicate xterm device-attribute replies for tmux", () => {
+    expect(filterTerminalResponse("\x1b[?1;2c", "tmux")).toBe("");
+    expect(filterTerminalResponse("\x1b[>0;276;0c", "tmux")).toBe("");
+  });
+
+  it("preserves normal input and direct-PTY terminal replies", () => {
+    expect(filterTerminalResponse("hello\r", "tmux")).toBe("hello\r");
+    expect(filterTerminalResponse("\x1b[>0;276;0c", "direct")).toBe(
+      "\x1b[>0;276;0c",
+    );
   });
 });

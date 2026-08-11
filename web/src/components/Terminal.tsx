@@ -12,11 +12,13 @@ import {
   openSessionSocket,
   WS_CLOSE_AUTH_FAILED,
 } from "../state/api";
+import type { Supervisor } from "../state/api";
 import { useIsMobile } from "../hooks/useMediaQuery";
 import {
   attachMouseSelection,
   attachTouchNavigation,
   clipboardAction,
+  filterTerminalResponse,
 } from "./terminalInteractions";
 
 /// Imperative handle exposed via forwardRef so the parent (and the
@@ -29,8 +31,8 @@ export interface TerminalHandle {
 
 export const TerminalView = forwardRef<
   TerminalHandle,
-  { sessionId: string; live?: boolean }
->(function TerminalView({ sessionId, live = true }, ref) {
+  { sessionId: string; live?: boolean; supervisor: Supervisor }
+>(function TerminalView({ sessionId, live = true, supervisor }, ref) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -119,9 +121,11 @@ export const TerminalView = forwardRef<
     }
 
     const onData = term.onData((data) => {
+      const filtered = filterTerminalResponse(data, supervisor);
+      if (!filtered) return;
       const ws = wsRef.current;
       if (ws?.readyState === WebSocket.OPEN) {
-        ws.send(new TextEncoder().encode(data));
+        ws.send(new TextEncoder().encode(filtered));
       }
     });
 
