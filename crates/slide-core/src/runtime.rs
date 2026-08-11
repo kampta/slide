@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CACHE_TTL: Duration = Duration::from_secs(60);
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+// Login shells + cold CLI startups (new binary, codesign, dyld) regularly
+// exceed a few seconds on macOS. Five seconds was too tight and a single
+// timeout used to hard-block create/resume for the full cache TTL.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 const PROBE_OUTPUT_LIMIT: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -326,11 +329,24 @@ fn probe_backend_with(
     if version.code == Some(127) {
         return missing(spec);
     }
+    // Timeouts and transient version-check failures must not mark the
+    // runtime unavailable: preflight gates create/resume on `available`,
+    // and a flaky probe would otherwise strand the user for CACHE_TTL.
     if version.timed_out {
-        return broken(spec, "The version probe timed out.");
+        return ready(
+            spec,
+            None,
+            None,
+            "Runtime version check timed out; launch may still work.",
+        );
     }
     if version.stdout_truncated || version.stderr_truncated || !version.success {
-        return broken(spec, "The version check failed.");
+        return ready(
+            spec,
+            None,
+            None,
+            "Runtime version check failed; launch may still work.",
+        );
     }
     let version = sanitized_version(&version);
     let Some(auth_probe) = spec.auth else {
@@ -569,12 +585,18 @@ fn validate_preflight(snapshot: &RuntimeDiagnosticsSnapshot, backend: BackendKin
         .iter()
         .find(|diagnostic| diagnostic.backend == backend)
         .context("runtime diagnostic missing backend")?;
-    if !diagnostic.available {
-        bail!(
-            "{} {}",
-            diagnostic.message,
-            diagnostic.action.as_deref().unwrap_or("")
-        );
+    // Only hard-block on definitive, user-actionable states. `Broken` is a
+    // probe uncertainty (timeout, weird exit) — let spawn surface the real
+    // error rather than caching a false negative across create/resume.
+    match diagnostic.status {
+        RuntimeStatus::Missing | RuntimeStatus::Unauthenticated => {
+            bail!(
+                "{} {}",
+                diagnostic.message,
+                diagnostic.action.as_deref().unwrap_or("")
+            );
+        }
+        RuntimeStatus::Ready | RuntimeStatus::Broken => {}
     }
     if snapshot.tmux.required && !snapshot.tmux.available {
         bail!(
@@ -777,6 +799,64 @@ mod tests {
         };
         let error = validate_preflight(&snapshot, BackendKind::Grok).unwrap_err();
         assert!(error.to_string().contains("install tmux"));
+    }
+
+    #[test]
+    fn version_probe_timeout_keeps_runtime_available() {
+        let diagnostic = probe_backend_with(runtime_spec(BackendKind::Claude), |_| {
+            Ok(BoundedOutput {
+                success: false,
+                code: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+                timed_out: true,
+            })
+        });
+        assert_eq!(diagnostic.status, RuntimeStatus::Ready);
+        assert!(diagnostic.available);
+        assert!(diagnostic.message.contains("timed out"));
+    }
+
+    #[test]
+    fn preflight_allows_broken_probe_but_blocks_missing() {
+        let broken = broken(runtime_spec(BackendKind::Claude), "weird failure.");
+        let missing = missing(runtime_spec(BackendKind::Codex));
+        let snapshot = RuntimeDiagnosticsSnapshot {
+            target: "local".to_string(),
+            checked_at: 0,
+            backends: vec![broken, missing],
+            tmux: RuntimeCapability {
+                available: true,
+                required: false,
+                version: Some("tmux 3.4".to_string()),
+                message: "ready".to_string(),
+                action: None,
+            },
+        };
+        validate_preflight(&snapshot, BackendKind::Claude).expect("broken must not block");
+        let error = validate_preflight(&snapshot, BackendKind::Codex).unwrap_err();
+        assert!(error.to_string().contains("not available"));
+    }
+
+    #[test]
+    fn preflight_blocks_unauthenticated() {
+        let diagnostic = unauthenticated(runtime_spec(BackendKind::Codex), Some("1.0".into()));
+        let snapshot = RuntimeDiagnosticsSnapshot {
+            target: "local".to_string(),
+            checked_at: 0,
+            backends: vec![diagnostic],
+            tmux: RuntimeCapability {
+                available: true,
+                required: false,
+                version: None,
+                message: "ready".to_string(),
+                action: None,
+            },
+        };
+        let error = validate_preflight(&snapshot, BackendKind::Codex).unwrap_err();
+        assert!(error.to_string().contains("not authenticated"));
     }
 
     #[test]

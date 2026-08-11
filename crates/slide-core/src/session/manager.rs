@@ -1321,7 +1321,13 @@ impl SessionManager {
             self.subagent_cache.write().await.remove(id);
             session = self.find(id).await?;
         }
-        self.preflight_runtime(session.backend, session.ssh_host.as_deref())
+        // Match create(): only remote sessions probe through SSH. A stale
+        // ssh_host on a local row must not force an unreachable-host preflight.
+        let diagnostic_host = session
+            .ssh_host
+            .as_deref()
+            .filter(|_| matches!(session.location, Location::Remote));
+        self.preflight_runtime(session.backend, diagnostic_host)
             .await?;
         session.state = SessionState::Active;
         session.last_activity = now_ms();
