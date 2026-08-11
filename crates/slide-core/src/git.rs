@@ -1,8 +1,12 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use crate::turn_diff::{self, RepoTarget};
+
+const REMOTE_GIT_OUTPUT_LIMIT: usize = 64 * 1024;
+const REMOTE_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn is_git_repo(path: &Path) -> bool {
     // `--is-inside-work-tree` exits 0 with stdout "false" when the cwd is
@@ -223,6 +227,163 @@ pub fn remove_worktree(base: &Path, worktree: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Create an isolated worktree on a remote host and return its absolute path.
+/// The remote repository's top-level directory is used, matching the local
+/// worktree layout even when `base` points at a subdirectory of the repo.
+pub fn add_remote_worktree(host: &str, base: &Path, session_name: &str) -> Result<PathBuf> {
+    let slug = slugify(session_name);
+    let output = run_remote_script(
+        host,
+        ADD_REMOTE_WORKTREE_SCRIPT,
+        &[base.to_string_lossy().into_owned(), slug],
+    )?;
+    let stdout = output.stdout.clone();
+    ensure_remote_success(output, "adding remote Git worktree")?;
+    let path = String::from_utf8(stdout)
+        .context("remote Git worktree path was not valid UTF-8")?
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .context("remote Git worktree command returned no path")?;
+    Ok(path)
+}
+
+/// Remove a Slide-owned worktree on a remote host. The branch is retained,
+/// matching local deletion semantics; rollback removes the branch as well.
+pub fn remove_remote_worktree(host: &str, base: &Path, worktree: &Path) -> Result<()> {
+    let output = run_remote_script(
+        host,
+        REMOVE_REMOTE_WORKTREE_SCRIPT,
+        &[
+            base.to_string_lossy().into_owned(),
+            worktree.to_string_lossy().into_owned(),
+        ],
+    )?;
+    ensure_remote_success(output, "removing remote Git worktree")
+}
+
+/// Best-effort cleanup for a worktree created before session creation or
+/// spawning failed. Unlike normal deletion, this also removes the branch so
+/// an immediate retry with the same session name can succeed.
+pub fn rollback_remote_worktree(
+    host: &str,
+    base: &Path,
+    worktree: &Path,
+    session_name: &str,
+) -> Result<()> {
+    let output = run_remote_script(
+        host,
+        ROLLBACK_REMOTE_WORKTREE_SCRIPT,
+        &[
+            base.to_string_lossy().into_owned(),
+            worktree.to_string_lossy().into_owned(),
+            slugify(session_name),
+        ],
+    )?;
+    ensure_remote_success(output, "rolling back remote Git worktree")
+}
+
+const ADD_REMOTE_WORKTREE_SCRIPT: &str = r#"set -eu
+base=$1
+slug=$2
+case "$base" in
+  "~") base=$HOME ;;
+  "~/"*) base=$HOME/${base#~/} ;;
+esac
+repo=$(git -C "$base" rev-parse --show-toplevel)
+worktree="$repo/.slide-worktrees/$slug"
+branch="slide/$slug"
+if [ -e "$worktree" ]; then
+  printf 'worktree already exists: %s\n' "$worktree" >&2
+  exit 2
+fi
+git -C "$repo" worktree add -b "$branch" "$worktree" >&2
+printf '%s\n' "$worktree"
+"#;
+
+const REMOVE_REMOTE_WORKTREE_SCRIPT: &str = r#"set -eu
+base=$1
+worktree=$2
+case "$base" in
+  "~") base=$HOME ;;
+  "~/"*) base=$HOME/${base#~/} ;;
+esac
+repo=$(git -C "$base" rev-parse --show-toplevel)
+if [ -e "$worktree" ]; then
+  git -C "$repo" worktree remove --force "$worktree"
+fi
+"#;
+
+const ROLLBACK_REMOTE_WORKTREE_SCRIPT: &str = r#"set -eu
+base=$1
+worktree=$2
+slug=$3
+case "$base" in
+  "~") base=$HOME ;;
+  "~/"*) base=$HOME/${base#~/} ;;
+esac
+repo=$(git -C "$base" rev-parse --show-toplevel)
+if [ -e "$worktree" ]; then
+  git -C "$repo" worktree remove --force "$worktree" || true
+fi
+git -C "$repo" branch -D "slide/$slug" 2>/dev/null || true
+"#;
+
+fn run_remote_script(
+    host: &str,
+    script: &str,
+    args: &[String],
+) -> Result<crate::process::BoundedOutput> {
+    crate::ssh::validate_host(host)?;
+    let mut parts = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        script.to_string(),
+        "sh".to_string(),
+    ];
+    parts.extend(args.iter().cloned());
+    let remote = parts
+        .iter()
+        .map(|part| shell_quote(part))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut command = Command::new("ssh");
+    command
+        .args(["-o", "BatchMode=yes"])
+        .args(crate::ssh::ssh_args())
+        .arg(host)
+        .arg(remote);
+    crate::process::run_bounded(
+        command,
+        REMOTE_GIT_OUTPUT_LIMIT,
+        REMOTE_GIT_OUTPUT_LIMIT,
+        REMOTE_GIT_TIMEOUT,
+    )
+}
+
+fn ensure_remote_success(output: crate::process::BoundedOutput, action: &str) -> Result<()> {
+    if output.success {
+        return Ok(());
+    }
+    if output.timed_out {
+        bail!("{action} timed out");
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.stderr_truncated {
+        bail!("{action} failed: {}…", stderr.trim());
+    }
+    bail!("{action} failed: {}", stderr.trim());
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,6 +434,40 @@ mod tests {
         ] {
             assert!(validate_session_name(bad).is_err(), "accepted {bad:?}");
         }
+    }
+
+    #[test]
+    fn remote_worktree_script_creates_isolated_worktree() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-q"]);
+        run_git(repo.path(), &["config", "user.email", "slide@test.invalid"]);
+        run_git(repo.path(), &["config", "user.name", "Slide Test"]);
+        std::fs::write(repo.path().join("README.md"), "remote worktree\n").unwrap();
+        run_git(repo.path(), &["add", "README.md"]);
+        run_git(repo.path(), &["commit", "-qm", "initial"]);
+
+        let output = Command::new("sh")
+            .args(["-c", ADD_REMOTE_WORKTREE_SCRIPT, "sh"])
+            .arg(repo.path())
+            .arg("remote-session")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "remote worktree script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let worktree = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+        assert_eq!(
+            worktree,
+            repo.path()
+                .canonicalize()
+                .unwrap()
+                .join(".slide-worktrees/remote-session")
+        );
+        assert!(worktree.join("README.md").is_file());
+        assert!(is_git_repo(&worktree));
     }
 
     #[test]

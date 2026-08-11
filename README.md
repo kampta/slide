@@ -1,6 +1,6 @@
 # slide
 
-A lightweight IDE for juggling Claude Code, Codex, Grok, Google Antigravity, and OpenCode sessions at once. The session list keeps live work first and stopped work collapsed. Each local session runs in an auto-created git worktree so concurrent agents don't stomp on each other.
+A lightweight IDE for juggling Claude Code, Codex, Grok, Google Antigravity, and OpenCode sessions at once. The session list keeps live work first and stopped work collapsed. Each session runs in an auto-created git worktree on the machine where its backend runs, so concurrent agents don't stomp on each other.
 
 Architecture: a small Rust daemon (`slide serve`) hosts an HTTP+WebSocket API and serves a React SPA. Open it in any browser.
 

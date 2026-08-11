@@ -171,6 +171,50 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+async fn remove_owned_worktree(session: &Session) -> Result<()> {
+    let base = PathBuf::from(&session.base_dir);
+    let worktree = PathBuf::from(&session.project_path);
+    match session.location {
+        Location::Local => {
+            tokio::task::spawn_blocking(move || git::remove_worktree(&base, &worktree)).await??;
+        }
+        Location::Remote => {
+            let host = session
+                .ssh_host
+                .clone()
+                .context("remote worktree is missing ssh_host")?;
+            tokio::task::spawn_blocking(move || {
+                git::remove_remote_worktree(&host, &base, &worktree)
+            })
+            .await??;
+        }
+    }
+    Ok(())
+}
+
+async fn rollback_owned_worktree(
+    location: Location,
+    ssh_host: Option<String>,
+    base: PathBuf,
+    worktree: PathBuf,
+    name: String,
+) -> Result<()> {
+    match location {
+        Location::Local => {
+            tokio::task::spawn_blocking(move || git::rollback_worktree(&base, &worktree, &name))
+                .await?;
+        }
+        Location::Remote => {
+            let host = ssh_host.context("remote worktree is missing ssh_host")?;
+            tokio::task::spawn_blocking(move || {
+                git::rollback_remote_worktree(&host, &base, &worktree, &name)
+            })
+            .await??;
+        }
+    }
+    Ok(())
+}
+
 /// Effective PTY size given the per-client map. Returns `None` when no
 /// clients are attached (the caller should leave the PTY at its prior
 /// size in that case). Otherwise returns the per-axis min so the
@@ -934,9 +978,7 @@ impl SessionManager {
         self.kill_running(id).await;
         self.discard_turn_diff_worker(id).await;
         if session.worktree {
-            let base = PathBuf::from(&session.base_dir);
-            let wt = PathBuf::from(&session.project_path);
-            tokio::task::spawn_blocking(move || git::remove_worktree(&base, &wt)).await??;
+            remove_owned_worktree(&session).await?;
         }
         self.store.delete(id).await?;
         self.subagent_cache.write().await.remove(id);
@@ -1006,9 +1048,19 @@ impl SessionManager {
                     .await??;
                     (worktree, true)
                 }
-                // For remote sessions use base_dir as the working directory on
-                // the remote machine; worktree management happens there separately.
-                Location::Remote => (base.clone(), false),
+                Location::Remote => {
+                    let host = req
+                        .ssh_host
+                        .clone()
+                        .context("remote worktree is missing ssh_host")?;
+                    let base = base.clone();
+                    let name = req.name.clone();
+                    let worktree = tokio::task::spawn_blocking(move || {
+                        git::add_remote_worktree(&host, &base, &name)
+                    })
+                    .await??;
+                    (worktree, true)
+                }
             },
         };
         // Pick the supervisor strategy at create time so the row in SQLite
@@ -1051,12 +1103,13 @@ impl SessionManager {
         };
         if let Err(error) = self.store.insert(&session).await {
             if worktree_owned {
-                let base = base.clone();
-                let worktree = project_path.clone();
-                let name = session.name.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    git::rollback_worktree(&base, &worktree, &name)
-                })
+                let _ = rollback_owned_worktree(
+                    session.location,
+                    session.ssh_host.clone(),
+                    base.clone(),
+                    project_path.clone(),
+                    session.name.clone(),
+                )
                 .await;
             }
             return Err(error);
@@ -1072,12 +1125,13 @@ impl SessionManager {
             self.runtime_diagnostics
                 .record_launch_failure(session.backend, session.ssh_host.as_deref());
             if worktree_owned {
-                let base = base.clone();
-                let worktree = PathBuf::from(&session.project_path);
-                let name = session.name.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    git::rollback_worktree(&base, &worktree, &name)
-                })
+                let _ = rollback_owned_worktree(
+                    session.location,
+                    session.ssh_host.clone(),
+                    base.clone(),
+                    PathBuf::from(&session.project_path),
+                    session.name.clone(),
+                )
                 .await;
             }
             return Err(e);

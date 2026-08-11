@@ -275,11 +275,13 @@ export function NewSessionDialog({
           {nameError(name.trim()) ? (
             <span className="hint hint-error">{nameError(name.trim())}</span>
           ) : (
-            location === "local" && name.trim() && baseDir.trim() && (
+            location === "local" && name.trim() && baseDir.trim() ? (
               <span className="hint">
                 worktree: <code>{baseDir.trim().replace(/\/+$/, "")}/.slide-worktrees/{name.trim()}</code>
               </span>
-            )
+            ) : location === "remote" && name.trim() && sshHost.trim() ? (
+              <span className="hint">an isolated worktree will be created on {sshHost.trim()}</span>
+            ) : null
           )}
         </label>
         {error && <div className="error">{error}</div>}
