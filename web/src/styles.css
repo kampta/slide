@@ -263,6 +263,35 @@ body.is-resizing-panels * {
   flex: none;
 }
 
+.session-action-group {
+  display: flex;
+  height: 30px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+}
+
+.session-action-group button {
+  min-height: 28px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.session-action-group button:hover:not(:disabled) {
+  border-color: transparent;
+  background: var(--surface-hover);
+}
+
+.session-search-btn {
+  display: grid;
+  width: 30px;
+  place-items: center;
+  padding: 0;
+  color: var(--text-muted);
+}
+
 .sr-only {
   position: absolute;
   width: 1px;
@@ -305,11 +334,16 @@ body.is-resizing-panels * {
   color: var(--text-faint);
 }
 
-.session-new-btn {
+.session-action-group .session-new-btn {
   display: inline-flex;
   align-items: center;
   gap: 4px;
   flex: none;
+  padding: 0 9px;
+  border-left: 1px solid var(--border);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
   white-space: nowrap;
 }
 
@@ -1336,7 +1370,7 @@ body.is-resizing-panels * {
     padding-top: calc(10px + env(safe-area-inset-top));
   }
 
-  .session-list-header .btn-primary,
+  .session-action-group .session-new-btn,
   .desktop-only {
     display: none;
   }
