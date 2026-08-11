@@ -1,4 +1,3 @@
-pub mod artifacts;
 pub mod backend;
 pub mod classifier;
 pub mod config;

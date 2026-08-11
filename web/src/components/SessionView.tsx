@@ -12,7 +12,6 @@ import { useIsMobile } from "../hooks/useMediaQuery";
 import { SessionPath, sessionDisplayPath } from "./SessionPath";
 import { SubagentDock } from "./SubagentDock";
 import { SessionTransferModal } from "./SessionTransferModal";
-import { ArtifactDock } from "./ArtifactDock";
 
 const TerminalView = lazy(() =>
   import("./Terminal").then((module) => ({ default: module.TerminalView })),
@@ -283,7 +282,6 @@ export function SessionView() {
           live={isRunning}
         />
       )}
-      <ArtifactDock key={session.id} sessionId={session.id} />
       <Suspense fallback={<div className="term-host terminal-loading">Loading terminal…</div>}>
         <TerminalView
           ref={termRef}

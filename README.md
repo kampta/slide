@@ -79,25 +79,6 @@ Open **Branch** on a session to take work in a new direction. A native fork crea
 
 A handoff works across backends and local or SSH sessions. Choose another Waiting session and a required focus: Slide reads at most 32 KiB of recent source output, removes terminal control sequences, collapses it to one line, keeps the newest 8,000 characters, and submits it as one turn to the target. Context is transferred only by this explicit action, and the target is checked again immediately before submission so an agent that has resumed working is not interrupted.
 
-## Rich artifacts
-
-Each agent receives a `SLIDE_ARTIFACT_MANIFEST` environment variable. To publish plots, images, rendered rollouts, audio, or PDFs in the Artifacts dock, write a JSON manifest there with paths relative to the session worktree:
-
-```json
-{
-  "files": [
-    "results/plot.png",
-    {
-      "path": "results/rollout.mp4",
-      "title": "Best rollout",
-      "text": "Checkpoint 42"
-    }
-  ]
-}
-```
-
-Slide accepts up to 50 PNG/JPEG/GIF/WebP, MP4/WebM/MOV, MP3/WAV/OGG, or PDF entries and serves at most 32 MiB per artifact. Paths cannot be absolute, traverse outside the worktree, or resolve through a symlink outside it. Local and SSH sessions use the same manifest contract; API responses expose filenames and media metadata, never host paths. Existing agents need one Stop/Resume cycle after upgrading to receive the new environment variable.
-
 ## New session
 
 - **Name** (required) — shown in the left panel and used as the worktree folder / branch if auto-creating one.

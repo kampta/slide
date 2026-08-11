@@ -1,6 +1,6 @@
 use crate::server::AppState;
 use axum::extract::{Path, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
@@ -21,8 +21,6 @@ pub fn routes() -> Router<AppState> {
         .route("/sessions/:id/handoff", post(handoff_session))
         .route("/sessions/:id/context", get(get_context))
         .route("/sessions/:id/subagents", get(get_subagents))
-        .route("/sessions/:id/artifacts", get(list_artifacts))
-        .route("/sessions/:id/artifacts/:artifact_id", get(get_artifact))
         .route("/ls", get(list_dir))
         .route("/diagnostics", get(get_runtime_diagnostics))
         .route("/history/search", post(search_history))
@@ -179,38 +177,6 @@ async fn get_subagents(State(state): State<AppState>, Path(id): Path<String>) ->
     match state.manager.subagents(&id).await {
         Ok(snapshot) => Json(snapshot).into_response(),
         Err(error) => server_error(&error),
-    }
-}
-
-async fn list_artifacts(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    match state.manager.artifacts(&id).await {
-        Ok(artifacts) => Json(artifacts).into_response(),
-        Err(error) => client_error(&error),
-    }
-}
-
-async fn get_artifact(
-    State(state): State<AppState>,
-    Path((id, artifact_id)): Path<(String, usize)>,
-) -> Response {
-    match state.manager.artifact(&id, artifact_id).await {
-        Ok(artifact) => {
-            let mut response = artifact.bytes.into_response();
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_str(&artifact.content_type)
-                    .unwrap_or(HeaderValue::from_static("application/octet-stream")),
-            );
-            response
-                .headers_mut()
-                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-            response.headers_mut().insert(
-                header::X_CONTENT_TYPE_OPTIONS,
-                HeaderValue::from_static("nosniff"),
-            );
-            response
-        }
-        Err(error) => client_error(&error),
     }
 }
 

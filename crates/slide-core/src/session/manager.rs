@@ -627,26 +627,6 @@ impl SessionManager {
         Ok(value)
     }
 
-    pub async fn artifacts(&self, session_id: &str) -> Result<crate::artifacts::ArtifactList> {
-        check_id(session_id)?;
-        let session = self.find(session_id).await?;
-        tokio::task::spawn_blocking(move || crate::artifacts::list(&session))
-            .await
-            .context("join artifact listing")?
-    }
-
-    pub async fn artifact(
-        &self,
-        session_id: &str,
-        artifact_id: usize,
-    ) -> Result<crate::artifacts::ArtifactPayload> {
-        check_id(session_id)?;
-        let session = self.find(session_id).await?;
-        tokio::task::spawn_blocking(move || crate::artifacts::load(&session, artifact_id))
-            .await
-            .context("join artifact read")?
-    }
-
     pub async fn runtime_diagnostics(
         &self,
         host: Option<&str>,
@@ -786,9 +766,6 @@ impl SessionManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(id);
         let _ = tokio::fs::remove_file(config::logs_dir().join(format!("{id}.log"))).await;
-        if matches!(session.location, Location::Local) {
-            let _ = tokio::fs::remove_file(config::artifact_manifest_path(id)).await;
-        }
         self.emit(SessionEvent::SessionRemoved { id: id.to_string() });
         Ok(())
     }
@@ -1424,10 +1401,6 @@ impl SessionManager {
             };
             let mut backend_env = backend.env();
             backend_env.push(("SLIDE_SESSION_ID".to_string(), session.id.clone()));
-            backend_env.push((
-                "SLIDE_ARTIFACT_MANIFEST".to_string(),
-                crate::artifacts::manifest_path(session),
-            ));
 
             if matches!(session.location, Location::Remote) && session.ssh_host.is_none() {
                 bail!("remote session missing ssh_host");

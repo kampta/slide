@@ -185,21 +185,6 @@ export interface SubagentList {
   agents: Subagent[];
 }
 
-export interface Artifact {
-  id: number;
-  filename: string;
-  title: string | null;
-  text: string | null;
-  content_type: string;
-  size: number;
-}
-
-export interface ArtifactList {
-  manifest_present: boolean;
-  artifacts: Artifact[];
-  unavailable: number;
-}
-
 export type RuntimeStatus =
   | "ready"
   | "missing"
@@ -294,24 +279,6 @@ export const api = {
     sourceId: string,
     request: { target_session_id: string; focus: string },
   ) => req<Session>("POST", sessionPath(sourceId, "/handoff"), request),
-  listArtifacts: (sessionId: string) =>
-    req<ArtifactList>("GET", sessionPath(sessionId, "/artifacts")),
-  getArtifactBlob: async (sessionId: string, artifactId: number) => {
-    const response = await fetch(
-      sessionPath(sessionId, `/artifacts/${encodeURIComponent(artifactId)}`),
-      { headers: authHeaders() },
-    );
-    if (response.status === 401) {
-      setToken("");
-      throw new Error(STALE_TOKEN_MESSAGE);
-    }
-    if (!response.ok) {
-      throw new Error(
-        `artifact fetch failed: ${response.status} ${await response.text()}`.trim(),
-      );
-    }
-    return response.blob();
-  },
   getLog: async (id: string) => {
     const res = await fetch(sessionPath(id, "/log"), {
       headers: authHeaders(),
