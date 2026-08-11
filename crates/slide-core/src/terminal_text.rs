@@ -65,7 +65,25 @@ pub(crate) fn compact(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::compact;
+    use super::{compact, strip_ansi};
+
+    #[test]
+    fn strip_ansi_removes_csi_sequences_but_keeps_prompt_text() {
+        assert_eq!(strip_ansi("\u{1b}[32muser>\u{1b}[0m "), "user> ");
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc_sequences_terminated_by_bel() {
+        assert_eq!(strip_ansi("\u{1b}]0;slide title\u{7}user>"), "user>");
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc_sequences_terminated_by_st() {
+        assert_eq!(
+            strip_ansi("\u{1b}]0;slide title\u{1b}\\\u{258c}"),
+            "\u{258c}",
+        );
+    }
 
     #[test]
     fn compact_strips_terminal_sequences_and_collapses_whitespace() {

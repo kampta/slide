@@ -83,10 +83,6 @@ Open **Branch** on a session to take work in a new direction. A native fork crea
 
 A handoff works across backends and local or SSH sessions. Choose another Waiting session and a required focus: Slide reads at most 32 KiB of recent source output, removes terminal control sequences, collapses it to one line, keeps the newest 8,000 characters, and submits it as one turn to the target. Context is transferred only by this explicit action, and the target is checked again immediately before submission so an agent that has resumed working is not interrupted.
 
-## Scheduled jobs
-
-Open **Schedule** on a session to create durable one-time or fixed-interval prompts, pause or delete them, and submit a test run immediately. Jobs are scoped to their session and stored in SQLite. The scheduler sleeps until the earliest deadline and wakes when a job changes; it has no polling ticker. A due prompt is submitted only while its session is running and Waiting. Busy or stopped sessions retry after 30 seconds, while interval cadence remains anchored to the original schedule so missed slots do not accumulate or drift.
-
 ## Rich artifacts
 
 Each agent receives a `SLIDE_ARTIFACT_MANIFEST` environment variable. To publish plots, images, rendered rollouts, audio, or PDFs in the Artifacts dock, write a JSON manifest there with paths relative to the session worktree:

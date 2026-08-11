@@ -1447,7 +1447,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "bytes",
  "clap",
  "dirs 5.0.1",
  "futures",
@@ -1462,11 +1461,9 @@ dependencies = [
  "slide-core",
  "tempfile",
  "tokio",
- "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
@@ -1483,7 +1480,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
  "tokio",
  "tokio-rusqlite",
  "tracing",

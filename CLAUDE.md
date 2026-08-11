@@ -26,13 +26,12 @@ cargo fmt --all -- --check
 npm --prefix web run build              # tsc -b --noEmit + vite build
 npm --prefix web run test               # vitest
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test -p slide-core --lib          # smoke scope used in PR CI
-cargo test -p slide-cli --bin slide server::tests
+cargo test --workspace
 ```
 
 Single test: `cargo test -p slide-core --lib session::manager::tests::test_name` or `npm --prefix web run test -- Terminal.test.tsx`.
 
-CI intentionally runs a **smoke subset** of Rust tests (`slide-core --lib` + `slide-cli server::tests`); broader `cargo test --workspace` is fine locally but not required for PRs.
+CI runs the full Rust workspace test suite on every pull request.
 
 ## Architecture
 

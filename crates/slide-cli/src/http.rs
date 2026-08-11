@@ -7,7 +7,6 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 use slide_core::backend::BackendKind;
-use slide_core::scheduled::{CreateScheduledJobRequest, UpdateScheduledJobRequest};
 use slide_core::session::{CreateSessionRequest, ForkSessionRequest, HandoffRequest};
 
 pub fn routes() -> Router<AppState> {
@@ -24,18 +23,6 @@ pub fn routes() -> Router<AppState> {
         .route("/sessions/:id/subagents", get(get_subagents))
         .route("/sessions/:id/turn-diffs", get(list_turn_diffs))
         .route("/sessions/:id/turn-diffs/:turn_diff_id", get(get_turn_diff))
-        .route(
-            "/sessions/:id/jobs",
-            get(list_scheduled_jobs).post(create_scheduled_job),
-        )
-        .route(
-            "/sessions/:id/jobs/:job_id",
-            patch(update_scheduled_job).delete(delete_scheduled_job),
-        )
-        .route(
-            "/sessions/:id/jobs/:job_id/run",
-            post(run_scheduled_job_now),
-        )
         .route("/sessions/:id/artifacts", get(list_artifacts))
         .route("/sessions/:id/artifacts/:artifact_id", get(get_artifact))
         .route("/ls", get(list_dir))
@@ -216,59 +203,6 @@ async fn get_turn_diff(
         )
             .into_response(),
         Err(error) => server_error(&error),
-    }
-}
-
-async fn list_scheduled_jobs(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    match state.manager.scheduled_jobs(&id).await {
-        Ok(jobs) => Json(jobs).into_response(),
-        Err(error) => client_error(&error),
-    }
-}
-
-async fn create_scheduled_job(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(request): Json<CreateScheduledJobRequest>,
-) -> Response {
-    match state.manager.create_scheduled_job(&id, request).await {
-        Ok(job) => Json(job).into_response(),
-        Err(error) => client_error(&error),
-    }
-}
-
-async fn update_scheduled_job(
-    State(state): State<AppState>,
-    Path((id, job_id)): Path<(String, String)>,
-    Json(request): Json<UpdateScheduledJobRequest>,
-) -> Response {
-    match state
-        .manager
-        .update_scheduled_job(&id, &job_id, request)
-        .await
-    {
-        Ok(job) => Json(job).into_response(),
-        Err(error) => client_error(&error),
-    }
-}
-
-async fn delete_scheduled_job(
-    State(state): State<AppState>,
-    Path((id, job_id)): Path<(String, String)>,
-) -> Response {
-    match state.manager.delete_scheduled_job(&id, &job_id).await {
-        Ok(()) => Json(json!({ "ok": true })).into_response(),
-        Err(error) => client_error(&error),
-    }
-}
-
-async fn run_scheduled_job_now(
-    State(state): State<AppState>,
-    Path((id, job_id)): Path<(String, String)>,
-) -> Response {
-    match state.manager.run_scheduled_job_now(&id, &job_id).await {
-        Ok(job) => Json(job).into_response(),
-        Err(error) => client_error(&error),
     }
 }
 

@@ -6,7 +6,6 @@ pub mod git;
 pub mod history;
 mod process;
 pub mod runtime;
-pub mod scheduled;
 pub mod session;
 pub mod ssh;
 pub mod store;
