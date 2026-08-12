@@ -53,18 +53,28 @@ describe("session store snapshots", () => {
     expect(useSessions.getState().sessions).toBe(sessionsBefore);
   });
 
-  it("keeps creation order when activity and lifecycle state change", () => {
+  it("keeps live sessions stable and stopped sessions at the bottom", () => {
     const older = session("older", { created_at: 10, last_activity: 100 });
     const newer = session("newer", { created_at: 20, last_activity: 20 });
-    useSessions.getState().loadSnapshot([older, newer]);
-    expect(useSessions.getState().order).toEqual(["newer", "older"]);
+    const stopped = session("stopped", {
+      state: "stopped",
+      created_at: 30,
+    });
+    useSessions.getState().loadSnapshot([stopped, older, newer]);
+    expect(useSessions.getState().order).toEqual(["newer", "older", "stopped"]);
 
     useSessions.getState().upsert({
       ...older,
-      state: "stopped",
+      state: "waiting",
       last_activity: 10_000,
     });
-    expect(useSessions.getState().order).toEqual(["newer", "older"]);
+    expect(useSessions.getState().order).toEqual(["newer", "older", "stopped"]);
+
+    useSessions.getState().upsert({ ...newer, state: "stopped" });
+    expect(useSessions.getState().order).toEqual(["older", "stopped", "newer"]);
+
+    useSessions.getState().upsert({ ...stopped, state: "active" });
+    expect(useSessions.getState().order).toEqual(["stopped", "older", "newer"]);
   });
 });
 

@@ -30,9 +30,10 @@ interface Store {
 }
 
 function sortOrder(a: Session, b: Session): number {
-  // Creation time never changes, so lifecycle and activity events cannot
-  // move a row while the user is switching between sessions.
-  return b.created_at - a.created_at || a.id.localeCompare(b.id);
+  // Keep running sessions above stopped ones, then use immutable creation
+  // time so activity and classifier updates cannot shuffle either group.
+  const stopped = Number(a.state === "stopped") - Number(b.state === "stopped");
+  return stopped || b.created_at - a.created_at || a.id.localeCompare(b.id);
 }
 
 /// Field-by-field equality so `upsert` can skip rebuilding `sessions` and
