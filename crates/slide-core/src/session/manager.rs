@@ -1,4 +1,5 @@
 use super::pty;
+use super::recovery::RecoveryCoordinator;
 use super::running::RunningSession;
 use super::{
     CreateSessionRequest, ForkSessionRequest, HandoffRequest, Location, Session, SessionEvent,
@@ -21,11 +22,8 @@ use tokio::sync::{broadcast, RwLock};
 
 const BROADCAST_CAP: usize = 256;
 const SUBAGENT_CACHE_TTL: Duration = Duration::from_secs(3);
-const ATTACH_RETRY_INITIAL: Duration = Duration::from_secs(1);
-const ATTACH_RETRY_MAX: Duration = Duration::from_secs(30);
 const HANDOFF_TAIL_BYTES: usize = 32 * 1024;
 const HANDOFF_CONTEXT_CHARS: usize = 8_000;
-const COLD_START_PROBE_CONCURRENCY: usize = 8;
 
 #[derive(Clone)]
 struct CachedSubagents {
@@ -146,25 +144,8 @@ async fn rollback_owned_worktree(
     Ok(())
 }
 
-fn remove_if_current<T>(map: &mut HashMap<String, Arc<T>>, id: &str, expected: &Arc<T>) -> bool {
-    let is_current = map
-        .get(id)
-        .is_some_and(|current| Arc::ptr_eq(current, expected));
-    if is_current {
-        map.remove(id);
-    }
-    is_current
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TmuxExitAction {
-    Reattach,
-    Stop,
-    Retry,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SpawnIntent {
+pub(super) enum SpawnIntent {
     Fresh,
     Existing,
     Fork {
@@ -173,69 +154,14 @@ enum SpawnIntent {
     },
 }
 
-/// Losing a tmux *client* is not the same thing as losing the backend that
-/// tmux owns. Remote sessions hit this whenever their SSH transport blips;
-/// local sessions can hit it when an attach client is detached. Only tmux
-/// confirming that the named session is absent is authoritative evidence
-/// that the backend stopped.
-fn tmux_exit_action(probe: crate::tmux::SessionProbe) -> TmuxExitAction {
-    match probe {
-        crate::tmux::SessionProbe::Present => TmuxExitAction::Reattach,
-        crate::tmux::SessionProbe::Absent => TmuxExitAction::Stop,
-        crate::tmux::SessionProbe::Unreachable => TmuxExitAction::Retry,
-    }
-}
-
-/// A failed attach is not proof that a tmux-owned backend stopped. Keep the
-/// session recoverable unless tmux itself authoritatively reports it absent.
-fn state_after_failed_reattach(probe: crate::tmux::SessionProbe) -> SessionState {
-    match probe {
-        crate::tmux::SessionProbe::Absent => SessionState::Stopped,
-        crate::tmux::SessionProbe::Present | crate::tmux::SessionProbe::Unreachable => {
-            SessionState::Unknown
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ColdStartStatus {
-    MissingWorktree,
-    Probe(crate::tmux::SessionProbe),
-}
-
-async fn inspect_cold_session(session: Session) -> (Session, ColdStartStatus) {
-    let location = session.location;
-    let project_path = session.project_path.clone();
-    let supervisor = session.supervisor;
-    let host = session.ssh_host.clone();
-    let id = session.id.clone();
-    let fallback = ColdStartStatus::Probe(match supervisor {
-        SupervisorKind::Direct => crate::tmux::SessionProbe::Absent,
-        SupervisorKind::Tmux => crate::tmux::SessionProbe::Unreachable,
-    });
-    let status = tokio::task::spawn_blocking(move || {
-        if matches!(location, Location::Local) && !Path::new(&project_path).exists() {
-            return ColdStartStatus::MissingWorktree;
-        }
-        ColdStartStatus::Probe(match supervisor {
-            SupervisorKind::Direct => crate::tmux::SessionProbe::Absent,
-            SupervisorKind::Tmux => crate::tmux::has_session(host.as_deref(), &id)
-                .unwrap_or(crate::tmux::SessionProbe::Unreachable),
-        })
-    })
-    .await
-    .unwrap_or(fallback);
-    (session, status)
-}
-
 /// Default tmux window size for newly-created sessions. The daemon resizes
 /// to the client's actual terminal size as soon as the first WS attaches.
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 40;
 
 pub struct SessionManager {
-    store: Arc<Store>,
-    running: RwLock<HashMap<String, Arc<RunningSession>>>,
+    pub(super) store: Arc<Store>,
+    pub(super) running: RwLock<HashMap<String, Arc<RunningSession>>>,
     // Broadcast carries `Arc<SessionEvent>`, not `SessionEvent`. Each event
     // ends up cloned once into the channel ring buffer plus once per
     // receiver on `recv()`; with N subscribers and a heap-heavy variant
@@ -279,89 +205,7 @@ impl SessionManager {
             runtime_diagnostics: Arc::new(RuntimeDiagnosticsCache::default()),
         });
 
-        // Cold-start reconciliation. Direct sessions died with the daemon;
-        // tmux sessions may still be alive. Probe a small bounded batch in
-        // parallel so several unreachable SSH hosts cost roughly one timeout
-        // window instead of one timeout per session.
-        //
-        // Critically: if SSH itself fails (host down, network blip), the
-        // probe returns Unreachable and the row's state is left untouched.
-        // A retry task wakes up periodically and reattaches once the host
-        // comes back, so a transient outage doesn't stop healthy sessions.
-        let mut survivors: Vec<Session> = Vec::new();
-        let mut deferred: Vec<Session> = Vec::new();
-        let mut sessions = mgr
-            .store
-            .list()
-            .await?
-            .into_iter()
-            .filter(|session| !matches!(session.state, SessionState::Stopped));
-        let mut probes = tokio::task::JoinSet::new();
-        for session in sessions.by_ref().take(COLD_START_PROBE_CONCURRENCY) {
-            probes.spawn(inspect_cold_session(session));
-        }
-        while let Some(result) = probes.join_next().await {
-            if let Some(session) = sessions.next() {
-                probes.spawn(inspect_cold_session(session));
-            }
-            let Ok((s, status)) = result else {
-                tracing::warn!("cold-start session probe task failed");
-                continue;
-            };
-            match status {
-                ColdStartStatus::MissingWorktree => {
-                    tracing::info!(
-                        session = %s.id,
-                        path = %s.project_path,
-                        "project path missing on cold start; marking stopped",
-                    );
-                    mgr.store
-                        .update_state(&s.id, SessionState::Stopped, now_ms())
-                        .await
-                        .ok();
-                }
-                ColdStartStatus::Probe(crate::tmux::SessionProbe::Present) => survivors.push(s),
-                ColdStartStatus::Probe(crate::tmux::SessionProbe::Absent) => {
-                    mgr.store
-                        .update_state(&s.id, SessionState::Stopped, now_ms())
-                        .await
-                        .ok();
-                }
-                ColdStartStatus::Probe(crate::tmux::SessionProbe::Unreachable) => {
-                    tracing::info!(
-                        session = %s.id,
-                        host = ?s.ssh_host,
-                        "host unreachable at cold start; deferring reattach",
-                    );
-                    mgr.persist_unattached_state(
-                        &s,
-                        state_after_failed_reattach(crate::tmux::SessionProbe::Unreachable),
-                    )
-                    .await;
-                    deferred.push(s);
-                }
-            }
-        }
-
-        // Re-attach surviving tmux sessions. Without this, the DB row stays
-        // Active/Waiting but the in-memory `running` map is empty, so every
-        // `/ws/session/{id}` attach returns "session not running" until the
-        // user manually hits Resume. TmuxSupervisor::spawn is idempotent —
-        // it skips new-session when tmux already owns the session and just
-        // re-establishes pipe-pane.
-        if !survivors.is_empty() {
-            let mgr2 = mgr.clone();
-            tokio::spawn(async move { mgr2.reattach_survivors(survivors).await });
-        }
-        if !deferred.is_empty() {
-            let mgr2 = mgr.clone();
-            tokio::spawn(async move { mgr2.retry_deferred(deferred).await });
-        }
-        // No global ticker: each session's `classifier_task` (spawned in
-        // `spawn_process`) reacts to byte arrivals via its own `Notify`
-        // channel and only captures pane / runs regex when the settle
-        // window for that one session expires. That's the entire reason
-        // this manager doesn't have a polling loop anymore.
+        RecoveryCoordinator::reconcile(&mgr).await?;
         Ok(mgr)
     }
 
@@ -372,7 +216,7 @@ impl SessionManager {
     /// Broadcast a session lifecycle event. Wrapping at this seam keeps
     /// every emit site free of `Arc::new` ceremony and gives us one place
     /// to add metrics or filtering later.
-    fn emit(&self, ev: SessionEvent) {
+    pub(super) fn emit(&self, ev: SessionEvent) {
         let _ = self.events.send(Arc::new(ev));
     }
 
@@ -389,7 +233,7 @@ impl SessionManager {
         });
     }
 
-    async fn persist_unattached_state(&self, session: &Session, state: SessionState) {
+    pub(super) async fn persist_unattached_state(&self, session: &Session, state: SessionState) {
         if session.state == state {
             return;
         }
@@ -403,7 +247,7 @@ impl SessionManager {
         });
     }
 
-    fn operation_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    pub(super) fn operation_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.operation_locks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -918,117 +762,6 @@ impl SessionManager {
         Ok(target)
     }
 
-    /// Re-attach surviving tmux sessions discovered at cold start. One
-    /// failure must not abort the whole batch. A failed attach is marked
-    /// Unknown and handed to the same bounded recovery loop used for a lost
-    /// SSH attach process; only an authoritative absent probe may stop it.
-    async fn reattach_survivors(self: Arc<Self>, survivors: Vec<Session>) {
-        for s in survivors {
-            if let Err(e) = self.spawn_process(&s, SpawnIntent::Existing).await {
-                tracing::warn!(session = %s.id, error = %format!("{e:#}"), "reattach failed; retrying");
-                self.persist_unattached_state(
-                    &s,
-                    state_after_failed_reattach(crate::tmux::SessionProbe::Present),
-                )
-                .await;
-                let mgr = self.clone();
-                let id = s.id.clone();
-                tokio::spawn(async move { mgr.recover_tmux_attachment(id, None).await });
-            }
-        }
-    }
-
-    /// Retry probing remote sessions whose host was unreachable at cold
-    /// start. Once each session resolves we drop it from the list:
-    /// `Present` → reattach; `Absent` → mark Stopped; `Unreachable` →
-    /// keep waiting. Backs off from 30s up to 5min so a host that's down
-    /// for hours doesn't pin a probe-every-30s loop forever, but
-    /// progress (any resolution) resets the delay so a flapping host
-    /// reattaches promptly.
-    async fn retry_deferred(self: Arc<Self>, mut pending: Vec<Session>) {
-        use std::time::Duration;
-        let mut delay = Duration::from_secs(30);
-        let max_delay = Duration::from_secs(300);
-        while !pending.is_empty() {
-            tokio::time::sleep(delay).await;
-            let mut still_pending = Vec::new();
-            let mut resolved_any = false;
-            for s in pending.drain(..) {
-                // User may have manually hit Resume in the meantime, or the
-                // row may have been deleted. Either way: drop from pending.
-                if self.running.read().await.contains_key(&s.id) {
-                    resolved_any = true;
-                    continue;
-                }
-                let s = match self.find(&s.id).await {
-                    Ok(s) if !matches!(s.state, SessionState::Stopped) => s,
-                    Ok(_) => {
-                        resolved_any = true;
-                        continue;
-                    }
-                    Err(_) => {
-                        resolved_any = true;
-                        continue;
-                    }
-                };
-                let host = s.ssh_host.clone();
-                let id = s.id.clone();
-                let probe = tokio::task::spawn_blocking(move || {
-                    crate::tmux::has_session(host.as_deref(), &id)
-                })
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or(crate::tmux::SessionProbe::Unreachable);
-                match probe {
-                    crate::tmux::SessionProbe::Present => {
-                        resolved_any = true;
-                        if let Err(e) = self.spawn_process(&s, SpawnIntent::Existing).await {
-                            tracing::warn!(
-                                session = %s.id,
-                                error = %format!("{e:#}"),
-                                "deferred reattach failed; retrying",
-                            );
-                            self.persist_unattached_state(
-                                &s,
-                                state_after_failed_reattach(crate::tmux::SessionProbe::Present),
-                            )
-                            .await;
-                            still_pending.push(s);
-                        } else {
-                            self.emit(SessionEvent::SessionUpdated { session: s.clone() });
-                        }
-                    }
-                    crate::tmux::SessionProbe::Absent => {
-                        resolved_any = true;
-                        let _ = self
-                            .store
-                            .update_state(&s.id, SessionState::Stopped, now_ms())
-                            .await;
-                        self.emit(SessionEvent::SessionState {
-                            id: s.id.clone(),
-                            state: SessionState::Stopped,
-                        });
-                    }
-                    crate::tmux::SessionProbe::Unreachable => {
-                        self.persist_unattached_state(
-                            &s,
-                            state_after_failed_reattach(crate::tmux::SessionProbe::Unreachable),
-                        )
-                        .await;
-                        still_pending.push(s);
-                    }
-                }
-            }
-            pending = still_pending;
-            delay = if resolved_any {
-                Duration::from_secs(30)
-            } else {
-                std::cmp::min(delay * 2, max_delay)
-            };
-        }
-    }
-
     /// Resume a stopped session. When `backend` differs from the stored
     /// backend, the session is switched to that backend first: the prior
     /// provider conversation id is cleared and the new process starts fresh
@@ -1101,7 +834,7 @@ impl SessionManager {
         Ok(session)
     }
 
-    async fn find(&self, id: &str) -> Result<Session> {
+    pub(super) async fn find(&self, id: &str) -> Result<Session> {
         self.store
             .get(id)
             .await?
@@ -1116,138 +849,6 @@ impl SessionManager {
             // metadata workers can observe their final sender closing while
             // stop/delete still holds the per-session operation lock.
             r.kill();
-        }
-    }
-
-    /// Handle termination of the daemon-owned child process. For direct
-    /// supervision that child *is* the backend, so its exit is terminal. For
-    /// tmux supervision it is only an attach client (`tmux attach`, or
-    /// `ssh -t host tmux attach`); probe the independently-owned tmux session
-    /// before deciding whether the backend stopped.
-    async fn handle_child_exit(
-        self: &Arc<Self>,
-        id: String,
-        running: Arc<RunningSession>,
-        code: Option<i32>,
-    ) {
-        let operation = self.operation_lock(&id);
-        let guard = operation.lock().await;
-        let removed_current = {
-            let mut running_map = self.running.write().await;
-            remove_if_current(&mut running_map, &id, &running)
-        };
-        // A stopped session can be resumed before its old PTY exit is
-        // delivered. That stale watcher must not stop or reconnect over the
-        // replacement.
-        if !removed_current {
-            return;
-        }
-        // Release the old broadcast sender/classifier immediately. This
-        // closes the terminal WebSocket so the frontend enters its existing
-        // reconnect loop instead of remaining attached to a dead PTY while
-        // transport recovery runs in the background.
-        drop(running);
-
-        let session = match self.find(&id).await {
-            Ok(session) => session,
-            Err(_) => return,
-        };
-        if !matches!(session.supervisor, SupervisorKind::Tmux) {
-            self.mark_exited(&id, code).await;
-            return;
-        }
-
-        // Let explicit stop/delete/resume acquire the lifecycle lock while
-        // the transport is down. Recovery re-checks both persisted state and
-        // the running map under the same lock before every attempt.
-        drop(guard);
-        self.recover_tmux_attachment(id, code).await;
-    }
-
-    async fn mark_exited(&self, id: &str, code: Option<i32>) {
-        let _ = self
-            .store
-            .update_state(id, SessionState::Stopped, now_ms())
-            .await;
-        self.emit(SessionEvent::SessionExit {
-            id: id.to_string(),
-            code,
-        });
-        self.emit(SessionEvent::SessionState {
-            id: id.to_string(),
-            state: SessionState::Stopped,
-        });
-    }
-
-    /// Reattach a daemon PTY to a tmux-owned backend after the prior local
-    /// attach process exits. Retries indefinitely with bounded exponential
-    /// backoff while the host is unreachable; a transient VPN/SSH outage
-    /// must not turn a healthy remote backend into a Stopped session.
-    async fn recover_tmux_attachment(self: &Arc<Self>, id: String, code: Option<i32>) {
-        let mut delay = ATTACH_RETRY_INITIAL;
-        tokio::time::sleep(delay).await;
-
-        loop {
-            let operation = self.operation_lock(&id);
-            let guard = operation.lock().await;
-
-            // A manual resume may have won the race while we slept.
-            if self.running.read().await.contains_key(&id) {
-                return;
-            }
-            let session = match self.find(&id).await {
-                Ok(session) if !matches!(session.state, SessionState::Stopped) => session,
-                _ => return, // explicitly stopped or deleted
-            };
-
-            let host = session.ssh_host.clone();
-            let probe_id = id.clone();
-            let probe = tokio::task::spawn_blocking(move || {
-                crate::tmux::has_session(host.as_deref(), &probe_id)
-            })
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or(crate::tmux::SessionProbe::Unreachable);
-
-            match tmux_exit_action(probe) {
-                TmuxExitAction::Reattach => {
-                    match self.spawn_process(&session, SpawnIntent::Existing).await {
-                        Ok(()) => {
-                            tracing::info!(
-                                session = %id,
-                                host = ?session.ssh_host,
-                                "reattached after tmux client exited",
-                            );
-                            return;
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                session = %id,
-                                host = ?session.ssh_host,
-                                error = %format!("{error:#}"),
-                                "tmux session is alive but reattach failed; retrying",
-                            );
-                        }
-                    }
-                }
-                TmuxExitAction::Stop => {
-                    self.mark_exited(&id, code).await;
-                    return;
-                }
-                TmuxExitAction::Retry => {
-                    tracing::warn!(
-                        session = %id,
-                        host = ?session.ssh_host,
-                        retry_seconds = delay.as_secs(),
-                        "host unreachable after tmux client exited; retrying attachment",
-                    );
-                }
-            }
-
-            drop(guard);
-            tokio::time::sleep(delay).await;
-            delay = std::cmp::min(delay * 2, ATTACH_RETRY_MAX);
         }
     }
 
@@ -1275,7 +876,7 @@ impl SessionManager {
     /// spawning its replacement, which installs another exit watcher. Type
     /// erasure breaks that recursive async-future type while retaining the
     /// `Send` guarantee required by `tokio::spawn`.
-    fn spawn_process<'a>(
+    pub(super) fn spawn_process<'a>(
         self: &'a Arc<Self>,
         session: &'a Session,
         intent: SpawnIntent,
@@ -1368,7 +969,7 @@ impl SessionManager {
             let mgr2 = self.clone();
             tokio::spawn(async move {
                 let code = spawned.exit.await.ok().flatten();
-                mgr2.handle_child_exit(id2, running, code).await;
+                RecoveryCoordinator::handle_exit(mgr2, id2, running, code).await;
             });
 
             // Discover the backend's native session id so we can `--resume`
@@ -1427,14 +1028,7 @@ impl SessionManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_handoff_prompt, newest_chars, normalize_focus, remove_if_current,
-        state_after_failed_reattach, tmux_exit_action, valid_id, TmuxExitAction,
-    };
-    use crate::session::SessionState;
-    use crate::tmux::SessionProbe;
-    use std::collections::HashMap;
-    use std::sync::Arc;
+    use super::{build_handoff_prompt, newest_chars, normalize_focus, valid_id};
 
     #[test]
     fn valid_id_accepts_uuid_shape() {
@@ -1486,62 +1080,5 @@ mod tests {
         assert!(prompt.contains("session 'source'"));
         assert!(prompt.contains("Focus: check tests"));
         assert!(!prompt.contains('\n'));
-    }
-
-    #[test]
-    fn stale_exit_cannot_remove_replacement_process() {
-        let old = Arc::new(1);
-        let replacement = Arc::new(2);
-        let mut running = HashMap::from([("session".to_string(), replacement.clone())]);
-
-        assert!(!remove_if_current(&mut running, "session", &old));
-        assert!(Arc::ptr_eq(running.get("session").unwrap(), &replacement));
-        assert!(remove_if_current(&mut running, "session", &replacement));
-        assert!(!running.contains_key("session"));
-    }
-
-    #[test]
-    fn live_tmux_backend_is_reattached_after_client_exit() {
-        assert_eq!(
-            tmux_exit_action(SessionProbe::Present),
-            TmuxExitAction::Reattach,
-        );
-    }
-
-    #[test]
-    fn absent_tmux_backend_is_stopped_after_client_exit() {
-        assert_eq!(tmux_exit_action(SessionProbe::Absent), TmuxExitAction::Stop,);
-    }
-
-    #[test]
-    fn unreachable_tmux_host_is_retried_after_client_exit() {
-        assert_eq!(
-            tmux_exit_action(SessionProbe::Unreachable),
-            TmuxExitAction::Retry,
-        );
-    }
-
-    #[test]
-    fn failed_reattach_does_not_stop_a_present_tmux_backend() {
-        assert_eq!(
-            state_after_failed_reattach(SessionProbe::Present),
-            SessionState::Unknown,
-        );
-    }
-
-    #[test]
-    fn failed_reattach_does_not_stop_an_unreachable_remote_backend() {
-        assert_eq!(
-            state_after_failed_reattach(SessionProbe::Unreachable),
-            SessionState::Unknown,
-        );
-    }
-
-    #[test]
-    fn authoritative_absence_stops_a_tmux_backend() {
-        assert_eq!(
-            state_after_failed_reattach(SessionProbe::Absent),
-            SessionState::Stopped,
-        );
     }
 }

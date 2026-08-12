@@ -1,5 +1,6 @@
 pub mod manager;
 pub mod pty;
+mod recovery;
 mod running;
 
 use crate::backend::BackendKind;
