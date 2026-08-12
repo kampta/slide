@@ -281,17 +281,6 @@ impl SessionManager {
         self.store.list().await
     }
 
-    pub async fn search_history(
-        &self,
-        query: &str,
-    ) -> Result<crate::history::HistorySearchResponse> {
-        let sessions = self.store.list().await?;
-        let query = query.to_string();
-        tokio::task::spawn_blocking(move || crate::history::search(&sessions, &query))
-            .await
-            .context("join history search")?
-    }
-
     /// Read context usage from the backend's transcript for this session.
     /// Returns `None` when the session is unknown, remote (we'd need to SSH
     /// to the host that owns the transcript — deferred), has no discovered
