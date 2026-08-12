@@ -1,6 +1,6 @@
 # slide
 
-A lightweight IDE for juggling Claude Code, Codex, Grok, Google Antigravity, and OpenCode sessions at once. The session list keeps live work first and stopped work collapsed. Each session runs in an auto-created git worktree on the machine where its backend runs, so concurrent agents don't stomp on each other.
+A lightweight IDE for juggling Claude Code, Codex, Grok, Google Antigravity, and OpenCode sessions at once. Sessions stay in creation order so lifecycle changes never move the row under your pointer. Each session runs in an auto-created git worktree on the machine where its backend runs, so concurrent agents don't stomp on each other.
 
 Architecture: a small Rust daemon (`slide serve`) hosts an HTTP+WebSocket API and serves a React SPA. Open it in any browser.
 
@@ -67,11 +67,11 @@ When a backend exposes structured child-agent metadata, Slide shows a collapsibl
 
 ## Runtime diagnostics
 
-Open Runtime diagnostics from the diamond button beside **New** to check every backend CLI, authentication state, version, and tmux capability on the local machine or a configured SSH host. Probes mirror Slide's launch environment, are cached for 60 seconds, and never return command output or account identity. Session creation and resume reuse the same snapshot; creation fails before making a worktree when the selected runtime—or remote tmux—is unavailable.
+Open Runtime diagnostics from the bottom of the session panel to check every backend CLI, authentication state, version, and tmux capability on the local machine or a configured SSH host. Probes mirror Slide's launch environment, are cached for 60 seconds, and never return command output or account identity. Session creation and resume reuse the same snapshot; creation fails before making a worktree when the selected runtime—or remote tmux—is unavailable.
 
-## History search
+## Session filter
 
-Open Search beside **New** to find text across the persisted terminal output of every local and SSH session, including stopped sessions. Searches stream local logs with fixed memory and group remote logs into one bounded SSH command per host. Results retain only the newest distinct snippets, strip terminal control sequences, and open the matching session when selected.
+Use the filter above the session list to narrow sessions by name, backend, state, host, repository, or worktree path. Filtering never changes the underlying fixed session order.
 
 ## Forks and handoffs
 

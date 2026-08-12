@@ -10,7 +10,6 @@ import { SessionList } from "./components/SessionList";
 import { SessionView } from "./components/SessionView";
 import { NewSessionDialog } from "./components/NewSessionDialog";
 import { DiagnosticsModal } from "./components/DiagnosticsModal";
-import { HistorySearchModal } from "./components/HistorySearchModal";
 import { useSessions } from "./state/sessionStore";
 import { useIsMobile } from "./hooks/useMediaQuery";
 import { setToken } from "./state/api";
@@ -50,7 +49,6 @@ function loadSidebarCollapsed(): boolean {
 export function App() {
   const [newOpen, setNewOpen] = useState(false);
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
-  const [historySearchOpen, setHistorySearchOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(loadSidebarCollapsed);
   const connect = useSessions((s) => s.connect);
@@ -170,7 +168,6 @@ export function App() {
         ) : (
           <SessionList
             onNew={() => setNewOpen(true)}
-            onSearch={() => setHistorySearchOpen(true)}
             onDiagnostics={() => setDiagnosticsOpen(true)}
           />
         )}
@@ -180,14 +177,6 @@ export function App() {
           onCreated={(id) => setActive(id)}
         />
         <DiagnosticsModal open={diagnosticsOpen} onClose={() => setDiagnosticsOpen(false)} />
-        <HistorySearchModal
-          open={historySearchOpen}
-          onClose={() => setHistorySearchOpen(false)}
-          onSelect={(id) => {
-            setActive(id);
-            setHistorySearchOpen(false);
-          }}
-        />
       </div>
     );
   }
@@ -204,7 +193,6 @@ export function App() {
       {!sidebarCollapsed && (
         <SessionList
           onNew={() => setNewOpen(true)}
-          onSearch={() => setHistorySearchOpen(true)}
           onDiagnostics={() => setDiagnosticsOpen(true)}
           onCollapse={collapseSidebar}
         />
@@ -243,14 +231,6 @@ export function App() {
         onCreated={(id) => setActive(id)}
       />
       <DiagnosticsModal open={diagnosticsOpen} onClose={() => setDiagnosticsOpen(false)} />
-      <HistorySearchModal
-        open={historySearchOpen}
-        onClose={() => setHistorySearchOpen(false)}
-        onSelect={(id) => {
-          setActive(id);
-          setHistorySearchOpen(false);
-        }}
-      />
     </div>
   );
 }

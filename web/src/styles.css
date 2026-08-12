@@ -284,14 +284,6 @@ body.is-resizing-panels * {
   background: var(--surface-hover);
 }
 
-.session-search-btn {
-  display: grid;
-  width: 30px;
-  place-items: center;
-  padding: 0;
-  color: var(--text-muted);
-}
-
 .sr-only {
   position: absolute;
   width: 1px;
@@ -340,7 +332,6 @@ body.is-resizing-panels * {
   gap: 4px;
   flex: none;
   padding: 0 9px;
-  border-left: 1px solid var(--border);
   color: var(--text);
   font-size: 12px;
   font-weight: 600;
@@ -385,6 +376,39 @@ body.is-resizing-panels * {
   overflow-y: auto;
 }
 
+.session-filter {
+  position: relative;
+  display: flex;
+  flex: none;
+  align-items: center;
+  margin: 8px 8px 2px;
+}
+
+.session-filter svg {
+  position: absolute;
+  left: 9px;
+  z-index: 1;
+  color: var(--text-faint);
+  pointer-events: none;
+}
+
+.session-filter input {
+  width: 100%;
+  height: 32px;
+  padding: 5px 9px 5px 31px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--canvas);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+
+.session-filter input:focus {
+  border-color: var(--border-strong);
+  outline: none;
+}
+
 .session-list-footer {
   flex: none;
   padding: 7px 8px 8px;
@@ -408,28 +432,6 @@ body.is-resizing-panels * {
 
 .session-list-footer button:hover:not(:disabled) {
   border-color: transparent;
-}
-
-.group-bottom {
-  margin-top: auto;
-  padding-top: 12px;
-}
-
-.group-header {
-  display: flex;
-  align-items: center;
-  width: 100%;
-  min-height: 28px;
-  margin: 2px 0;
-  padding: 3px 8px;
-  border-color: transparent;
-  background: transparent;
-  color: var(--text-faint);
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  text-align: left;
-  text-transform: uppercase;
 }
 
 .chevron {

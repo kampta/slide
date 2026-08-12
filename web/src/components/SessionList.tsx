@@ -3,21 +3,25 @@ import { useSessions } from "../state/sessionStore";
 import { SessionItem } from "./SessionItem";
 import type { Session } from "../state/api";
 
-const STOPPED_COLLAPSED_KEY = "slide.stoppedCollapsed";
-
-function loadStoppedCollapsed(): boolean {
-  const raw = localStorage.getItem(STOPPED_COLLAPSED_KEY);
-  return raw === null ? true : raw === "1";
+export function matchesSession(session: Session, query: string): boolean {
+  const needle = query.trim().toLocaleLowerCase();
+  if (!needle) return true;
+  return [
+    session.name,
+    session.backend,
+    session.state,
+    session.ssh_host ?? "local",
+    session.base_dir,
+    session.project_path,
+  ].some((value) => value.toLocaleLowerCase().includes(needle));
 }
 
 export function SessionList({
   onNew,
-  onSearch,
   onDiagnostics,
   onCollapse,
 }: {
   onNew: () => void;
-  onSearch: () => void;
   onDiagnostics: () => void;
   // Optional: when present, header shows a collapse chevron. Omitted on
   // mobile where the sidebar IS the whole screen and there's nothing to
@@ -32,27 +36,12 @@ export function SessionList({
   const authError = useSessions((s) => s.authError);
   const error = useSessions((s) => s.error);
   const clearError = useSessions((s) => s.clearError);
-  const [stoppedCollapsed, setStoppedCollapsed] = useState(loadStoppedCollapsed);
+  const [query, setQuery] = useState("");
 
-  const { live, stopped } = useMemo(() => {
-    const live: Session[] = [];
-    const stopped: Session[] = [];
-    for (const id of order) {
-      const s = sessions[id];
-      if (!s) continue;
-      if (s.state === "stopped") stopped.push(s);
-      else live.push(s);
-    }
-    return { live, stopped };
-  }, [sessions, order]);
-
-  function toggleStopped() {
-    setStoppedCollapsed((prev) => {
-      const next = !prev;
-      localStorage.setItem(STOPPED_COLLAPSED_KEY, next ? "1" : "0");
-      return next;
-    });
-  }
+  const visible = useMemo(
+    () => order.map((id) => sessions[id]).filter((session) => session && matchesSession(session, query)),
+    [order, query, sessions],
+  );
 
   return (
     <aside className="session-list">
@@ -85,18 +74,6 @@ export function SessionList({
         </div>
         <div className="session-list-actions">
           <div className="session-action-group">
-            <button
-              type="button"
-              className="session-search-btn"
-              onClick={onSearch}
-              aria-label="Search session history"
-              title="Search session history"
-            >
-              <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
-                <circle cx="11" cy="11" r="6" />
-                <path d="m16 16 4 4" />
-              </svg>
-            </button>
             <button className="session-new-btn" onClick={onNew}>
               <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
                 <path d="M12 5v14M5 12h14" />
@@ -128,41 +105,29 @@ export function SessionList({
           )}
         </div>
       )}
+      <label className="session-filter">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+          <circle cx="11" cy="11" r="6" />
+          <path d="m16 16 4 4" />
+        </svg>
+        <span className="sr-only">Filter sessions</span>
+        <input
+          type="search"
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="Filter sessions"
+          autoComplete="off"
+        />
+      </label>
       <div className="session-list-scroll">
-        {live.length > 0 && (
-          <section className="group group-live">
-            {live.map((s) => (
-              <SessionItem
-                key={s.id}
-                session={s}
-                active={s.id === activeId}
-                onClick={() => setActive(s.id)}
-              />
-            ))}
-          </section>
-        )}
-        {stopped.length > 0 && (
-          <section className="group group-stopped group-bottom">
-            <button
-              type="button"
-              className="group-header"
-              aria-expanded={!stoppedCollapsed}
-              onClick={toggleStopped}
-            >
-              <span className={`chevron ${stoppedCollapsed ? "collapsed" : ""}`}>▸</span>
-              Stopped <span className="count">{stopped.length}</span>
-            </button>
-            {!stoppedCollapsed &&
-              stopped.map((s) => (
-                <SessionItem
-                  key={s.id}
-                  session={s}
-                  active={s.id === activeId}
-                  onClick={() => setActive(s.id)}
-                />
-              ))}
-          </section>
-        )}
+        {visible.map((session) => (
+          <SessionItem
+            key={session.id}
+            session={session}
+            active={session.id === activeId}
+            onClick={() => setActive(session.id)}
+          />
+        ))}
         {order.length === 0 && (
           <div className="empty">
             No sessions yet.<br />
@@ -171,6 +136,9 @@ export function SessionList({
             </span>
             <span className="mobile-only">Tap + to create one.</span>
           </div>
+        )}
+        {order.length > 0 && visible.length === 0 && (
+          <div className="empty">No matching sessions.</div>
         )}
       </div>
       <footer className="session-list-footer">

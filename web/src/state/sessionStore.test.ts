@@ -52,6 +52,20 @@ describe("session store snapshots", () => {
     useSessions.getState().upsert({ ...original });
     expect(useSessions.getState().sessions).toBe(sessionsBefore);
   });
+
+  it("keeps creation order when activity and lifecycle state change", () => {
+    const older = session("older", { created_at: 10, last_activity: 100 });
+    const newer = session("newer", { created_at: 20, last_activity: 20 });
+    useSessions.getState().loadSnapshot([older, newer]);
+    expect(useSessions.getState().order).toEqual(["newer", "older"]);
+
+    useSessions.getState().upsert({
+      ...older,
+      state: "stopped",
+      last_activity: 10_000,
+    });
+    expect(useSessions.getState().order).toEqual(["newer", "older"]);
+  });
 });
 
 describe("sessionDisplayPath", () => {

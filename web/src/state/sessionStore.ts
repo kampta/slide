@@ -30,12 +30,9 @@ interface Store {
 }
 
 function sortOrder(a: Session, b: Session): number {
-  // Stopped always sinks to the bottom; every live state interleaves by
-  // recency so classification changes do not move a session around.
-  const aStopped = a.state === "stopped" ? 1 : 0;
-  const bStopped = b.state === "stopped" ? 1 : 0;
-  if (aStopped !== bStopped) return aStopped - bStopped;
-  return b.last_activity - a.last_activity;
+  // Creation time never changes, so lifecycle and activity events cannot
+  // move a row while the user is switching between sessions.
+  return b.created_at - a.created_at || a.id.localeCompare(b.id);
 }
 
 /// Field-by-field equality so `upsert` can skip rebuilding `sessions` and
@@ -155,7 +152,7 @@ export const useSessions = create<Store>((set, get) => ({
           case "session_state":
             {
               const s = get().sessions[msg.id];
-              if (s) get().upsert({ ...s, state: msg.state, last_activity: Date.now() });
+              if (s) get().upsert({ ...s, state: msg.state });
             }
             break;
           case "session_exit":

@@ -218,23 +218,6 @@ export interface RuntimeDiagnosticsSnapshot {
   tmux: RuntimeCapability;
 }
 
-export interface HistorySearchResult {
-  session_id: string;
-  session_name: string;
-  backend: Backend;
-  location: Location;
-  state: SessionState;
-  position: number;
-  snippet: string;
-}
-
-export interface HistorySearchResponse {
-  results: HistorySearchResult[];
-  searched_sessions: number;
-  unavailable_sessions: number;
-  truncated: boolean;
-}
-
 export const api = {
   listSessions: () => req<Session[]>("GET", "/api/sessions"),
   listBackends: () => req<BackendInfo[]>("GET", "/api/backends"),
@@ -271,8 +254,6 @@ export const api = {
       `/api/diagnostics${query ? `?${query}` : ""}`,
     );
   },
-  searchHistory: (query: string) =>
-    req<HistorySearchResponse>("POST", "/api/history/search", { query }),
   forkSession: (id: string, request: { name: string; focus?: string }) =>
     req<Session>("POST", sessionPath(id, "/fork"), request),
   handoffSession: (
