@@ -1,5 +1,6 @@
 pub mod manager;
 pub mod pty;
+mod running;
 
 use crate::backend::BackendKind;
 use serde::{Deserialize, Serialize};

@@ -1,34 +1,28 @@
-use super::pty::{self, Pty};
+use super::pty;
+use super::running::RunningSession;
 use super::{
     CreateSessionRequest, ForkSessionRequest, HandoffRequest, Location, Session, SessionEvent,
     SessionState, SupervisorKind,
 };
 use crate::backend::{self, BackendKind, ContextUsage, SubagentList};
-use crate::classifier;
 use crate::config;
 use crate::git;
 use crate::runtime::{RuntimeDiagnosticsCache, RuntimeDiagnosticsSnapshot};
 use crate::store::Store;
-use crate::supervisor::{self, SpawnReq, WritesLog};
+use crate::supervisor::{self, SpawnReq};
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
-use tokio::sync::{broadcast, Notify, RwLock};
-use tokio::task::JoinHandle;
+use tokio::sync::{broadcast, RwLock};
 
-const RING_CAP: usize = 2 * 1024 * 1024; // 2 MB per session
-const TAIL_SNIFF: usize = 4 * 1024;
 const BROADCAST_CAP: usize = 256;
 const SUBAGENT_CACHE_TTL: Duration = Duration::from_secs(3);
 const ATTACH_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const ATTACH_RETRY_MAX: Duration = Duration::from_secs(30);
-const UNKNOWN_RECHECK_INITIAL: Duration = Duration::from_secs(5);
-const UNKNOWN_RECHECK_MAX: Duration = Duration::from_secs(30);
 const HANDOFF_TAIL_BYTES: usize = 32 * 1024;
 const HANDOFF_CONTEXT_CHARS: usize = 8_000;
 const COLD_START_PROBE_CONCURRENCY: usize = 8;
@@ -37,40 +31,6 @@ const COLD_START_PROBE_CONCURRENCY: usize = 8;
 struct CachedSubagents {
     fetched_at: Instant,
     value: SubagentList,
-}
-
-/// Bounded terminal history without the repeated 2 MB memmove caused by
-/// trimming the front of a `Vec<u8>` for every output chunk after capacity.
-struct ByteRing {
-    bytes: VecDeque<u8>,
-}
-
-impl ByteRing {
-    fn new() -> Self {
-        Self {
-            bytes: VecDeque::with_capacity(8192),
-        }
-    }
-
-    fn push(&mut self, chunk: &[u8]) {
-        self.bytes.extend(chunk);
-        let overflow = self.bytes.len().saturating_sub(RING_CAP);
-        if overflow > 0 {
-            self.bytes.drain(..overflow);
-        }
-    }
-
-    fn snapshot(&self) -> Vec<u8> {
-        self.bytes.iter().copied().collect()
-    }
-
-    fn tail(&self, len: usize) -> Vec<u8> {
-        self.bytes
-            .iter()
-            .skip(self.bytes.len().saturating_sub(len))
-            .copied()
-            .collect()
-    }
 }
 
 /// Reject ids that could escape `logs_dir` when joined as `{id}.log`, or
@@ -135,7 +95,7 @@ fn build_handoff_prompt(source_name: &str, focus: &str, context: &str) -> String
     )
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -184,16 +144,6 @@ async fn rollback_owned_worktree(
         }
     }
     Ok(())
-}
-
-/// Effective PTY size given the per-client map. Returns `None` when no
-/// clients are attached (the caller should leave the PTY at its prior
-/// size in that case). Otherwise returns the per-axis min so the
-/// smallest viewport sees its full content.
-fn effective_min_size(sizes: &HashMap<u64, (u16, u16)>) -> Option<(u16, u16)> {
-    let mut iter = sizes.values().copied();
-    let first = iter.next()?;
-    Some(iter.fold(first, |(c, r), (nc, nr)| (c.min(nc), r.min(nr))))
 }
 
 fn remove_if_current<T>(map: &mut HashMap<String, Arc<T>>, id: &str, expected: &Arc<T>) -> bool {
@@ -278,39 +228,6 @@ async fn inspect_cold_session(session: Session) -> (Session, ColdStartStatus) {
     (session, status)
 }
 
-struct Running {
-    pty: Pty,
-    supervisor: SupervisorKind,
-    // `Bytes` collapses the per-subscriber broadcast clone into an Arc
-    // refcount bump. The underlying allocation is shared across every
-    // /ws/session subscriber AND the slot the broadcast channel holds in
-    // its own ring — important because at default capacity the channel
-    // can hold 256 chunks per session.
-    output_tx: broadcast::Sender<Bytes>,
-    ring: Arc<tokio::sync::Mutex<ByteRing>>,
-    /// Per-session classifier task. Aborted in `Drop` so removing a
-    /// session from the running map immediately stops its classifier;
-    /// no orphan tasks accumulate across stop/resume cycles. The Arcs
-    /// the classifier and reader tasks need (last_activity, ring,
-    /// activity_notify) live in those tasks' captures rather than here.
-    classifier_handle: JoinHandle<()>,
-    /// Per-attached-client viewport size. The PTY is one shared resource
-    /// so we can't honor each client independently — instead we resize
-    /// to the minimum across attached clients, the same approach tmux
-    /// uses for multiple attached clients. A laptop client at 200x50
-    /// and a phone at 60x30 means the PTY runs at 60x30; the laptop
-    /// renders with right/bottom whitespace but both clients see the
-    /// same content. Without this, each client's resize trampled the
-    /// other on the same session.
-    client_sizes: tokio::sync::Mutex<HashMap<u64, (u16, u16)>>,
-}
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        self.classifier_handle.abort();
-    }
-}
-
 /// Default tmux window size for newly-created sessions. The daemon resizes
 /// to the client's actual terminal size as soon as the first WS attaches.
 const DEFAULT_COLS: u16 = 120;
@@ -318,7 +235,7 @@ const DEFAULT_ROWS: u16 = 40;
 
 pub struct SessionManager {
     store: Arc<Store>,
-    running: RwLock<HashMap<String, Arc<Running>>>,
+    running: RwLock<HashMap<String, Arc<RunningSession>>>,
     // Broadcast carries `Arc<SessionEvent>`, not `SessionEvent`. Each event
     // ends up cloned once into the channel ring buffer plus once per
     // receiver on `recv()`; with N subscribers and a heap-heavy variant
@@ -459,6 +376,19 @@ impl SessionManager {
         let _ = self.events.send(Arc::new(ev));
     }
 
+    pub(super) async fn persist_classification(
+        &self,
+        id: &str,
+        state: SessionState,
+        last_activity: i64,
+    ) {
+        let _ = self.store.update_state(id, state, last_activity).await;
+        self.emit(SessionEvent::SessionState {
+            id: id.to_string(),
+            state,
+        });
+    }
+
     async fn persist_unattached_state(&self, session: &Session, state: SessionState) {
         if session.state == state {
             return;
@@ -482,7 +412,7 @@ impl SessionManager {
             .clone()
     }
 
-    async fn running_session(&self, id: &str) -> Option<Arc<Running>> {
+    async fn running_session(&self, id: &str) -> Option<Arc<RunningSession>> {
         self.running.read().await.get(id).cloned()
     }
 
@@ -499,23 +429,14 @@ impl SessionManager {
             return None;
         }
         let r = self.running_session(id).await?;
-        // Hold the ring lock across snapshot + subscribe. The reader task
-        // takes this same lock around its broadcast send (see the spawn at
-        // the top of this module), so any chunk visible in the snapshot
-        // has already been broadcast — and the receiver we create here will
-        // only see chunks that haven't been written to the ring yet.
-        let ring = r.ring.lock().await;
-        let snapshot = ring.snapshot();
-        let rx = r.output_tx.subscribe();
-        drop(ring);
-        Some((snapshot, rx))
+        Some(r.subscribe_with_snapshot().await)
     }
 
     pub async fn get_log(&self, id: &str) -> Result<Vec<u8>> {
         check_id(id)?;
         // Prefer in-memory ring; fall back to disk log.
         if let Some(r) = self.running_session(id).await {
-            return Ok(r.ring.lock().await.snapshot());
+            return Ok(r.snapshot().await);
         }
         let path = config::logs_dir().join(format!("{id}.log"));
         if path.exists() {
@@ -653,7 +574,7 @@ impl SessionManager {
             .running_session(id)
             .await
             .context("session not running")?;
-        r.pty.write(bytes)?;
+        r.write(bytes)?;
         Ok(())
     }
 
@@ -685,12 +606,7 @@ impl SessionManager {
             .running_session(id)
             .await
             .context("session not running")?;
-        let mut sizes = r.client_sizes.lock().await;
-        sizes.insert(client_id, (cols, rows));
-        if let Some((c, r2)) = effective_min_size(&sizes) {
-            r.pty.resize(c, r2)?;
-        }
-        Ok(())
+        r.set_client_size(client_id, cols, rows).await
     }
 
     /// Drop a disconnected client's size and re-resize to the new min.
@@ -704,16 +620,7 @@ impl SessionManager {
         let Some(r) = self.running_session(id).await else {
             return;
         };
-        let mut sizes = r.client_sizes.lock().await;
-        if sizes.remove(&client_id).is_none() {
-            return;
-        }
-        if let Some((c, r2)) = effective_min_size(&sizes) {
-            let _ = r.pty.resize(c, r2);
-        }
-        // Empty map: leave the PTY at its last size. Resizing to 0 would
-        // confuse most TUIs, and the next client to attach will set a
-        // sensible value as soon as its xterm fits.
+        r.forget_client(client_id).await;
     }
 
     pub async fn rename(&self, id: &str, new_name: &str) -> Result<Session> {
@@ -981,7 +888,7 @@ impl SessionManager {
         let focus = normalize_focus(Some(&request.focus), true)?.context("focus is required")?;
         let running = self.running.read().await.get(source_id).cloned();
         let bytes = match running {
-            Some(running) => running.ring.lock().await.tail(HANDOFF_TAIL_BYTES),
+            Some(running) => running.tail(HANDOFF_TAIL_BYTES).await,
             None => {
                 let source = source.clone();
                 tokio::task::spawn_blocking(move || {
@@ -1204,12 +1111,11 @@ impl SessionManager {
     async fn kill_running(&self, id: &str) {
         let running = self.running.write().await.remove(id);
         if let Some(r) = running {
-            // Exit watchers retain an Arc<Running> until the child reports
+            // Exit watchers retain an Arc<RunningSession> until the child reports
             // its status. Abort immediately rather than waiting for Drop so
             // metadata workers can observe their final sender closing while
             // stop/delete still holds the per-session operation lock.
-            r.classifier_handle.abort();
-            r.pty.kill();
+            r.kill();
         }
     }
 
@@ -1221,7 +1127,7 @@ impl SessionManager {
     async fn handle_child_exit(
         self: &Arc<Self>,
         id: String,
-        running: Arc<Running>,
+        running: Arc<RunningSession>,
         code: Option<i32>,
     ) {
         let operation = self.operation_lock(&id);
@@ -1356,7 +1262,7 @@ impl SessionManager {
             let running = self.running.read().await;
             running
                 .iter()
-                .filter(|(_, session)| matches!(session.supervisor, SupervisorKind::Direct))
+                .filter(|(_, session)| matches!(session.supervisor(), SupervisorKind::Direct))
                 .map(|(id, _)| id.clone())
                 .collect()
         };
@@ -1441,85 +1347,19 @@ impl SessionManager {
                     handoff.attach_cwd.display()
                 )
             })?;
-            let writes_log = handoff.writes_log;
-            let (output_tx, _) = broadcast::channel(BROADCAST_CAP);
-            let ring = Arc::new(tokio::sync::Mutex::new(ByteRing::new()));
-            let last_activity = Arc::new(AtomicI64::new(now_ms()));
-            let activity_notify = Arc::new(Notify::new());
-
-            // Per-session classifier task. Runs only while this Running entry
-            // is in the map; aborted via `Running::Drop` when the session is
-            // stopped, killed, or the daemon shuts down.
-            let classifier_handle = tokio::spawn(classifier_task(ClassifierCtx {
-                mgr: self.clone(),
-                id: session.id.clone(),
-                backend_kind: session.backend,
-                supervisor: session.supervisor,
-                ssh_host: session.ssh_host.clone(),
-                initial_state: session.state,
-                last_activity: last_activity.clone(),
-                activity_notify: activity_notify.clone(),
-                ring: ring.clone(),
-            }));
-
-            let running = Arc::new(Running {
-                pty: spawned.pty,
-                supervisor: session.supervisor,
-                output_tx: output_tx.clone(),
-                ring: ring.clone(),
-                classifier_handle,
-                client_sizes: tokio::sync::Mutex::new(HashMap::new()),
-            });
+            let running = RunningSession::start(
+                self.clone(),
+                session,
+                spawned.pty,
+                spawned.output,
+                handoff.writes_log,
+                &log_path,
+            )
+            .await;
             self.running
                 .write()
                 .await
                 .insert(session.id.clone(), running.clone());
-
-            // Log file writer — only when the supervisor isn't doing it for us.
-            // Tmux's pipe-pane writes the same log_path on the host, so a daemon
-            // writer would double-count.
-            let log_file = if matches!(writes_log, WritesLog::Daemon) {
-                tokio::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&log_path)
-                    .await
-                    .ok()
-            } else {
-                None
-            };
-
-            // Reader task: pumps PTY bytes into the ring buffer, log file, and
-            // per-session broadcast. PTY output never enters the global events
-            // bus — that channel is for low-volume lifecycle metadata only —
-            // so /ws/events stays cheap regardless of how chatty a backend is.
-            let mut output = spawned.output;
-            tokio::spawn(async move {
-                let mut log_file = log_file;
-                while let Some(chunk) = output.recv().await {
-                    last_activity.store(now_ms(), Ordering::SeqCst);
-                    // Append to ring AND broadcast under the same lock so that
-                    // `subscribe_output_with_snapshot` is atomic w.r.t. live
-                    // bytes: a subscriber that snapshots the ring and creates a
-                    // broadcast receiver while holding this same lock will see
-                    // every chunk exactly once with no gap and no duplicate.
-                    {
-                        let mut ring = ring.lock().await;
-                        ring.push(&chunk);
-                        // Bytes::clone is a refcount bump; broadcast subscribers
-                        // share one allocation with the channel's own slot.
-                        let _ = output_tx.send(chunk.clone());
-                    }
-                    if let Some(f) = log_file.as_mut() {
-                        let _ = f.write_all(&chunk).await;
-                    }
-                    // Wake the classifier. notify_one is a single permit, so a
-                    // burst of chunks coalesces into one wakeup — exactly the
-                    // debouncing the classifier relies on to avoid running its
-                    // (potentially SSH-bound) pane capture per chunk.
-                    activity_notify.notify_one();
-                }
-            });
 
             // Exit watcher. Under tmux, `spawned` is only the local attach
             // client; its exit may be a recoverable SSH transport loss rather
@@ -1585,186 +1425,16 @@ impl SessionManager {
     }
 }
 
-/// Inputs to [`classifier_task`]. Bundled into a struct because the task
-/// needs almost a dozen pieces of context and a flat signature would be
-/// hard to read at the call site.
-struct ClassifierCtx {
-    mgr: Arc<SessionManager>,
-    id: String,
-    backend_kind: BackendKind,
-    supervisor: SupervisorKind,
-    ssh_host: Option<String>,
-    initial_state: SessionState,
-    last_activity: Arc<AtomicI64>,
-    activity_notify: Arc<Notify>,
-    ring: Arc<tokio::sync::Mutex<ByteRing>>,
-}
-
-/// Per-session classification loop that replaces the old global ticker.
-///
-/// Wakes on either (a) a settle deadline derived from `last_activity`, or
-/// (b) a notification from the reader task signalling fresh PTY bytes. On
-/// every wake it captures the rendered pane (tmux `capture-pane` for tmux
-/// sessions, ANSI-stripped ring tail for direct-PTY) and runs the existing
-/// pure [`classifier::classify`] on it. State changes are persisted and
-/// broadcast.
-///
-/// A stable Waiting or positively-identified Active session sits in
-/// `notified().await` indefinitely. Unknown panes and capture failures are
-/// retried with a 5–30 second backoff, preventing a transient SSH/tmux failure
-/// or an unrecognized modal from leaving a stale state forever. Aborted via
-/// `Running::Drop` when the session stops or the daemon goes down.
-async fn classifier_task(ctx: ClassifierCtx) {
-    let ClassifierCtx {
-        mgr,
-        id,
-        backend_kind,
-        supervisor,
-        ssh_host,
-        initial_state,
-        last_activity,
-        activity_notify,
-        ring,
-    } = ctx;
-    let signals = backend::for_kind(backend_kind).signals();
-    let mut last_state = initial_state;
-    let mut unknown_recheck = UNKNOWN_RECHECK_INITIAL;
-
-    loop {
-        let activity = last_activity.load(Ordering::SeqCst);
-        let now = now_ms();
-        let elapsed = now.saturating_sub(activity);
-        let settle_ms = signals.settle_ms as i64;
-
-        // Pane snapshot. A capture failure is uncertain rather than evidence
-        // that the last state is still true. The exit watcher remains the
-        // authority for transitioning to Stopped.
-        let pane = match supervisor {
-            SupervisorKind::Tmux => {
-                let host = ssh_host.clone();
-                let sid = id.clone();
-                tokio::task::spawn_blocking(move || {
-                    crate::tmux::capture_pane(host.as_deref(), &sid)
-                })
-                .await
-                .ok()
-                .and_then(Result::ok)
-            }
-            SupervisorKind::Direct => {
-                let ring = ring.lock().await;
-                let tail = ring.tail(TAIL_SNIFF);
-                Some(crate::terminal_text::strip_ansi(&String::from_utf8_lossy(
-                    &tail,
-                )))
-            }
-        };
-
-        let classification = match pane {
-            Some(pane) => classifier::classify(
-                &classifier::Snapshot {
-                    pane: &pane,
-                    idle_ms: elapsed,
-                },
-                signals,
-            ),
-            None => classifier::Classification {
-                state: SessionState::Unknown,
-                reason: classifier::ClassificationReason::CaptureFailed,
-            },
-        };
-        let desired = classification.state;
-        if desired != last_state {
-            // Classification is not terminal activity. Preserve the actual
-            // last byte timestamp so sorting and the next settle calculation
-            // remain meaningful.
-            let _ = mgr.store.update_state(&id, desired, activity).await;
-            mgr.emit(SessionEvent::SessionState {
-                id: id.clone(),
-                state: desired,
-            });
-            tracing::debug!(
-                session = %id,
-                state = desired.as_str(),
-                reason = ?classification.reason,
-                "classified session state"
-            );
-            last_state = desired;
-        }
-
-        // Wake conditions:
-        // - Inside the settle window: wait for the window to expire (so the
-        //   prompt regex gets its fair shot) OR for fresh bytes (which will
-        //   reset the window on the next iteration).
-        // - Unknown/capture failure: retry with bounded backoff, since silence
-        //   alone cannot make the state more certain and remote capture can
-        //   recover without PTY bytes arriving.
-        // - Known and settled: park until fresh bytes arrive.
-        if desired == SessionState::Unknown {
-            let delay = unknown_recheck;
-            unknown_recheck = std::cmp::min(unknown_recheck.saturating_mul(2), UNKNOWN_RECHECK_MAX);
-            tokio::select! {
-                _ = tokio::time::sleep(delay) => {}
-                _ = activity_notify.notified() => {
-                    unknown_recheck = UNKNOWN_RECHECK_INITIAL;
-                }
-            }
-        } else if elapsed < settle_ms {
-            unknown_recheck = UNKNOWN_RECHECK_INITIAL;
-            let remaining = (settle_ms - elapsed).max(1) as u64;
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(remaining)) => {}
-                _ = activity_notify.notified() => {}
-            }
-        } else {
-            unknown_recheck = UNKNOWN_RECHECK_INITIAL;
-            activity_notify.notified().await;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        build_handoff_prompt, effective_min_size, newest_chars, normalize_focus, remove_if_current,
-        state_after_failed_reattach, tmux_exit_action, valid_id, ByteRing, TmuxExitAction,
-        RING_CAP,
+        build_handoff_prompt, newest_chars, normalize_focus, remove_if_current,
+        state_after_failed_reattach, tmux_exit_action, valid_id, TmuxExitAction,
     };
     use crate::session::SessionState;
     use crate::tmux::SessionProbe;
     use std::collections::HashMap;
     use std::sync::Arc;
-
-    #[test]
-    fn effective_min_size_empty_returns_none() {
-        let sizes: HashMap<u64, (u16, u16)> = HashMap::new();
-        assert_eq!(effective_min_size(&sizes), None);
-    }
-
-    #[test]
-    fn effective_min_size_single_client_returns_its_size() {
-        let mut sizes = HashMap::new();
-        sizes.insert(1, (200, 50));
-        assert_eq!(effective_min_size(&sizes), Some((200, 50)));
-    }
-
-    #[test]
-    fn effective_min_size_picks_per_axis_min_across_clients() {
-        // Laptop wide+short, phone narrow+tall: PTY runs at the
-        // intersection so neither client's content gets clipped.
-        let mut sizes = HashMap::new();
-        sizes.insert(1, (200, 30)); // laptop
-        sizes.insert(2, (60, 80)); // phone
-        assert_eq!(effective_min_size(&sizes), Some((60, 30)));
-    }
-
-    #[test]
-    fn effective_min_size_three_clients() {
-        let mut sizes = HashMap::new();
-        sizes.insert(1, (200, 50));
-        sizes.insert(2, (120, 40));
-        sizes.insert(3, (80, 24));
-        assert_eq!(effective_min_size(&sizes), Some((80, 24)));
-    }
 
     #[test]
     fn valid_id_accepts_uuid_shape() {
@@ -1816,18 +1486,6 @@ mod tests {
         assert!(prompt.contains("session 'source'"));
         assert!(prompt.contains("Focus: check tests"));
         assert!(!prompt.contains('\n'));
-    }
-
-    #[test]
-    fn byte_ring_keeps_only_the_newest_bytes() {
-        let mut ring = ByteRing::new();
-        ring.push(&vec![b'a'; RING_CAP]);
-        ring.push(b"bc");
-
-        let snapshot = ring.snapshot();
-        assert_eq!(snapshot.len(), RING_CAP);
-        assert_eq!(&snapshot[RING_CAP - 2..], b"bc");
-        assert_eq!(ring.tail(3), b"abc");
     }
 
     #[test]
