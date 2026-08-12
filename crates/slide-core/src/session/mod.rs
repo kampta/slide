@@ -1,4 +1,5 @@
 pub mod manager;
+mod metadata;
 pub mod pty;
 mod recovery;
 mod running;

@@ -243,24 +243,27 @@ impl Store {
 
     /// Record the backend-native session id (e.g. claude's `--resume`
     /// target) once discovery has found it.
-    pub async fn update_backend_session_id(
+    pub async fn set_backend_session_id_if_current(
         &self,
         id: &str,
+        backend: BackendKind,
         backend_session_id: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let id = id.to_string();
+        let backend = backend.as_str().to_string();
         let backend_session_id = backend_session_id.to_string();
-        self.conn
+        let updated = self
+            .conn
             .call(move |c| {
-                c.execute(
-                    "UPDATE sessions SET backend_session_id=?1 WHERE id=?2",
-                    params![backend_session_id, id],
-                )?;
-                Ok(())
+                Ok(c.execute(
+                    "UPDATE sessions SET backend_session_id=?1
+                     WHERE id=?2 AND backend=?3 AND backend_session_id IS NULL",
+                    params![backend_session_id, id, backend],
+                )?)
             })
             .await
             .context("update backend session id")?;
-        Ok(())
+        Ok(updated > 0)
     }
 
     pub async fn delete(&self, id: &str) -> Result<()> {
@@ -409,6 +412,29 @@ mod tests {
         let got = store.get("id1").await.unwrap().unwrap();
         assert_eq!(got.backend, BackendKind::Codex);
         assert!(got.backend_session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_session_id_only_updates_matching_backend() {
+        let store = mem_store().await;
+        store.insert(&make_session("id1", "session")).await.unwrap();
+
+        assert!(store
+            .set_backend_session_id_if_current("id1", BackendKind::Claude, "claude-id")
+            .await
+            .unwrap());
+        store
+            .update_backend("id1", BackendKind::Codex)
+            .await
+            .unwrap();
+        assert!(!store
+            .set_backend_session_id_if_current("id1", BackendKind::Claude, "stale-id")
+            .await
+            .unwrap());
+
+        let session = store.get("id1").await.unwrap().unwrap();
+        assert_eq!(session.backend, BackendKind::Codex);
+        assert_eq!(session.backend_session_id, None);
     }
 
     #[tokio::test]

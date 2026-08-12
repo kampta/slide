@@ -144,6 +144,10 @@ impl Backend for GrokBackend {
     fn discover_session_id(&self, cwd: &Path, since: SystemTime) -> Option<String> {
         discover_in(&grok_home()?.join("sessions"), cwd, since)
     }
+
+    fn supports_session_discovery(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

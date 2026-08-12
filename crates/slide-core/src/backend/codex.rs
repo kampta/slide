@@ -184,6 +184,10 @@ impl Backend for CodexBackend {
         discover_session_id_in(&root, cwd, since)
     }
 
+    fn supports_session_discovery(&self) -> bool {
+        true
+    }
+
     fn read_subagents(
         &self,
         _cwd: &Path,

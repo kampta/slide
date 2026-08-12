@@ -1,3 +1,4 @@
+use super::metadata::BackendMetadata;
 use super::pty;
 use super::recovery::RecoveryCoordinator;
 use super::running::RunningSession;
@@ -17,26 +18,18 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, RwLock};
 
 const BROADCAST_CAP: usize = 256;
-const SUBAGENT_CACHE_TTL: Duration = Duration::from_secs(3);
 const HANDOFF_TAIL_BYTES: usize = 32 * 1024;
 const HANDOFF_CONTEXT_CHARS: usize = 8_000;
-
-#[derive(Clone)]
-struct CachedSubagents {
-    fetched_at: Instant,
-    value: SubagentList,
-}
 
 /// Reject ids that could escape `logs_dir` when joined as `{id}.log`, or
 /// otherwise reach outside the caller's intent. All ids this daemon
 /// generates are UUIDs (see `create`), so restricting to UUID-shaped
 /// characters is strict enough to block `..`, absolute paths, NULs, and
 /// path separators while allowing every legitimate id through.
-fn valid_id(id: &str) -> bool {
+pub(super) fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
         && id
@@ -44,7 +37,7 @@ fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-fn check_id(id: &str) -> Result<()> {
+pub(super) fn check_id(id: &str) -> Result<()> {
     if !valid_id(id) {
         bail!("invalid session id");
     }
@@ -176,13 +169,7 @@ pub struct SessionManager {
     /// requests from spawning duplicate attach PTYs without making a slow
     /// remote operation block unrelated sessions.
     operation_locks: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// A short cache keeps several browser clients from each starting a
-    /// provider metadata query on the same polling boundary. Entries are
-    /// small (at most 50 sanitized rows) and removed with their session.
-    subagent_cache: RwLock<HashMap<String, CachedSubagents>>,
-    /// Deduplicate cache misses per session without making a slow remote
-    /// provider query block metadata requests for unrelated sessions.
-    subagent_query_locks: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    pub(super) backend_metadata: Arc<BackendMetadata>,
     /// Cached runtime/toolchain health per local or SSH target. The same
     /// snapshot powers the diagnostics UI and create-time preflight, so
     /// health polling does not duplicate version/auth probes.
@@ -194,14 +181,14 @@ impl SessionManager {
         config::ensure_dirs().context("create data dir")?;
         let store = Arc::new(Store::open(&config::db_path()).await?);
         let (events, _) = broadcast::channel(BROADCAST_CAP);
+        let backend_metadata = BackendMetadata::new(store.clone(), events.clone());
         let mgr = Arc::new(Self {
             store,
             running: RwLock::new(HashMap::new()),
             events,
             next_client_id: AtomicU64::new(1),
             operation_locks: StdMutex::new(HashMap::new()),
-            subagent_cache: RwLock::new(HashMap::new()),
-            subagent_query_locks: StdMutex::new(HashMap::new()),
+            backend_metadata,
             runtime_diagnostics: Arc::new(RuntimeDiagnosticsCache::default()),
         });
 
@@ -310,86 +297,14 @@ impl SessionManager {
     /// to the host that owns the transcript — deferred), has no discovered
     /// backend session id yet, or the backend has no transcript concept.
     pub async fn context_usage(&self, id: &str) -> Option<ContextUsage> {
-        if !valid_id(id) {
-            return None;
-        }
-        let s = self.find(id).await.ok()?;
-        if matches!(s.location, Location::Remote) {
-            return None;
-        }
-        let sid = s.backend_session_id?;
-        let cwd = PathBuf::from(s.project_path);
-        tokio::task::spawn_blocking(move || {
-            backend::for_kind(s.backend).read_context_usage(&cwd, &sid)
-        })
-        .await
-        .ok()
-        .flatten()
+        self.backend_metadata.context_usage(id).await
     }
 
     /// Fetch a sanitized child-agent snapshot from the provider. Provider
     /// calls are blocking subprocess I/O, so they run off Tokio's workers;
     /// a short success cache amortizes the query across attached browsers.
     pub async fn subagents(&self, id: &str) -> Result<SubagentList> {
-        check_id(id)?;
-        if let Some(cached) = self.subagent_cache.read().await.get(id).cloned() {
-            if cached.fetched_at.elapsed() < SUBAGENT_CACHE_TTL {
-                return Ok(cached.value);
-            }
-        }
-        let query_lock = self
-            .subagent_query_locks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(id.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        let _query_guard = query_lock.lock().await;
-        // A request that was ahead of us may have filled the cache while we
-        // waited. Recheck before starting another local process or SSH call.
-        if let Some(cached) = self.subagent_cache.read().await.get(id).cloned() {
-            if cached.fetched_at.elapsed() < SUBAGENT_CACHE_TTL {
-                return Ok(cached.value);
-            }
-        }
-
-        let session = self.find(id).await?;
-        let Some(session_id) = session.backend_session_id.clone() else {
-            return Ok(SubagentList {
-                supported: session.backend.info().subagents,
-                agents: Vec::new(),
-            });
-        };
-        let cwd = PathBuf::from(session.project_path);
-        let ssh_host = session.ssh_host.clone();
-        let backend_kind = session.backend;
-        let result = tokio::task::spawn_blocking(move || {
-            backend::for_kind(backend_kind).read_subagents(&cwd, &session_id, ssh_host.as_deref())
-        })
-        .await
-        .context("join subagent metadata query")??;
-        let value = match result {
-            Some(agents) => SubagentList {
-                supported: true,
-                agents,
-            },
-            None => SubagentList {
-                supported: false,
-                agents: Vec::new(),
-            },
-        };
-        // Deletion can run while the provider subprocess is in flight. Do
-        // not resurrect a cache entry after the owning session disappears.
-        if self.find(id).await.is_ok() {
-            self.subagent_cache.write().await.insert(
-                id.to_string(),
-                CachedSubagents {
-                    fetched_at: Instant::now(),
-                    value: value.clone(),
-                },
-            );
-        }
-        Ok(value)
+        self.backend_metadata.subagents(id).await
     }
 
     pub async fn runtime_diagnostics(
@@ -488,6 +403,7 @@ impl SessionManager {
         let s = self.find(id).await?;
         supervisor::for_session(&s).teardown(id).await?;
         self.kill_running(id).await;
+        self.backend_metadata.cancel_discovery(id);
         self.store
             .update_state(id, SessionState::Stopped, now_ms())
             .await?;
@@ -511,11 +427,7 @@ impl SessionManager {
             remove_owned_worktree(&session).await?;
         }
         self.store.delete(id).await?;
-        self.subagent_cache.write().await.remove(id);
-        self.subagent_query_locks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(id);
+        self.backend_metadata.clear_session(id).await;
         let _ = tokio::fs::remove_file(config::logs_dir().join(format!("{id}.log"))).await;
         self.emit(SessionEvent::SessionRemoved { id: id.to_string() });
         Ok(())
@@ -786,7 +698,7 @@ impl SessionManager {
         if let Some(new_backend) = switch_backend {
             self.store.update_backend(id, new_backend).await?;
             // Provider-scoped metadata is invalid after a backend switch.
-            self.subagent_cache.write().await.remove(id);
+            self.backend_metadata.clear_session(id).await;
             session = self.find(id).await?;
         }
         // Match create(): only remote sessions probe through SSH. A stale
@@ -977,52 +889,10 @@ impl SessionManager {
             // killed the tmux session). Only runs for local sessions today —
             // remote discovery would need to scan the remote filesystem over
             // SSH, which we defer.
-            if matches!(session.location, Location::Local) && session.backend_session_id.is_none() {
-                self.spawn_session_id_discovery(session);
-            }
+            self.backend_metadata.start_discovery(session);
 
             Ok(())
         })
-    }
-
-    fn spawn_session_id_discovery(self: &Arc<Self>, session: &Session) {
-        let mgr = self.clone();
-        let id = session.id.clone();
-        let cwd = PathBuf::from(&session.project_path);
-        let backend_kind = session.backend;
-        // `since` lets discovery ignore unrelated transcripts that happen
-        // to live in the same directory. created_at is in ms since epoch.
-        let since = std::time::UNIX_EPOCH
-            + std::time::Duration::from_millis(session.created_at.max(0) as u64);
-        tokio::spawn(async move {
-            // Poll for up to ~two minutes, which is long enough for a cold
-            // start plus an initial prompt without being wasteful if the
-            // backend never writes a transcript.
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
-            loop {
-                let cwd = cwd.clone();
-                // BackendKind is Copy; rebuild the backend each iteration
-                // inside the blocking closure so nothing is moved across
-                // loop iterations.
-                let result = tokio::task::spawn_blocking(move || {
-                    backend::for_kind(backend_kind).discover_session_id(&cwd, since)
-                })
-                .await
-                .ok()
-                .flatten();
-                if let Some(sid) = result {
-                    let _ = mgr.store.update_backend_session_id(&id, &sid).await;
-                    if let Ok(session) = mgr.find(&id).await {
-                        mgr.emit(SessionEvent::SessionUpdated { session });
-                    }
-                    break;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-        });
     }
 }
 

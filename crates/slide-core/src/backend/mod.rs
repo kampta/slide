@@ -216,6 +216,13 @@ pub trait Backend: Send + Sync {
         None
     }
 
+    /// Whether `discover_session_id` has a real implementation. Callers use
+    /// this to avoid polling the default no-op for backends whose transcript
+    /// location is unknown.
+    fn supports_session_discovery(&self) -> bool {
+        false
+    }
+
     /// Read the latest turn's context usage from the backend's transcript.
     /// Returns `None` when the backend has no transcript, the session id
     /// hasn't been discovered yet, or no assistant turn has been recorded.
@@ -359,5 +366,17 @@ mod tests {
             .map(|backend| backend.id)
             .collect::<Vec<_>>();
         assert_eq!(fork_backends, [BackendKind::Claude, BackendKind::Codex]);
+    }
+
+    #[test]
+    fn discovery_capability_matches_implemented_backends() {
+        let discoverable = BackendKind::ALL
+            .into_iter()
+            .filter(|kind| for_kind(*kind).supports_session_discovery())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            discoverable,
+            [BackendKind::Claude, BackendKind::Codex, BackendKind::Grok]
+        );
     }
 }

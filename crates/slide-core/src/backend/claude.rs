@@ -219,6 +219,10 @@ impl Backend for ClaudeBackend {
         }
         best.map(|(_, id)| id)
     }
+
+    fn supports_session_discovery(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

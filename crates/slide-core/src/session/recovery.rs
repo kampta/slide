@@ -279,6 +279,7 @@ impl RecoveryCoordinator {
     }
 
     async fn mark_exited(manager: &SessionManager, id: &str, code: Option<i32>) {
+        manager.backend_metadata.cancel_discovery(id);
         let _ = manager
             .store
             .update_state(id, SessionState::Stopped, now_ms())
