@@ -95,9 +95,7 @@ async fn migrate(conn: &Connection) -> Result<()> {
         for (i, sql) in MIGRATIONS.iter().enumerate() {
             let target = i as u32 + 1;
             if current < target {
-                conn.execute_batch(sql)?;
-                // PRAGMA doesn't accept bind params; an integer is safe to format.
-                conn.execute_batch(&format!("PRAGMA user_version = {target}"))?;
+                apply_migration(conn, sql, target)?;
             }
         }
         Ok(())
@@ -105,6 +103,17 @@ async fn migrate(conn: &Connection) -> Result<()> {
     .await
     .context("apply migrations")?;
     Ok(())
+}
+
+fn apply_migration(
+    conn: &mut rusqlite::Connection,
+    sql: &str,
+    target: u32,
+) -> rusqlite::Result<()> {
+    let transaction = conn.transaction()?;
+    transaction.execute_batch(sql)?;
+    transaction.pragma_update(None, "user_version", target)?;
+    transaction.commit()
 }
 
 /// Async wrapper around the SQLite connection.
@@ -343,6 +352,32 @@ mod tests {
 
     async fn mem_store() -> Store {
         Store::open(Path::new(":memory:")).await.unwrap()
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_schema_and_version_together() {
+        let mut conn = SyncConnection::open_in_memory().unwrap();
+        apply_migration(&mut conn, "CREATE TABLE stable (id INTEGER);", 1).unwrap();
+
+        let error = apply_migration(
+            &mut conn,
+            "CREATE TABLE partial (id INTEGER); THIS IS NOT SQL;",
+            2,
+        );
+        assert!(error.is_err());
+
+        let partial_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='partial')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let version: u32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert!(!partial_exists);
+        assert_eq!(version, 1);
     }
 
     fn make_session(id: &str, name: &str) -> Session {
