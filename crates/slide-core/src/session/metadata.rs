@@ -6,8 +6,8 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{broadcast, RwLock};
 use tokio::task::AbortHandle;
 
@@ -33,7 +33,7 @@ pub(super) struct BackendMetadata {
     store: Arc<Store>,
     events: broadcast::Sender<Arc<SessionEvent>>,
     subagent_cache: RwLock<HashMap<String, CachedSubagents>>,
-    subagent_query_locks: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    subagent_query_locks: StdMutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     discovery_tasks: StdMutex<HashMap<String, DiscoveryTask>>,
     next_generation: AtomicU64,
 }
@@ -76,13 +76,20 @@ impl BackendMetadata {
         if let Some(cached) = self.cached_subagents(id).await {
             return Ok(cached);
         }
-        let query_lock = self
-            .subagent_query_locks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(id.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
+        let query_lock = {
+            let mut locks = self
+                .subagent_query_locks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(id).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(id.to_string(), Arc::downgrade(&lock));
+                lock
+            }
+        };
         let _query_guard = query_lock.lock().await;
         if let Some(cached) = self.cached_subagents(id).await {
             return Ok(cached);
@@ -135,7 +142,7 @@ impl BackendMetadata {
         Ok(value)
     }
 
-    pub(super) fn start_discovery(self: &Arc<Self>, session: &Session) {
+    pub(super) fn start_discovery(self: &Arc<Self>, session: &Session, since: SystemTime) {
         let provider = backend::for_kind(session.backend);
         if !matches!(session.location, Location::Local)
             || session.backend_session_id.is_some()
@@ -150,7 +157,6 @@ impl BackendMetadata {
         let task_id = id.clone();
         let cwd = PathBuf::from(&session.project_path);
         let backend_kind = session.backend;
-        let since = std::time::UNIX_EPOCH + Duration::from_millis(session.created_at.max(0) as u64);
         let (start_tx, start_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             if start_rx.await.is_err() {

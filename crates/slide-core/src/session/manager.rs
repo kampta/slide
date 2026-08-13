@@ -856,6 +856,7 @@ impl SessionManager {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| config::logs_dir().join(format!("{}.log", session.id)));
             let sup = supervisor::for_session(session);
+            let launch_started = std::time::SystemTime::now();
             let spawn_req = SpawnReq {
                 id: session.id.clone(),
                 argv: backend_argv,
@@ -910,7 +911,8 @@ impl SessionManager {
             // killed the tmux session). Only runs for local sessions today —
             // remote discovery would need to scan the remote filesystem over
             // SSH, which we defer.
-            self.backend_metadata.start_discovery(session);
+            self.backend_metadata
+                .start_discovery(session, launch_started);
 
             Ok(())
         })
