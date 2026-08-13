@@ -87,7 +87,7 @@ SQLite at `~/Library/Application Support/slide/slide.db` (macOS) / `$XDG_DATA_HO
 ## Security
 
 - Daemon binds `127.0.0.1` only.
-- Phone access requires an HTTPS reverse proxy to the loopback listener and `--public-url`; use `slide pair` to authorize a device. Direct LAN HTTP binds are refused.
+- Phone access requires an HTTPS reverse proxy to the loopback listener and `--public-url`; use `slide pair` to authorize a device. The proxy must support WebSockets, preserve `Origin`, and overwrite `X-Forwarded-Proto` with `https`. Direct LAN HTTP binds are refused.
 - Every session API and WebSocket request is centrally authenticated. Local tabs use a process bearer held in `sessionStorage`; paired devices use a host-only HttpOnly cookie.
 - The middleware rejects requests whose `Host` is neither loopback nor the configured public host. A public `Origin` must exactly match `--public-url`, including scheme and port.
 - The mode-0600 daemon lock contains discovery metadata and a non-secret local browser URL. The mode-0600 auth state contains only SHA-256 hashes, never cleartext bootstrap tickets, pairing tickets, or device credentials. Both ticket types expire after five minutes and work once.
