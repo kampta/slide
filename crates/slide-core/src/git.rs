@@ -7,6 +7,8 @@ use crate::git_snapshot::{self, RepoTarget};
 
 const REMOTE_GIT_OUTPUT_LIMIT: usize = 64 * 1024;
 const REMOTE_GIT_TIMEOUT: Duration = Duration::from_secs(30);
+const FIRST_COMMIT_ERROR: &str =
+    "repository HEAD has no commit; create an initial commit before creating a Slide session";
 
 pub fn is_git_repo(path: &Path) -> bool {
     // `--is-inside-work-tree` exits 0 with stdout "false" when the cwd is
@@ -136,6 +138,9 @@ fn add_worktree_at(base: &Path, session_name: &str, start_point: Option<&str>) -
         bail!("{} is not a git repo", base.display());
     }
     let top = toplevel(base)?;
+    if start_point.is_none() {
+        ensure_head_commit(&top)?;
+    }
     let slug = slugify(session_name);
     let wt = top.join(".slide-worktrees").join(&slug);
     let branch = format!("slide/{slug}");
@@ -161,6 +166,19 @@ fn add_worktree_at(base: &Path, session_name: &str, start_point: Option<&str>) -
         );
     }
     Ok(wt)
+}
+
+fn ensure_head_commit(path: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+        .output()
+        .context("checking repository HEAD")?;
+    if !output.status.success() {
+        bail!(FIRST_COMMIT_ERROR);
+    }
+    Ok(())
 }
 
 fn revision(path: &Path, revision: &str) -> Result<String> {
@@ -293,6 +311,10 @@ case "$base" in
   "~/"*) base=$HOME/${base#~/} ;;
 esac
 repo=$(git -C "$base" rev-parse --show-toplevel)
+if ! git -C "$repo" rev-parse --verify --quiet 'HEAD^{commit}' >/dev/null; then
+  printf '%s\n' 'repository HEAD has no commit; create an initial commit before creating a Slide session' >&2
+  exit 2
+fi
 worktree="$repo/.slide-worktrees/$slug"
 branch="slide/$slug"
 if [ -e "$worktree" ]; then
@@ -468,6 +490,36 @@ mod tests {
         );
         assert!(worktree.join("README.md").is_file());
         assert!(is_git_repo(&worktree));
+    }
+
+    #[test]
+    fn local_worktree_requires_an_initial_commit() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-q"]);
+
+        let error = add_worktree(repo.path(), "unborn").unwrap_err();
+        assert_eq!(error.to_string(), FIRST_COMMIT_ERROR);
+        assert!(!repo.path().join(".slide-worktrees/unborn").exists());
+    }
+
+    #[test]
+    fn remote_worktree_script_requires_an_initial_commit() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-q"]);
+
+        let output = Command::new("sh")
+            .args(["-c", ADD_REMOTE_WORKTREE_SCRIPT, "sh"])
+            .arg(repo.path())
+            .arg("unborn")
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).trim(),
+            FIRST_COMMIT_ERROR
+        );
+        assert!(!repo.path().join(".slide-worktrees/unborn").exists());
     }
 
     #[test]
