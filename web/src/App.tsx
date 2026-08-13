@@ -13,7 +13,7 @@ import { DiagnosticsModal } from "./components/DiagnosticsModal";
 import { StatusBanners } from "./components/StatusBanners";
 import { useSessions } from "./state/sessionStore";
 import { useIsMobile } from "./hooks/useMediaQuery";
-import { setToken } from "./state/api";
+import { prepareAuth } from "./state/api";
 
 const SIDEBAR_WIDTH_KEY = "slide.sidebarWidth";
 const SIDEBAR_COLLAPSED_KEY = "slide.sidebarCollapsed";
@@ -53,6 +53,7 @@ export function App() {
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(loadSidebarCollapsed);
   const connect = useSessions((s) => s.connect);
+  const reportError = useSessions((s) => s.reportError);
   const setActive = useSessions((s) => s.setActive);
   // Subscribe to activeId so the mobile single-pane render swaps when the
   // user picks (or backs out of) a session. Desktop layout doesn't need
@@ -62,20 +63,20 @@ export function App() {
   const isMobile = useIsMobile();
 
   useEffect(() => {
-    // Capture the token *before* stripping the URL: getToken() falls back to
-    // localStorage, which would be empty on a fresh device if we stripped
-    // first. Stripping after capture keeps the address bar clean across
-    // refreshes without losing auth on a new device's first load.
-    const url = new URL(window.location.href);
-    const fromUrl = url.searchParams.get("token");
-    if (fromUrl) {
-      setToken(fromUrl);
-      url.searchParams.delete("token");
-      window.history.replaceState({}, "", url.toString());
-    }
-    const stop = connect();
-    return stop;
-  }, [connect]);
+    let cancelled = false;
+    let stop: (() => void) | undefined;
+    prepareAuth()
+      .then(() => {
+        if (!cancelled) stop = connect();
+      })
+      .catch((error) => {
+        if (!cancelled) reportError(error);
+      });
+    return () => {
+      cancelled = true;
+      stop?.();
+    };
+  }, [connect, reportError]);
 
   useEffect(() => {
     try {

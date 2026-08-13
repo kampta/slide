@@ -67,37 +67,21 @@ export function clusterLabel(session: Session): string {
   return "local";
 }
 
-const TOKEN_KEY = "slide.token";
+const TOKEN_KEY = "slide.bootstrapToken";
+const LEGACY_TOKEN_KEY = "slide.token";
 
-// One-time migration: the token used to live in sessionStorage. Drop the
-// stale key so a future read with the same key from sessionStorage (e.g.
-// future bug, browser extension) can't shadow the localStorage value.
+// Discard credentials stored by older releases. Device credentials now live
+// only in an HttpOnly cookie; the local bootstrap token is tab-scoped.
 try {
-  sessionStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(LEGACY_TOKEN_KEY);
+  sessionStorage.removeItem(LEGACY_TOKEN_KEY);
 } catch {
-  // sessionStorage can throw in private-mode tabs; ignore.
+  // Storage can throw in private-mode tabs; ignore.
 }
 
-// Token is read on every request so a fresh `?token=…` (e.g. a re-pair via
-// QR scan) takes effect immediately. URL token always wins, since it's the
-// most recent explicit pairing intent; we cache it to localStorage so the
-// phone keeps working after Safari closes/sleeps. The previous module-init
-// `const token` capture meant in-flight calls used the stale value after
-// daemon restart, which rotates the token on every boot.
 export function getToken(): string {
-  // Skip the URLSearchParams parse on the common case where the URL was
-  // already stripped by App.tsx — `?token=…` only appears on first load.
-  if (window.location.search.includes("token=")) {
-    const fromUrl = new URLSearchParams(window.location.search).get("token");
-    if (fromUrl) {
-      try {
-        localStorage.setItem(TOKEN_KEY, fromUrl);
-      } catch {}
-      return fromUrl;
-    }
-  }
   try {
-    return localStorage.getItem(TOKEN_KEY) ?? "";
+    return sessionStorage.getItem(TOKEN_KEY) ?? "";
   } catch {
     return "";
   }
@@ -105,9 +89,50 @@ export function getToken(): string {
 
 export function setToken(t: string): void {
   try {
-    if (t) localStorage.setItem(TOKEN_KEY, t);
-    else localStorage.removeItem(TOKEN_KEY);
+    if (t) sessionStorage.setItem(TOKEN_KEY, t);
+    else sessionStorage.removeItem(TOKEN_KEY);
   } catch {}
+}
+
+let authPreparation: Promise<void> | null = null;
+
+/** Exchange a fragment secret before any protected HTTP or WS request. */
+export function prepareAuth(): Promise<void> {
+  authPreparation ??= exchangeFragment();
+  return authPreparation;
+}
+
+async function exchangeFragment(): Promise<void> {
+  const params = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+  const pair = params.get("pair");
+  const bootstrap = params.get("bootstrap");
+  if (!pair && !bootstrap) return;
+
+  // Fragments are not sent to the server, and removing this immediately also
+  // keeps the secret out of screenshots, bookmarks, and later navigation.
+  const clean = new URL(window.location.href);
+  clean.hash = "";
+  window.history.replaceState({}, "", clean.toString());
+
+  const path = pair ? "/api/auth/pair" : "/api/auth/bootstrap";
+  const res = await fetch(path, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ secret: pair ?? bootstrap }),
+  });
+  if (!res.ok) {
+    throw new Error(`${res.status} pairing failed: ${await res.text()}`.trim());
+  }
+  if (bootstrap) {
+    const body = (await res.json()) as { token?: unknown };
+    if (typeof body.token !== "string" || !body.token) {
+      throw new Error("bootstrap response did not include a token");
+    }
+    setToken(body.token);
+  } else {
+    setToken("");
+  }
 }
 
 function authHeaders(): HeadersInit {
@@ -121,7 +146,7 @@ function authHeaders(): HeadersInit {
 // and `slide open` (host browser re-launch) so the message works from
 // either device.
 export const STALE_TOKEN_MESSAGE =
-  "401 unauthorized — token rotated. On phone, re-scan the QR from `slide pair` (or run `slide open` on the host).";
+  "401 unauthorized. On phone, create and scan a new `slide pair` QR (or run `slide open` on the host).";
 
 // WebSocket application close code emitted by the daemon when the bearer
 // token in the upgrade subprotocol is missing or doesn't match. Mirrors

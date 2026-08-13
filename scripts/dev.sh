@@ -2,25 +2,18 @@
 # Run slide in dev mode: Rust daemon + Vite dev server concurrently.
 # Vite proxies /api and /ws to the daemon (see web/vite.config.ts).
 #
-# Usage: ./scripts/dev.sh [--lan]
-#   --lan   Bind both daemon and Vite to 0.0.0.0 so a phone or tablet
-#           on the same network (or Tailscale) can reach the dev UI.
-#           Dev mode still prints the token-bearing localhost:5173 URL
-#           on stdout — that token is now reachable from your LAN, so
-#           only enable on trusted networks.
+# Usage: ./scripts/dev.sh
 set -euo pipefail
 
-LAN=0
 for arg in "$@"; do
   case "$arg" in
-    --lan) LAN=1 ;;
     -h|--help)
-      sed -n '2,10p' "$0"
+      sed -n '2,5p' "$0"
       exit 0
       ;;
     *)
       echo "unknown arg: $arg" >&2
-      echo "usage: $0 [--lan]" >&2
+      echo "usage: $0" >&2
       exit 2
       ;;
   esac
@@ -89,25 +82,9 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-SLIDE_LAN=""
-VITE_LAN=""
-if [ "$LAN" = 1 ]; then
-  SLIDE_LAN="--lan"
-  VITE_LAN="--host 0.0.0.0"
-  echo
-  echo "  dev.sh --lan: daemon + Vite exposed to LAN. The dev token URL"
-  echo "  printed below is now reachable from your network — trusted"
-  echo "  networks only."
-  echo
-fi
-
-# Unquoted expansion is intentional: empty $SLIDE_LAN/$VITE_LAN must vanish,
-# and the only token we ever pass ("--host 0.0.0.0") is fixed shellsafe.
-# shellcheck disable=SC2086
-cargo run -p slide-cli -- serve --no-open --dev $SLIDE_LAN &
+cargo run -p slide-cli -- serve --no-open --dev &
 pids+=("$!")
-# shellcheck disable=SC2086
-(cd web && npm run dev -- $VITE_LAN) &
+(cd web && npm run dev) &
 pids+=("$!")
 
 # Portable "wait for any child" — poll both PIDs (macOS bash 3.2 lacks `wait -n`).

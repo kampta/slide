@@ -24,15 +24,7 @@ Slide launches agent CLIs already installed on the daemon host. Install and auth
 ./scripts/dev.sh
 ```
 
-This starts the Rust daemon on `127.0.0.1:7777` and the Vite development server on `127.0.0.1:5173`. Vite serves the UI with hot reload and proxies `/api` and `/ws` to the daemon. Open the token-bearing `http://localhost:5173/?token=…` URL printed in the terminal. Stop both processes with `Ctrl+C`.
-
-To test from another device on a trusted local network:
-
-```bash
-./scripts/dev.sh --lan
-```
-
-This exposes both development servers on the network, including the token-bearing URL, so do not use it on an untrusted network.
+This starts the Rust daemon on `127.0.0.1:7777` and the Vite development server on `127.0.0.1:5173`. Vite serves the UI with hot reload and proxies `/api` and `/ws` to the daemon. Open the fragment-bootstrap URL printed in the terminal. Stop both processes with `Ctrl+C`. Development servers remain loopback-only; phone pairing is a production-build flow behind HTTPS.
 
 ## Production mode
 
@@ -51,7 +43,19 @@ The release binary embeds `web/dist`, so production runs as one process with no 
 
 It serves the embedded UI and API on `http://127.0.0.1:7777` and opens the authenticated page in your browser without printing the token-bearing URL. To start without opening a tab, add `--no-open`; while the daemon is running, `./target/release/slide open` opens it later.
 
-For access from another device, run `./target/release/slide serve --lan`, then use `./target/release/slide pair` to print the pairing URLs and QR codes. Only expose Slide on a trusted network.
+### Phone access over HTTPS
+
+Keep Slide on loopback and put an HTTPS reverse proxy in front of it. For example, configure Tailscale Serve to proxy its HTTPS URL to `http://127.0.0.1:7777`, then start Slide with the exact origin Tailscale reports:
+
+```bash
+tailscale serve --bg http://127.0.0.1:7777
+./target/release/slide serve --public-url https://your-machine.your-tailnet.ts.net
+./target/release/slide pair
+```
+
+The proxy must support WebSocket upgrades and send `X-Forwarded-Proto: https`. `slide pair` prints a QR whose secret is in the URL fragment, expires after five minutes, and works once. The SPA exchanges it for a per-device `HttpOnly; Secure; SameSite=Strict` cookie; neither the device credential nor the process bearer token is stored in `localStorage` or placed in a query string. The oldest credential is pruned after 32 paired devices.
+
+Direct LAN HTTP is intentionally refused: `--lan` and non-loopback `--bind` are not safe substitutes for TLS.
 
 On a phone, open the paired URL once, then use the browser's **Add to Home Screen** or **Install app** action. The installed shell can open offline, but session data and terminal connections still require the Slide daemon; API and WebSocket traffic is never cached.
 
@@ -103,7 +107,7 @@ Every running session has its own classifier task that wakes on byte activity (v
 slide/
 ├── crates/
 │   ├── slide-core/   # Rust library: sessions, PTY, backends, git, async SQLite
-│   └── slide-cli/    # Binary: `slide serve` / `slide open` / `slide token`, HTTP + WS + embedded SPA
+│   └── slide-cli/    # Binary: `slide serve` / `slide open` / `slide pair`, HTTP + WS + embedded SPA
 └── web/              # React + xterm.js SPA (served by the daemon in release)
 ```
 
@@ -114,9 +118,9 @@ SQLite at `~/Library/Application Support/slide/slide.db` (macOS) / `$XDG_DATA_HO
 ## Security
 
 - Daemon binds `127.0.0.1` only.
-- Every session API and WebSocket request is authenticated (the health check is intentionally public). HTTP uses a constant-time-compared bearer token; WebSocket upgrades carry it in the `Sec-WebSocket-Protocol: slide.bearer.<token>` subprotocol because browsers can't set arbitrary handshake headers.
-- The middleware also rejects requests whose `Host` (or `Origin`, when present) isn't a loopback name — DNS rebinding hardening.
-- Token + port + pid live at `~/Library/Application Support/slide/daemon.lock` (macOS) / `$XDG_DATA_HOME/slide/daemon.lock` (Linux), mode 0600. In production, `slide serve` does **not** print the token-bearing URL to stdout — the auto-open path hands it straight to the browser, and `slide open` reads it from the lock file. Dev mode prints the URL because Vite's dev server (port 5173) needs to receive the token in the page load.
+- Every session API and WebSocket request is centrally authenticated. Local tabs use a process bearer held in `sessionStorage`; paired devices use a host-only HttpOnly cookie.
+- The middleware rejects requests whose `Host` or `Origin` is neither loopback nor the explicitly configured `--public-url` origin.
+- The mode-0600 daemon lock contains only the local bootstrap secret and discovery metadata. Persistent pairing state is also mode 0600 and contains SHA-256 hashes, never cleartext tickets or device credentials.
 - `SIGINT` / `SIGTERM` trigger a graceful drain: axum finishes in-flight requests, then direct-supervised backends are killed so they don't outlive the daemon as orphans. Tmux-supervised sessions are left alive on purpose.
 
 ## License

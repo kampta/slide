@@ -1,24 +1,21 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const KEY = "slide.token";
+const KEY = "slide.bootstrapToken";
 
-// vitest's jsdom environment in this repo doesn't provide a working
-// `Storage` implementation (.removeItem is missing), so install a tiny
-// Map-backed shim before importing the module under test.
 function makeStorage(): Storage {
-  const m = new Map<string, string>();
+  const values = new Map<string, string>();
   return {
     get length() {
-      return m.size;
+      return values.size;
     },
-    clear: () => m.clear(),
-    getItem: (k: string) => (m.has(k) ? m.get(k)! : null),
-    key: (i: number) => Array.from(m.keys())[i] ?? null,
-    removeItem: (k: string) => {
-      m.delete(k);
+    clear: () => values.clear(),
+    getItem: (key) => values.get(key) ?? null,
+    key: (index) => Array.from(values.keys())[index] ?? null,
+    removeItem: (key) => {
+      values.delete(key);
     },
-    setItem: (k: string, v: string) => {
-      m.set(k, String(v));
+    setItem: (key, value) => {
+      values.set(key, String(value));
     },
   };
 }
@@ -26,53 +23,51 @@ function makeStorage(): Storage {
 vi.stubGlobal("localStorage", makeStorage());
 vi.stubGlobal("sessionStorage", makeStorage());
 
-const { api, getToken, setToken, STALE_TOKEN_MESSAGE } = await import("./api");
+const { api, getToken, prepareAuth, setToken, STALE_TOKEN_MESSAGE } =
+  await import("./api");
 
-describe("token storage", () => {
+describe("authentication", () => {
   beforeEach(() => {
-    localStorage.removeItem(KEY);
-    sessionStorage.removeItem(KEY);
+    localStorage.clear();
+    sessionStorage.clear();
     window.history.replaceState({}, "", "/");
+    vi.restoreAllMocks();
   });
 
-  it("returns empty string with no token in URL or storage", () => {
+  it("keeps the local process token in sessionStorage only", () => {
+    setToken("local");
+    expect(getToken()).toBe("local");
+    expect(sessionStorage.getItem(KEY)).toBe("local");
+    expect(localStorage.length).toBe(0);
+  });
+
+  it("exchanges a pairing fragment without storing the device credential", async () => {
+    window.history.replaceState({}, "", "/#pair=single-use");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(null, { status: 204 })),
+    );
+
+    await prepareAuth();
+
+    expect(window.location.hash).toBe("");
     expect(getToken()).toBe("");
+    expect(localStorage.length).toBe(0);
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/auth/pair",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "same-origin",
+        body: JSON.stringify({ secret: "single-use" }),
+      }),
+    );
   });
 
-  it("returns the localStorage token when no URL token is present", () => {
-    setToken("stored");
-    expect(getToken()).toBe("stored");
-  });
-
-  it("URL token wins over stored token (post-rotation re-pair)", () => {
-    setToken("old");
-    window.history.replaceState({}, "", "/?token=new");
-    expect(getToken()).toBe("new");
-    expect(localStorage.getItem(KEY)).toBe("new");
-  });
-
-  it("setToken('') clears the stored token", () => {
-    setToken("foo");
-    setToken("");
-    expect(localStorage.getItem(KEY)).toBeNull();
-    expect(getToken()).toBe("");
-  });
-
-  it("ignores URL params that don't include token=", () => {
-    setToken("stored");
-    window.history.replaceState({}, "", "/?other=value");
-    expect(getToken()).toBe("stored");
-  });
-
-  it("clears a rejected token for log requests too", async () => {
+  it("clears a rejected local token", async () => {
     setToken("expired");
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 401 })));
 
     await expect(api.getLog("session/id")).rejects.toThrow(STALE_TOKEN_MESSAGE);
-    expect(localStorage.getItem(KEY)).toBeNull();
-    expect(fetch).toHaveBeenCalledWith(
-      "/api/sessions/session%2Fid/log",
-      expect.any(Object),
-    );
+    expect(getToken()).toBe("");
   });
 });

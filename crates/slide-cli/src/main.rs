@@ -1,6 +1,7 @@
 mod assets;
 mod http;
 mod pair;
+mod pairing;
 mod server;
 mod ws;
 
@@ -23,11 +24,14 @@ enum Cmd {
         port: u16,
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
-        /// Bind to 0.0.0.0 and emit pairing QR codes for non-loopback IPv4
-        /// interfaces (LAN, Tailscale). Overrides --bind. Use this to
-        /// connect a phone or tablet on the same network.
+        /// Deprecated: direct LAN HTTP is insecure and refused. Use
+        /// --public-url with an HTTPS reverse proxy instead.
         #[arg(long)]
         lan: bool,
+        /// HTTPS origin that proxies to this loopback daemon, for example a
+        /// Tailscale Serve URL. Enables `slide pair`.
+        #[arg(long)]
+        public_url: Option<String>,
         /// Skip auto-opening a browser tab.
         #[arg(long)]
         no_open: bool,
@@ -40,19 +44,14 @@ enum Cmd {
     /// token embedded. The URL itself is never written to stdout — handy
     /// when the daemon was started with `--no-open`.
     Open,
-    /// Print the running daemon's bootstrap token to stdout. Useful for
-    /// debugging or for pasting into a connect form by hand. The lock file
-    /// itself is mode 0600, so prefer `slide open` when you can.
-    Token,
-    /// Re-print pairing URLs and QR codes for the running daemon.
-    /// Reads token + port + bind from the lockfile; doesn't touch the daemon.
+    /// Create a five-minute, single-use phone pairing QR code.
     Pair,
 }
 
 #[derive(Deserialize)]
 struct LockFile {
     port: u16,
-    token: String,
+    bootstrap: String,
 }
 
 fn read_lock() -> Result<LockFile> {
@@ -68,14 +67,11 @@ fn read_lock() -> Result<LockFile> {
 
 fn cmd_open() -> Result<()> {
     let lock = read_lock()?;
-    let url = format!("http://127.0.0.1:{}/?token={}", lock.port, lock.token);
+    let url = format!(
+        "http://127.0.0.1:{}/#bootstrap={}",
+        lock.port, lock.bootstrap
+    );
     opener::open(&url).context("open browser")?;
-    Ok(())
-}
-
-fn cmd_token() -> Result<()> {
-    let lock = read_lock()?;
-    println!("{}", lock.token);
     Ok(())
 }
 
@@ -93,6 +89,7 @@ async fn main() -> Result<()> {
         port: 7777,
         bind: "127.0.0.1".into(),
         lan: false,
+        public_url: None,
         no_open: false,
         dev: false,
     }) {
@@ -100,21 +97,19 @@ async fn main() -> Result<()> {
             port,
             bind,
             lan,
+            public_url,
             no_open,
             dev,
         } => {
-            let bind = if lan {
-                if bind != "127.0.0.1" {
-                    eprintln!("note: --lan overrides --bind {bind}");
-                }
-                "0.0.0.0".to_string()
-            } else {
-                bind
-            };
-            server::run(&bind, port, !no_open, dev).await?
+            if lan {
+                anyhow::bail!(
+                    "--lan is no longer supported because it exposes credentials over HTTP; use --public-url with an HTTPS reverse proxy"
+                );
+            }
+            let public_url = pair::ensure_phone_pairing_is_safe(&bind, public_url.as_deref())?;
+            server::run(&bind, port, !no_open, dev, public_url).await?
         }
         Cmd::Open => cmd_open()?,
-        Cmd::Token => cmd_token()?,
         Cmd::Pair => pair::run_pair_cmd()?,
     }
     Ok(())
@@ -132,6 +127,23 @@ mod cli_tests {
             Some(Cmd::Serve { lan, bind, .. }) => {
                 assert!(lan);
                 assert_eq!(bind, "127.0.0.1");
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_public_url_parses() {
+        let cli = Cli::try_parse_from([
+            "slide",
+            "serve",
+            "--public-url",
+            "https://slide.example.ts.net",
+        ])
+        .expect("parse");
+        match cli.cmd {
+            Some(Cmd::Serve { public_url, .. }) => {
+                assert_eq!(public_url.as_deref(), Some("https://slide.example.ts.net"));
             }
             other => panic!("expected Serve, got {other:?}"),
         }

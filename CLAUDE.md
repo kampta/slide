@@ -6,13 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 First-time setup: `./scripts/bootstrap.sh` (installs rustup toolchain pinned by `rust-toolchain.toml`, Node from `.nvmrc`, and `web/` deps).
 
-Day-to-day dev: `./scripts/dev.sh` runs `cargo run -p slide-cli -- serve --no-open --dev` alongside the Vite dev server. Vite (`:5173`) proxies `/api` and `/ws` to the daemon (`:7777`) — see `web/vite.config.ts`. The script frees both ports and kills any stale daemon via its pidfile before launching. In dev mode the daemon intentionally prints the full `http://localhost:5173/?token=…` URL on stdout so a developer can click it; production mode prints only the bare URL and either auto-opens the browser (default) or expects `slide open` (manual).
+Day-to-day dev: `./scripts/dev.sh` runs `cargo run -p slide-cli -- serve --no-open --dev` alongside the Vite dev server. Vite (`:5173`) proxies `/api` and `/ws` to the daemon (`:7777`) — see `web/vite.config.ts`. Both remain loopback-only. Dev prints a fragment-bootstrap URL; production auto-opens it or expects `slide open`.
 
 Other CLI subcommands:
 
 - `slide serve` — start the daemon (default).
-- `slide open` — launch the browser at the running daemon, with the bootstrap token injected via `?token=…` from the lock file. Never prints the token-bearing URL.
-- `slide token` — print just the bootstrap token to stdout. Use sparingly — it explicitly writes the token to the terminal.
+- `slide open` — launch the local browser with a fragment bootstrap read from the mode-0600 lock file.
+- `slide pair` — create a five-minute, single-use fragment QR when `--public-url` is configured.
 
 Release build (single binary with embedded SPA via `rust-embed`):
 ```bash
@@ -37,9 +37,9 @@ CI runs the full Rust workspace test suite on every pull request.
 
 **Two processes that ship as one binary.** `slide-cli` is a thin Tokio/Axum daemon that owns all state; `web/` is a React+xterm.js SPA. In dev they run separately with Vite proxying; in release, `crates/slide-cli/src/assets.rs` uses `rust-embed` to serve `web/dist` from the daemon itself — so `web/dist` **must exist before `cargo build --release`** or the binary ships without a UI.
 
-**Auth model is load-bearing.** Daemon binds `127.0.0.1` only and writes a per-process random token plus port + pid to `~/Library/Application Support/slide/daemon.lock` (macOS) or `$XDG_DATA_HOME/slide/daemon.lock` (Linux), mode 0600. Auth is centrally enforced in `crates/slide-cli/src/server.rs::auth_layer` — a Tower middleware applied once to the protected router, so a new route can't accidentally skip the check. HTTP requests use `Authorization: Bearer <token>`; WebSocket upgrades ride the `Sec-WebSocket-Protocol: slide.bearer.<token>` subprotocol because browsers can't set arbitrary headers on the WS handshake. The `auth_layer` also rejects requests whose `Host` (or `Origin`, when present) isn't a loopback name — DNS rebinding hardening. The `slide-cli server::tests` CI job exists specifically to protect both checks.
+**Auth model is load-bearing.** The daemon stays on loopback. Local tabs exchange a fragment bootstrap for a process bearer kept in `sessionStorage`; phone pairing exchanges a five-minute, single-use fragment secret over HTTPS for a persistent host-only HttpOnly cookie. Only hashes are stored in the mode-0600 `pairing.json`. HTTP and WS both use the centralized credential check, and Host/Origin must match loopback or `--public-url`.
 
-**Token bootstrap.** The browser receives the token via `?token=…` once at first load and stashes it in `sessionStorage`; subsequent reloads reuse the stored value. The daemon never accepts `?token=` for actual auth (only as a one-shot SPA bootstrap mechanism); `server.rs::query_token_is_no_longer_accepted` is the regression test for this.
+**Phone exposure.** Direct `--lan` and non-loopback HTTP binds are refused. Configure an HTTPS reverse proxy (for example Tailscale Serve) to loopback and pass its origin via `--public-url`.
 
 **Session lifecycle lives in `slide-core`.** `SessionManager` (`crates/slide-core/src/session/manager.rs`) owns the map of sessions; `session/pty.rs` wraps `portable-pty` for the child process. Each running session spawns its own classifier task that reacts to byte arrivals via a `tokio::sync::Notify` ping from the reader task — there is no global polling ticker. The classifier captures the rendered pane (tmux `capture-pane` for tmux-supervised sessions, ANSI-stripped ring tail for direct-PTY) and runs the pure `classifier::classify` function, which produces one of:
 

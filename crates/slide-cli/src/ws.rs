@@ -1,6 +1,4 @@
-use crate::server::{
-    constant_time_eq, token_from_headers, AppState, SAFE_PROTO, WS_CLOSE_AUTH_FAILED,
-};
+use crate::server::{request_is_authenticated, AppState, SAFE_PROTO, WS_CLOSE_AUTH_FAILED};
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
@@ -19,13 +17,6 @@ fn terminal_dimension(value: Option<&serde_json::Value>, fallback: u16) -> u16 {
         .unwrap_or(fallback)
 }
 
-fn ws_token_ok(headers: &HeaderMap, expected: &str) -> bool {
-    match token_from_headers(headers) {
-        Some(supplied) => constant_time_eq(supplied.as_bytes(), expected.as_bytes()),
-        None => false,
-    }
-}
-
 async fn close_with_auth_failed(mut sock: WebSocket) {
     // Best-effort: if the peer already closed we just drop the socket.
     let _ = sock
@@ -41,7 +32,7 @@ pub async fn events(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let auth_ok = ws_token_ok(&headers, &state.token);
+    let auth_ok = request_is_authenticated(&headers, &state);
     ws.protocols([SAFE_PROTO])
         .on_upgrade(move |sock| async move {
             if !auth_ok {
@@ -105,7 +96,7 @@ pub async fn session(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let auth_ok = ws_token_ok(&headers, &state.token);
+    let auth_ok = request_is_authenticated(&headers, &state);
     ws.protocols([SAFE_PROTO])
         .on_upgrade(move |sock| async move {
             if !auth_ok {

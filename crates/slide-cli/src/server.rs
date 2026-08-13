@@ -1,13 +1,16 @@
 use crate::assets;
 use crate::http;
-use crate::pair;
+use crate::pairing::{self, PairingStore};
 use crate::ws;
 use anyhow::{Context, Result};
-use axum::extract::Request;
+use axum::extract::{Json, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::{routing::get, Router};
+use axum::{
+    routing::{get, post},
+    Router,
+};
 use rand::RngCore;
 use slide_core::config;
 use slide_core::SessionManager;
@@ -19,17 +22,20 @@ use tower_http::trace::TraceLayer;
 pub struct AppState {
     pub manager: Arc<SessionManager>,
     pub token: Arc<String>,
-    /// Hostnames the daemon will accept in the Host (and, when present,
-    /// Origin) header. Always includes loopback names; widened with the
-    /// concrete LAN IPs we're listening on when `--lan` (or any
-    /// non-loopback `--bind`) is used, so phones reaching us at e.g.
-    /// `http://100.64.0.5:7777/` aren't rejected by the DNS-rebinding
-    /// check while DNS-rebinding-as-loopback attacks from the public
-    /// internet still 403.
+    pub bootstrap: Arc<String>,
+    pub pairing: PairingStore,
+    /// Hostnames accepted in Host and Origin. This is loopback plus the
+    /// explicitly configured HTTPS reverse-proxy origin, if any.
     pub allowed_hosts: Arc<Vec<String>>,
 }
 
-pub async fn run(bind: &str, port: u16, open_browser: bool, dev: bool) -> Result<()> {
+pub async fn run(
+    bind: &str,
+    port: u16,
+    open_browser: bool,
+    dev: bool,
+    public_url: Option<String>,
+) -> Result<()> {
     config::ensure_dirs()?;
     // Claim the port before mutating the daemon lock or reconciling stored
     // sessions. A second `slide serve` must fail without corrupting the
@@ -46,16 +52,21 @@ pub async fn run(bind: &str, port: u16, open_browser: bool, dev: bool) -> Result
     // it once axum owns the router.
     let manager_for_shutdown = manager.clone();
 
-    // Limit a leaked pairing URL to this daemon process. `slide open` and
-    // `slide pair` read the current value from the lock file.
+    // The process token is accepted only from local browser bootstrap. Phone
+    // clients receive independent, persistent device credentials.
     let token = generate_token();
-    write_lock_file(&token, bind, port)?;
+    let bootstrap = generate_token();
+    write_lock_file(&bootstrap, bind, port, public_url.as_deref())?;
     let _lock_guard = DaemonLockGuard;
 
-    let allowed_hosts = build_allowed_hosts(bind);
+    let pairing = PairingStore::open(config::data_dir().join("pairing.json"))?;
+
+    let allowed_hosts = build_allowed_hosts(bind, public_url.as_deref())?;
     let state = AppState {
         manager,
         token: Arc::new(token.clone()),
+        bootstrap: Arc::new(bootstrap.clone()),
+        pairing,
         allowed_hosts: Arc::new(allowed_hosts),
     };
 
@@ -77,9 +88,18 @@ pub async fn run(bind: &str, port: u16, open_browser: bool, dev: bool) -> Result
         ));
     let protected = api.merge(ws_routes);
 
+    let bootstrap_routes = Router::new()
+        .route("/api/auth/bootstrap", post(exchange_bootstrap))
+        .route("/api/auth/pair", post(exchange_pairing))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            host_origin_layer,
+        ));
+
     // Always-open routes: health check + static assets.
     let mut app = Router::new()
         .route("/api/health", get(|| async { "ok" }))
+        .merge(bootstrap_routes)
         .merge(protected);
 
     if dev {
@@ -136,11 +156,11 @@ pub async fn run(bind: &str, port: u16, open_browser: bool, dev: bool) -> Result
     // with the token in their terminal scrollback.
     let local_addr = local_browser_addr(bind, port);
     let bootstrap_url = if dev {
-        format!("http://localhost:5173/?token={token}")
+        format!("http://localhost:5173/#bootstrap={bootstrap}")
     } else {
-        format!("http://{local_addr}/?token={token}")
+        format!("http://{local_addr}/#bootstrap={bootstrap}")
     };
-    let public_url = if dev {
+    let browser_url = if dev {
         bootstrap_url.clone()
     } else {
         format!("http://{local_addr}/")
@@ -148,18 +168,16 @@ pub async fn run(bind: &str, port: u16, open_browser: bool, dev: bool) -> Result
     tracing::info!("slide listening on http://{addr}");
     println!();
     println!("  open slide in your browser:");
-    println!("    {public_url}");
+    println!("    {browser_url}");
     if !dev && !open_browser {
         println!();
         println!("  (auto-open disabled — run `slide open` to launch the browser)");
     }
     println!();
-    if !dev {
-        // Startup never prints the token-bearing URL — same stance as #32
-        // for the loopback case. The operator runs `slide pair` to get
-        // the scannable QR explicitly. Touches stdout only when there are
-        // actually LAN URLs to advertise.
-        pair::print_lan_summary(bind, port);
+    if let Some(public_url) = public_url.as_deref() {
+        println!("  phone access (HTTPS proxy): {public_url}");
+        println!("  run `slide pair` to create a single-use QR code");
+        println!();
     }
 
     if open_browser {
@@ -221,16 +239,102 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-fn write_lock_file(token: &str, bind: &str, port: u16) -> Result<()> {
+fn write_lock_file(bootstrap: &str, bind: &str, port: u16, public_url: Option<&str>) -> Result<()> {
     let path = config::lock_path();
     let body = serde_json::json!({
         "pid": std::process::id(),
         "bind": bind,
         "port": port,
-        "token": token,
+        "bootstrap": bootstrap,
+        "public_url": public_url,
     });
     write_secret_file(&path, body.to_string().as_bytes())?;
     Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct ExchangeRequest {
+    secret: String,
+}
+
+async fn exchange_bootstrap(
+    State(state): State<AppState>,
+    headers: header::HeaderMap,
+    Json(request): Json<ExchangeRequest>,
+) -> Response {
+    if !request_is_loopback(&headers)
+        || !constant_time_eq(request.secret.as_bytes(), state.bootstrap.as_bytes())
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(serde_json::json!({ "token": state.token.as_str() })).into_response()
+}
+
+async fn exchange_pairing(
+    State(state): State<AppState>,
+    headers: header::HeaderMap,
+    Json(request): Json<ExchangeRequest>,
+) -> Response {
+    if !request_is_https(&headers) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "pairing requires HTTPS through the configured reverse proxy",
+        )
+            .into_response();
+    }
+    match state.pairing.redeem(&request.secret) {
+        Ok(Some(credential)) => device_cookie_response(&credential),
+        Ok(None) => StatusCode::UNAUTHORIZED.into_response(),
+        Err(error) => {
+            tracing::error!("pairing exchange failed: {error:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+fn device_cookie_response(credential: &str) -> Response {
+    match pairing::device_cookie(credential) {
+        Ok(cookie) => {
+            let mut response = StatusCode::NO_CONTENT.into_response();
+            response.headers_mut().insert(header::SET_COOKIE, cookie);
+            response
+        }
+        Err(error) => {
+            tracing::error!("device cookie creation failed: {error:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+fn forwarded_proto(headers: &header::HeaderMap) -> Option<&str> {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+}
+
+fn request_is_https(headers: &header::HeaderMap) -> bool {
+    forwarded_proto(headers) == Some("https")
+        || headers
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            .map(|origin| origin.starts_with("https://"))
+            .unwrap_or(false)
+}
+
+fn request_is_loopback(headers: &header::HeaderMap) -> bool {
+    headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(|host| {
+            host_in(
+                host,
+                &["127.0.0.1".into(), "localhost".into(), "::1".into()],
+            )
+        })
+        .unwrap_or(false)
+        && forwarded_proto(headers) != Some("https")
 }
 
 /// Removes only this process's discovery file. If another daemon has
@@ -313,15 +417,28 @@ async fn auth_layer(
             .body(axum::body::Body::from("forbidden authority"))
             .unwrap();
     }
-    if let Some(supplied) = token_from_headers(req.headers()) {
-        if constant_time_eq(supplied.as_bytes(), state.token.as_bytes()) {
-            return next.run(req).await;
-        }
+    if request_is_authenticated(req.headers(), &state) {
+        return next.run(req).await;
     }
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
         .body(axum::body::Body::from("unauthorized"))
         .unwrap()
+}
+
+pub(crate) fn request_is_authenticated(headers: &header::HeaderMap, state: &AppState) -> bool {
+    credentials_are_valid(headers, &state.token, &state.pairing)
+}
+
+fn credentials_are_valid(headers: &header::HeaderMap, token: &str, pairing: &PairingStore) -> bool {
+    if let Some(supplied) = token_from_headers(headers) {
+        if constant_time_eq(supplied.as_bytes(), token.as_bytes()) {
+            return true;
+        }
+    }
+    pairing::cookie_credential(headers)
+        .map(|credential| pairing.authenticate(credential))
+        .unwrap_or(false)
 }
 
 /// DNS-rebinding check only — applied to WS routes that need to perform
@@ -417,31 +534,19 @@ fn local_browser_addr(bind: &str, port: u16) -> String {
 // `mybox.tail-scale.ts.net`), not an IP. Add a `--allow-host=<name>`
 // flag (or derive from the cert) and append the names here, otherwise
 // the rebinding check will 403 the hostname-based requests.
-fn build_allowed_hosts(bind: &str) -> Vec<String> {
+fn build_allowed_hosts(bind: &str, public_url: Option<&str>) -> Result<Vec<String>> {
     let mut hosts = vec![
         "127.0.0.1".to_string(),
         "localhost".to_string(),
         "::1".to_string(),
     ];
-    let parsed: Option<std::net::IpAddr> = bind.parse().ok();
-    match parsed {
-        Some(ip) if ip.is_loopback() => {}
-        Some(std::net::IpAddr::V4(v4)) if v4.is_unspecified() => {
-            for ip in pair::lan_ipv4_addresses() {
-                hosts.push(format!("{ip}"));
-            }
-        }
-        Some(std::net::IpAddr::V6(v6)) if v6.is_unspecified() => {
-            for ip in pair::lan_ipv4_addresses() {
-                hosts.push(format!("{ip}"));
-            }
-        }
-        Some(ip) => {
-            hosts.push(format!("{ip}"));
-        }
-        None => {}
+    if !hosts.iter().any(|host| host == bind) {
+        hosts.push(bind.to_string());
     }
-    hosts
+    if let Some(public_url) = public_url {
+        hosts.push(pairing::public_url_host(public_url)?);
+    }
+    Ok(hosts)
 }
 
 /// Byte-equality check that doesn't short-circuit on the first differing
@@ -518,6 +623,41 @@ mod tests {
                 .insert(header::AUTHORIZATION, "Bearer abc123".parse().unwrap());
         });
         assert_eq!(token_from_request(&r).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn central_auth_accepts_process_bearer_or_device_cookie() {
+        let dir = tempfile::tempdir().unwrap();
+        let pairing = PairingStore::open(dir.path().join("pairing.json")).unwrap();
+        let ticket = pairing.create_ticket().unwrap();
+        let credential = pairing.redeem(&ticket).unwrap().unwrap();
+
+        let mut bearer = header::HeaderMap::new();
+        bearer.insert(header::AUTHORIZATION, "Bearer process".parse().unwrap());
+        assert!(credentials_are_valid(&bearer, "process", &pairing));
+
+        let mut cookie = header::HeaderMap::new();
+        cookie.insert(
+            header::COOKIE,
+            format!("{}={credential}", pairing::COOKIE_NAME)
+                .parse()
+                .unwrap(),
+        );
+        assert!(credentials_are_valid(&cookie, "process", &pairing));
+
+        cookie.insert(
+            header::COOKIE,
+            format!("{}=invalid", pairing::COOKIE_NAME).parse().unwrap(),
+        );
+        assert!(!credentials_are_valid(&cookie, "process", &pairing));
+    }
+
+    #[test]
+    fn pairing_exchange_requires_https_signal() {
+        let mut headers = header::HeaderMap::new();
+        assert!(!request_is_https(&headers));
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert!(request_is_https(&headers));
     }
 
     #[test]
@@ -692,14 +832,14 @@ mod tests {
 
     #[test]
     fn build_allowed_hosts_loopback_bind_only_loopback() {
-        let hosts = build_allowed_hosts("127.0.0.1");
+        let hosts = build_allowed_hosts("127.0.0.1", None).unwrap();
         assert_eq!(hosts, vec!["127.0.0.1", "localhost", "::1"]);
     }
 
     #[test]
-    fn build_allowed_hosts_specific_lan_ip() {
-        let hosts = build_allowed_hosts("100.64.0.5");
-        assert!(hosts.contains(&"100.64.0.5".to_string()));
+    fn build_allowed_hosts_includes_explicit_public_origin() {
+        let hosts = build_allowed_hosts("127.0.0.1", Some("https://slide.example.ts.net")).unwrap();
+        assert!(hosts.contains(&"slide.example.ts.net".to_string()));
         assert!(hosts.contains(&"127.0.0.1".to_string()));
     }
 
