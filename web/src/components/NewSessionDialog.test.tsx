@@ -80,7 +80,6 @@ describe("NewSessionDialog execution policy", () => {
       created_at: 1,
       last_activity: 1,
       supervisor: "tmux",
-      log_offset: 0,
     };
     const create = vi.spyOn(api, "createSession").mockResolvedValue(created);
 

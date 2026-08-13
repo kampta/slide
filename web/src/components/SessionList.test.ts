@@ -16,7 +16,6 @@ const session: Session = {
   created_at: 1,
   last_activity: 2,
   supervisor: "tmux",
-  log_offset: 0,
 };
 
 describe("session filtering", () => {

@@ -122,7 +122,6 @@ mod tests {
             last_activity: 2,
             supervisor: SupervisorKind::Direct,
             host_log_path: Some(path.to_string_lossy().into_owned()),
-            log_offset: 0,
             backend_session_id: None,
             parent_session_id: None,
         };
@@ -157,7 +156,6 @@ mod tests {
             last_activity: 2,
             supervisor: SupervisorKind::Direct,
             host_log_path: Some(path.to_string_lossy().into_owned()),
-            log_offset: 0,
             backend_session_id: None,
             parent_session_id: None,
         };

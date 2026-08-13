@@ -92,6 +92,11 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE sessions ADD COLUMN execution_policy TEXT NOT NULL DEFAULT 'unrestricted';
     "#,
+    // v9 → v10: log readers use bounded tails directly; the old incremental
+    // cursor was never consumed after that design was removed.
+    r#"
+    ALTER TABLE sessions DROP COLUMN log_offset;
+    "#,
 ];
 
 async fn migrate(conn: &Connection) -> Result<()> {
@@ -138,7 +143,7 @@ fn session_from_row(r: &Row<'_>) -> rusqlite::Result<Session> {
         id: r.get(0)?,
         name: r.get(1)?,
         backend: BackendKind::from_str(&r.get::<_, String>(2)?).unwrap_or(BackendKind::Claude),
-        execution_policy: ExecutionPolicy::from_str(&r.get::<_, String>(16)?)
+        execution_policy: ExecutionPolicy::from_str(&r.get::<_, String>(15)?)
             .unwrap_or(ExecutionPolicy::Unrestricted),
         location: Location::from_str(&r.get::<_, String>(3)?).unwrap_or(Location::Local),
         ssh_host: r.get(4)?,
@@ -151,15 +156,14 @@ fn session_from_row(r: &Row<'_>) -> rusqlite::Result<Session> {
         supervisor: SupervisorKind::from_str(&r.get::<_, String>(11)?)
             .unwrap_or(SupervisorKind::Direct),
         host_log_path: r.get(12)?,
-        log_offset: r.get(13)?,
-        backend_session_id: r.get(14)?,
-        parent_session_id: r.get(15)?,
+        backend_session_id: r.get(13)?,
+        parent_session_id: r.get(14)?,
     })
 }
 
 const SESSION_COLUMNS: &str =
     "id, name, backend, location, ssh_host, base_dir, project_path, worktree, state, \
-     created_at, last_activity, supervisor, host_log_path, log_offset, backend_session_id, parent_session_id, execution_policy";
+     created_at, last_activity, supervisor, host_log_path, backend_session_id, parent_session_id, execution_policy";
 impl Store {
     pub async fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -177,8 +181,8 @@ impl Store {
                 c.execute(
                     "INSERT INTO sessions \
                      (id, name, backend, location, ssh_host, base_dir, project_path, worktree, state, created_at, last_activity, \
-                      supervisor, host_log_path, log_offset, backend_session_id, parent_session_id, execution_policy) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                      supervisor, host_log_path, backend_session_id, parent_session_id, execution_policy) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                     params![
                         s.id,
                         s.name,
@@ -193,7 +197,6 @@ impl Store {
                         s.last_activity,
                         s.supervisor.as_str(),
                         s.host_log_path,
-                        s.log_offset,
                         s.backend_session_id,
                         s.parent_session_id,
                         s.execution_policy.as_str(),
@@ -432,7 +435,6 @@ mod tests {
             last_activity: 2_000,
             supervisor: SupervisorKind::Direct,
             host_log_path: None,
-            log_offset: 0,
             backend_session_id: None,
             parent_session_id: None,
         }
@@ -622,7 +624,6 @@ mod tests {
             last_activity: 99,
             supervisor: SupervisorKind::Tmux,
             host_log_path: Some("/home/user/.local/share/slide/logs/abc.log".to_string()),
-            log_offset: 12_345,
             backend_session_id: Some("claude-uuid-xyz".to_string()),
             parent_session_id: Some("source-session".to_string()),
         };
@@ -641,7 +642,6 @@ mod tests {
             got.host_log_path.as_deref(),
             Some("/home/user/.local/share/slide/logs/abc.log"),
         );
-        assert_eq!(got.log_offset, 12_345);
         assert_eq!(got.backend_session_id.as_deref(), Some("claude-uuid-xyz"));
         assert_eq!(got.parent_session_id.as_deref(), Some("source-session"));
     }
@@ -689,7 +689,6 @@ mod tests {
         // New columns should default sensibly.
         assert_eq!(got.supervisor, SupervisorKind::Direct);
         assert!(got.host_log_path.is_none());
-        assert_eq!(got.log_offset, 0);
         assert!(got.backend_session_id.is_none());
         assert!(got.parent_session_id.is_none());
         assert_eq!(got.execution_policy, ExecutionPolicy::Unrestricted);
@@ -815,6 +814,32 @@ mod tests {
         let store = Store::open(path).await.unwrap();
         let session = store.get("existing").await.unwrap().unwrap();
         assert_eq!(session.execution_policy, ExecutionPolicy::Unrestricted);
+    }
+
+    #[tokio::test]
+    async fn migration_v10_removes_unused_log_offset() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        {
+            let conn = SyncConnection::open(path).unwrap();
+            for migration in &MIGRATIONS[..9] {
+                conn.execute_batch(migration).unwrap();
+            }
+            conn.execute_batch("PRAGMA user_version = 9").unwrap();
+        }
+
+        let _ = Store::open(path).await.unwrap();
+        let conn = SyncConnection::open(path).unwrap();
+        let has_log_offset = conn
+            .prepare("PRAGMA table_info(sessions)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .iter()
+            .any(|column| column == "log_offset");
+        assert!(!has_log_offset);
     }
 
     #[tokio::test]

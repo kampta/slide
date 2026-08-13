@@ -149,9 +149,6 @@ pub struct Session {
     /// Populated once the supervisor spawns; `None` on legacy rows.
     #[serde(default)]
     pub host_log_path: Option<String>,
-    /// How many bytes of [`host_log_path`] the daemon has already consumed.
-    #[serde(default)]
-    pub log_offset: i64,
     /// Backend-native session id (e.g. claude's `~/.claude/projects/.../<uuid>.jsonl`),
     /// discovered after spawn. Enables `--resume` recovery when the
     /// supervisor is no longer around.

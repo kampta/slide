@@ -17,7 +17,6 @@ function session(id: string, overrides: Partial<Session> = {}): Session {
     created_at: 1,
     last_activity: 1,
     supervisor: "tmux",
-    log_offset: 0,
     ...overrides,
   };
 }

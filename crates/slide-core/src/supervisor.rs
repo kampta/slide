@@ -295,7 +295,6 @@ mod tests {
             last_activity: 1,
             supervisor,
             host_log_path: None,
-            log_offset: 0,
             backend_session_id: None,
             parent_session_id: None,
         }

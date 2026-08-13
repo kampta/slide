@@ -35,7 +35,6 @@ export interface Session {
   last_activity: number;
   supervisor: Supervisor;
   host_log_path?: string | null;
-  log_offset: number;
   backend_session_id?: string | null;
   parent_session_id?: string | null;
 }

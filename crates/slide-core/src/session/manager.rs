@@ -567,7 +567,6 @@ impl SessionManager {
             last_activity: now,
             supervisor: supervisor_kind,
             host_log_path,
-            log_offset: 0,
             backend_session_id: None,
             parent_session_id,
         };
