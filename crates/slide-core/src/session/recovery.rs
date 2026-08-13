@@ -115,6 +115,10 @@ impl RecoveryCoordinator {
         if !removed_current {
             return;
         }
+        // The attach process is gone, but its classifier may still be
+        // finishing a database write. Fence it before this operation lock is
+        // released so stop/resume cannot race a stale attachment commit.
+        running.quiesce_classifier().await;
         drop(running);
 
         let session = match manager.find(&id).await {
