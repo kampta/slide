@@ -22,17 +22,18 @@ jobs:
   ci:
     name: fmt · web · clippy · test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: github.event_name != 'schedule'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+        # rustup honors the exact version and components in
+        # rust-toolchain.toml; this keeps CI aligned with local builds.
+        run: rustup show active-toolchain
 
       - name: Cache Cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -42,9 +43,9 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Setup Node (for rust-embed web/dist)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version-file: .nvmrc
           cache: npm
           cache-dependency-path: web/package-lock.json
 
@@ -61,27 +62,28 @@ jobs:
         run: npm --prefix web run test
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Test workspace
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
   security:
     # Runs in parallel with `ci`. Pure scans only — no Rust compile — so
     # this stays under a minute and doesn't stack on the main build.
     name: npm audit · cargo audit · secret scan
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       # fetch-depth: 0 is only needed for gitleaks on push events so it can
       # diff the full history; PRs go through the API path.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version-file: .nvmrc
 
       - name: npm audit
         run: npm --prefix web audit --package-lock-only --audit-level=moderate
@@ -90,7 +92,7 @@ jobs:
       # GitHub Releases. rustsec/audit-check compiles cargo-audit from
       # source, which was costing ~4min on a cold runner — no thanks.
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2
         with:
           tool: cargo-audit
 
@@ -98,6 +100,6 @@ jobs:
         run: cargo audit
 
       - name: Secret scan
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
