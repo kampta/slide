@@ -103,6 +103,21 @@ pub fn validate_host(host: &str) -> Result<()> {
     Ok(())
 }
 
+/// Require a destination to be one of the explicit, non-wildcard aliases in
+/// the user's SSH config. This keeps authenticated HTTP callers from turning
+/// Slide's directory and runtime probes into a general-purpose SSH client.
+pub fn validate_configured_host(host: &str) -> Result<()> {
+    validate_configured_host_in(host, &list_hosts())
+}
+
+fn validate_configured_host_in(host: &str, configured: &[SshHost]) -> Result<()> {
+    validate_host(host)?;
+    if configured.iter().any(|configured| configured.alias == host) {
+        return Ok(());
+    }
+    bail!("ssh host is not configured: {host}")
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SshHost {
     pub alias: String,
@@ -219,7 +234,9 @@ fn build_host(alias: String, props: &HashMap<String, String>) -> Option<SshHost>
 
 #[cfg(test)]
 mod tests {
-    use super::{build_multiplex_args, ssh_args, validate_host};
+    use super::{
+        build_multiplex_args, ssh_args, validate_configured_host_in, validate_host, SshHost,
+    };
     use std::path::Path;
 
     #[test]
@@ -234,6 +251,19 @@ mod tests {
         ] {
             assert!(validate_host(ok).is_ok(), "rejected {ok:?}");
         }
+    }
+
+    #[test]
+    fn configured_hosts_are_matched_by_explicit_alias() {
+        let hosts = [SshHost {
+            alias: "spark".into(),
+            hostname: "10.0.0.8".into(),
+            user: Some("developer".into()),
+            port: None,
+        }];
+        assert!(validate_configured_host_in("spark", &hosts).is_ok());
+        assert!(validate_configured_host_in("10.0.0.8", &hosts).is_err());
+        assert!(validate_configured_host_in("unlisted", &hosts).is_err());
     }
 
     #[test]

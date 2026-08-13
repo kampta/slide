@@ -5,7 +5,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CACHE_TTL: Duration = Duration::from_secs(60);
@@ -14,6 +14,7 @@ const CACHE_TTL: Duration = Duration::from_secs(60);
 // timeout used to hard-block create/resume for the full cache TTL.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 const PROBE_OUTPUT_LIMIT: usize = 16 * 1024;
+const MAX_CACHE_TARGETS: usize = 64;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -62,14 +63,14 @@ struct CachedSnapshot {
 #[derive(Default)]
 pub struct RuntimeDiagnosticsCache {
     snapshots: Mutex<HashMap<String, CachedSnapshot>>,
-    query_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    query_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     last_errors: Mutex<HashMap<String, String>>,
 }
 
 impl RuntimeDiagnosticsCache {
     pub fn get(&self, host: Option<&str>, refresh: bool) -> Result<RuntimeDiagnosticsSnapshot> {
         if let Some(host) = host {
-            crate::ssh::validate_host(host)?;
+            crate::ssh::validate_configured_host(host)?;
         }
         let key = target_key(host);
         if !refresh {
@@ -77,13 +78,20 @@ impl RuntimeDiagnosticsCache {
                 return Ok(value);
             }
         }
-        let query_lock = self
-            .query_locks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
+        let query_lock = {
+            let mut locks = self
+                .query_locks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(key.clone(), Arc::downgrade(&lock));
+                lock
+            }
+        };
         let _query_guard = query_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -102,17 +110,43 @@ impl RuntimeDiagnosticsCache {
             diagnostic.last_error = errors.get(&error_key(&key, diagnostic.backend)).cloned();
         }
         drop(errors);
-        self.snapshots
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
+        self.cache_snapshot(key, snapshot.clone());
+        Ok(snapshot)
+    }
+
+    fn cache_snapshot(&self, key: String, snapshot: RuntimeDiagnosticsSnapshot) {
+        let evicted = {
+            let mut snapshots = self
+                .snapshots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            snapshots.retain(|_, cached| cached.fetched_at.elapsed() < CACHE_TTL);
+            let evicted = if snapshots.len() >= MAX_CACHE_TARGETS && !snapshots.contains_key(&key) {
+                snapshots
+                    .iter()
+                    .max_by_key(|(_, cached)| cached.fetched_at.elapsed())
+                    .map(|(target, _)| target.clone())
+            } else {
+                None
+            };
+            if let Some(target) = evicted.as_deref() {
+                snapshots.remove(target);
+            }
+            snapshots.insert(
                 key,
                 CachedSnapshot {
                     fetched_at: Instant::now(),
                     value: snapshot.clone(),
                 },
             );
-        Ok(snapshot)
+            evicted
+        };
+        if let Some(target) = evicted {
+            self.last_errors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain(|key, _| !key.starts_with(&format!("{target}:")));
+        }
     }
 
     pub fn preflight(&self, backend: BackendKind, host: Option<&str>) -> Result<()> {
@@ -695,6 +729,38 @@ mod tests {
             stderr_truncated: false,
             timed_out: false,
         }
+    }
+
+    fn empty_snapshot(target: String) -> RuntimeDiagnosticsSnapshot {
+        RuntimeDiagnosticsSnapshot {
+            target,
+            checked_at: 0,
+            backends: Vec::new(),
+            tmux: RuntimeCapability {
+                available: true,
+                required: false,
+                version: None,
+                message: String::new(),
+                action: None,
+            },
+        }
+    }
+
+    #[test]
+    fn diagnostics_cache_has_a_hard_target_limit() {
+        let cache = RuntimeDiagnosticsCache::default();
+        for index in 0..=MAX_CACHE_TARGETS {
+            let target = format!("ssh:host-{index}");
+            cache.cache_snapshot(target.clone(), empty_snapshot(target));
+        }
+        assert_eq!(
+            cache
+                .snapshots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            MAX_CACHE_TARGETS
+        );
     }
 
     #[test]

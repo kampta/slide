@@ -462,7 +462,7 @@ impl SessionManager {
         // (`-oProxyCommand=…` → arbitrary local code execution). Do this
         // before we touch the filesystem to keep error ordering clean.
         if let Some(host) = req.ssh_host.as_deref() {
-            crate::ssh::validate_host(host)?;
+            crate::ssh::validate_configured_host(host)?;
         }
         if matches!(req.location, Location::Remote) && req.ssh_host.is_none() {
             bail!("ssh_host is required for remote sessions");

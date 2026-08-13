@@ -282,7 +282,7 @@ fn list_dir_remote(host: &str, path: Option<&str>) -> anyhow::Result<serde_json:
     use std::process::Command;
     use std::time::Duration;
 
-    slide_core::ssh::validate_host(host).context("invalid ssh host")?;
+    slide_core::ssh::validate_configured_host(host).context("invalid ssh host")?;
 
     // Passed as `$1` to the remote sh -c script — no further escaping needed
     // inside the script, since sh handles the argv split for us.
