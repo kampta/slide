@@ -11,7 +11,7 @@ Day-to-day dev: `./scripts/dev.sh` runs `cargo run -p slide-cli -- serve --no-op
 Other CLI subcommands:
 
 - `slide serve` — start the daemon (default).
-- `slide open` — launch the local browser with a fragment bootstrap read from the mode-0600 lock file.
+- `slide open` — mint a five-minute, single-use local bootstrap in the mode-0600 auth state and launch the browser URL recorded in the daemon lock.
 - `slide pair` — create a five-minute, single-use fragment QR when `--public-url` is configured.
 
 Release build (single binary with embedded SPA via `rust-embed`):
@@ -37,9 +37,9 @@ CI runs the full Rust workspace test suite on every pull request.
 
 **Two processes that ship as one binary.** `slide-cli` is a thin Tokio/Axum daemon that owns all state; `web/` is a React+xterm.js SPA. In dev they run separately with Vite proxying; in release, `crates/slide-cli/src/assets.rs` uses `rust-embed` to serve `web/dist` from the daemon itself — so `web/dist` **must exist before `cargo build --release`** or the binary ships without a UI.
 
-**Auth model is load-bearing.** The daemon stays on loopback. Local tabs exchange a fragment bootstrap for a process bearer kept in `sessionStorage`; phone pairing exchanges a five-minute, single-use fragment secret over HTTPS for a persistent host-only HttpOnly cookie. Only hashes are stored in the mode-0600 `pairing.json`. HTTP and WS both use the centralized credential check, and Host/Origin must match loopback or `--public-url`.
+**Auth model is load-bearing.** The daemon stays on loopback. Local tabs exchange a five-minute, single-use fragment bootstrap for a process bearer kept in `sessionStorage`; phone pairing exchanges a five-minute, single-use fragment secret over HTTPS for a persistent host-only HttpOnly cookie. Only hashes are stored in the mode-0600 `pairing.json`; `daemon.lock` contains no credential. HTTP and WS both use the centralized credential check. Public Origin must exactly match `--public-url`, including port, while Host may be that public host or proxy-rewritten loopback.
 
-**Phone exposure.** Direct `--lan` and non-loopback HTTP binds are refused. Configure an HTTPS reverse proxy (for example Tailscale Serve) to loopback and pass its origin via `--public-url`.
+**Phone exposure.** Direct `--lan` and non-loopback HTTP binds are refused. Configure an HTTPS reverse proxy (for example Tailscale Serve) to loopback and pass its origin via `--public-url`. The proxy must overwrite `X-Forwarded-Proto` with `https`, preserve Origin, and support WebSockets.
 
 **Session lifecycle lives in `slide-core`.** `SessionManager` (`crates/slide-core/src/session/manager.rs`) owns the map of sessions; `session/pty.rs` wraps `portable-pty` for the child process. Each running session spawns its own classifier task that reacts to byte arrivals via a `tokio::sync::Notify` ping from the reader task — there is no global polling ticker. The classifier captures the rendered pane (tmux `capture-pane` for tmux-supervised sessions, ANSI-stripped ring tail for direct-PTY) and runs the pure `classifier::classify` function, which produces one of:
 

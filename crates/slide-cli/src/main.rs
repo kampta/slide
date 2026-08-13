@@ -40,9 +40,7 @@ enum Cmd {
         #[arg(long)]
         dev: bool,
     },
-    /// Launch the browser pointed at the running daemon, with the bootstrap
-    /// token embedded. The URL itself is never written to stdout — handy
-    /// when the daemon was started with `--no-open`.
+    /// Launch the browser with a fresh five-minute, single-use bootstrap.
     Open,
     /// Create a five-minute, single-use phone pairing QR code.
     Pair,
@@ -50,8 +48,7 @@ enum Cmd {
 
 #[derive(Deserialize)]
 struct LockFile {
-    port: u16,
-    bootstrap: String,
+    browser_url: Option<String>,
 }
 
 fn read_lock() -> Result<LockFile> {
@@ -67,9 +64,14 @@ fn read_lock() -> Result<LockFile> {
 
 fn cmd_open() -> Result<()> {
     let lock = read_lock()?;
+    let browser_url = lock.browser_url.context(
+        "daemon lock predates single-use browser bootstrap; restart `slide serve` and try again",
+    )?;
+    let store = pairing::PairingStore::open(slide_core::config::data_dir().join("pairing.json"))?;
+    let bootstrap = store.create_bootstrap()?;
     let url = format!(
-        "http://127.0.0.1:{}/#bootstrap={}",
-        lock.port, lock.bootstrap
+        "{}/#bootstrap={bootstrap}",
+        browser_url.trim_end_matches('/')
     );
     opener::open(&url).context("open browser")?;
     Ok(())
@@ -165,5 +167,19 @@ mod cli_tests {
             }
             other => panic!("expected Serve, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn current_lock_has_a_browser_url() {
+        let lock: LockFile =
+            serde_json::from_str(r#"{"pid":1,"browser_url":"http://localhost:5173"}"#).unwrap();
+        assert_eq!(lock.browser_url.as_deref(), Some("http://localhost:5173"));
+    }
+
+    #[test]
+    fn legacy_lock_is_detected_without_reusing_its_secret() {
+        let lock: LockFile =
+            serde_json::from_str(r#"{"pid":1,"port":7777,"bootstrap":"reusable-secret"}"#).unwrap();
+        assert!(lock.browser_url.is_none());
     }
 }

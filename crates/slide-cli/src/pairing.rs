@@ -1,4 +1,4 @@
-//! Persistent phone credentials and short-lived, single-use pairing tickets.
+//! Persistent phone credentials and short-lived, single-use auth tickets.
 //!
 //! Only SHA-256 digests are written to disk. The cleartext ticket is returned
 //! once to the CLI, and device credentials exist only in the browser's
@@ -18,6 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const COOKIE_NAME: &str = "__Host-slide_device";
 const TICKET_TTL_SECS: u64 = 5 * 60;
 const DEVICE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+const MAX_TICKETS: usize = 32;
 const MAX_DEVICES: usize = 32;
 
 #[derive(Clone)]
@@ -27,8 +28,10 @@ pub struct PairingStore {
 }
 
 #[derive(Default, Deserialize, Serialize)]
+#[serde(default)]
 struct PersistedState {
     tickets: Vec<Ticket>,
+    bootstraps: Vec<Ticket>,
     devices: Vec<Device>,
 }
 
@@ -60,19 +63,26 @@ impl PairingStore {
     }
 
     pub fn create_ticket(&self) -> Result<String> {
-        self.create_ticket_at(now_secs())
+        self.create_ticket_at(TicketKind::Pairing, now_secs())
     }
 
-    fn create_ticket_at(&self, now: u64) -> Result<String> {
+    pub fn create_bootstrap(&self) -> Result<String> {
+        self.create_ticket_at(TicketKind::Bootstrap, now_secs())
+    }
+
+    fn create_ticket_at(&self, kind: TicketKind, now: u64) -> Result<String> {
         let secret = random_secret();
         let _mutation_lock = self.mutation_lock()?;
         let mut state = self.lock_state()?;
         self.reload(&mut state)?;
-        state.tickets.retain(|ticket| ticket.expires_at > now);
-        state.tickets.push(Ticket {
+        let tickets = kind.select(&mut state);
+        tickets.retain(|ticket| ticket.expires_at > now);
+        tickets.push(Ticket {
             hash: secret_hash(&secret),
             expires_at: now.saturating_add(TICKET_TTL_SECS),
         });
+        let excess = tickets.len().saturating_sub(MAX_TICKETS);
+        tickets.drain(..excess);
         self.save(&state)?;
         Ok(secret)
     }
@@ -110,6 +120,31 @@ impl PairingStore {
         state.devices.drain(..excess);
         self.save(&state)?;
         Ok(Some(credential))
+    }
+
+    pub fn consume_bootstrap(&self, secret: &str) -> Result<bool> {
+        self.consume_bootstrap_at(secret, now_secs())
+    }
+
+    fn consume_bootstrap_at(&self, secret: &str, now: u64) -> Result<bool> {
+        let hash = secret_hash(secret);
+        let _mutation_lock = self.mutation_lock()?;
+        let mut state = self.lock_state()?;
+        self.reload(&mut state)?;
+        let before = state.bootstraps.len();
+        let valid = state
+            .bootstraps
+            .iter()
+            .position(|ticket| ticket.expires_at > now && constant_time_eq(&ticket.hash, &hash));
+        if let Some(index) = valid {
+            state.bootstraps.remove(index);
+        } else {
+            state.bootstraps.retain(|ticket| ticket.expires_at > now);
+        }
+        if valid.is_some() || state.bootstraps.len() != before {
+            self.save(&state)?;
+        }
+        Ok(valid.is_some())
     }
 
     pub fn authenticate(&self, credential: &str) -> bool {
@@ -180,6 +215,21 @@ impl PairingStore {
         self.state
             .lock()
             .map_err(|_| anyhow::anyhow!("pairing state lock poisoned"))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TicketKind {
+    Pairing,
+    Bootstrap,
+}
+
+impl TicketKind {
+    fn select(self, state: &mut PersistedState) -> &mut Vec<Ticket> {
+        match self {
+            Self::Pairing => &mut state.tickets,
+            Self::Bootstrap => &mut state.bootstraps,
+        }
     }
 }
 
@@ -304,7 +354,7 @@ mod tests {
     #[test]
     fn ticket_is_single_use_and_creates_a_device() {
         let (_dir, store) = store();
-        let ticket = store.create_ticket_at(100).unwrap();
+        let ticket = store.create_ticket_at(TicketKind::Pairing, 100).unwrap();
         let credential = store.redeem_at(&ticket, 101).unwrap().unwrap();
         assert!(store.authenticate_at(&credential, 101));
         assert!(store.redeem_at(&ticket, 102).unwrap().is_none());
@@ -313,7 +363,7 @@ mod tests {
     #[test]
     fn expired_ticket_cannot_be_redeemed() {
         let (_dir, store) = store();
-        let ticket = store.create_ticket_at(100).unwrap();
+        let ticket = store.create_ticket_at(TicketKind::Pairing, 100).unwrap();
         assert!(store
             .redeem_at(&ticket, 100 + TICKET_TTL_SECS)
             .unwrap()
@@ -323,7 +373,7 @@ mod tests {
     #[test]
     fn state_contains_hashes_not_secrets() {
         let (dir, store) = store();
-        let ticket = store.create_ticket_at(100).unwrap();
+        let ticket = store.create_ticket_at(TicketKind::Pairing, 100).unwrap();
         let credential = store.redeem_at(&ticket, 101).unwrap().unwrap();
         let persisted = std::fs::read_to_string(dir.path().join("pairing.json")).unwrap();
         assert!(!persisted.contains(&ticket));
@@ -335,7 +385,7 @@ mod tests {
         let (dir, store) = store();
         let mut credentials = Vec::new();
         for now in 0..(MAX_DEVICES as u64 + 2) {
-            let ticket = store.create_ticket_at(now).unwrap();
+            let ticket = store.create_ticket_at(TicketKind::Pairing, now).unwrap();
             credentials.push(store.redeem_at(&ticket, now).unwrap().unwrap());
         }
         let now = MAX_DEVICES as u64 + 2;
@@ -351,7 +401,7 @@ mod tests {
     #[test]
     fn device_credential_expires() {
         let (_dir, store) = store();
-        let ticket = store.create_ticket_at(100).unwrap();
+        let ticket = store.create_ticket_at(TicketKind::Pairing, 100).unwrap();
         let credential = store.redeem_at(&ticket, 100).unwrap().unwrap();
         assert!(store.authenticate_at(&credential, 100 + DEVICE_TTL_SECS - 1));
         assert!(!store.authenticate_at(&credential, 100 + DEVICE_TTL_SECS));
@@ -362,7 +412,7 @@ mod tests {
     fn state_file_is_mode_0600() {
         use std::os::unix::fs::PermissionsExt;
         let (dir, store) = store();
-        store.create_ticket_at(100).unwrap();
+        store.create_ticket_at(TicketKind::Pairing, 100).unwrap();
         let mode = std::fs::metadata(dir.path().join("pairing.json"))
             .unwrap()
             .permissions()
@@ -406,5 +456,47 @@ mod tests {
             public_url_host("https://slide.example.ts.net:8443").unwrap(),
             "slide.example.ts.net"
         );
+    }
+
+    #[test]
+    fn bootstrap_is_single_use_across_store_instances() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pairing.json");
+        let creator = PairingStore::open(path.clone()).unwrap();
+        let consumer = PairingStore::open(path).unwrap();
+        let secret = creator
+            .create_ticket_at(TicketKind::Bootstrap, 100)
+            .unwrap();
+
+        assert!(consumer.consume_bootstrap_at(&secret, 101).unwrap());
+        assert!(!creator.consume_bootstrap_at(&secret, 102).unwrap());
+    }
+
+    #[test]
+    fn bootstrap_expires_and_is_never_persisted_in_cleartext() {
+        let (dir, store) = store();
+        let secret = store.create_ticket_at(TicketKind::Bootstrap, 100).unwrap();
+        let persisted = std::fs::read_to_string(dir.path().join("pairing.json")).unwrap();
+        assert!(!persisted.contains(&secret));
+        assert!(!store
+            .consume_bootstrap_at(&secret, 100 + TICKET_TTL_SECS)
+            .unwrap());
+    }
+
+    #[test]
+    fn auth_tickets_are_bounded() {
+        let (_dir, store) = store();
+        for now in 0..(MAX_TICKETS as u64 + 2) {
+            store.create_ticket_at(TicketKind::Bootstrap, now).unwrap();
+        }
+        assert_eq!(store.lock_state().unwrap().bootstraps.len(), MAX_TICKETS);
+    }
+
+    #[test]
+    fn state_without_bootstraps_remains_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pairing.json");
+        std::fs::write(&path, r#"{"tickets":[],"devices":[]}"#).unwrap();
+        assert!(PairingStore::open(path).is_ok());
     }
 }

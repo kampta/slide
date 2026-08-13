@@ -4,7 +4,7 @@ use crate::pairing::{self, PairingStore};
 use crate::ws;
 use anyhow::{Context, Result};
 use axum::extract::{Json, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, uri::Authority, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::{
@@ -22,11 +22,12 @@ use tower_http::trace::TraceLayer;
 pub struct AppState {
     pub manager: Arc<SessionManager>,
     pub token: Arc<String>,
-    pub bootstrap: Arc<String>,
     pub pairing: PairingStore,
     /// Hostnames accepted in Host and Origin. This is loopback plus the
     /// explicitly configured HTTPS reverse-proxy origin, if any.
     pub allowed_hosts: Arc<Vec<String>>,
+    /// Exact phone-facing HTTPS origin, including any non-default port.
+    pub public_origin: Arc<Option<String>>,
 }
 
 pub async fn run(
@@ -52,22 +53,26 @@ pub async fn run(
     // it once axum owns the router.
     let manager_for_shutdown = manager.clone();
 
-    // The process token is accepted only from local browser bootstrap. Phone
-    // clients receive independent, persistent device credentials.
+    // The process token is accepted only after consuming a short-lived local
+    // bootstrap. Phone clients receive independent persistent credentials.
     let token = generate_token();
-    let bootstrap = generate_token();
-    write_lock_file(&bootstrap, bind, port, public_url.as_deref())?;
-    let _lock_guard = DaemonLockGuard;
-
     let pairing = PairingStore::open(config::data_dir().join("pairing.json"))?;
+    let local_addr = local_browser_addr(bind, port);
+    let browser_url = if dev {
+        "http://localhost:5173".to_string()
+    } else {
+        format!("http://{local_addr}")
+    };
+    write_lock_file(bind, port, public_url.as_deref(), &browser_url)?;
+    let _lock_guard = DaemonLockGuard;
 
     let allowed_hosts = build_allowed_hosts(bind, public_url.as_deref())?;
     let state = AppState {
         manager,
         token: Arc::new(token.clone()),
-        bootstrap: Arc::new(bootstrap.clone()),
-        pairing,
+        pairing: pairing.clone(),
         allowed_hosts: Arc::new(allowed_hosts),
+        public_origin: Arc::new(public_url.clone()),
     };
 
     // /api/* is fully gated by `auth_layer` (Host/Origin + token). /ws/* only
@@ -140,35 +145,33 @@ pub async fn run(
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    // The token-bearing URL is only used internally by the auto-open path
+    // A single-use bootstrap URL is only used by the auto-open path
     // and never written to stdout in production: doing so would leak the
     // token into shell scrollback, screen recordings, and `ps -ef`
     // snapshots. Users who disabled auto-open can re-launch the browser
-    // with `slide open`, which reads the token from the mode-0600 lock
-    // file directly.
+    // with `slide open`, which mints a fresh ticket in the mode-0600 auth
+    // state using the non-secret browser URL from the lock file.
     //
     // Dev mode is the exception: `dev.sh` runs `serve --no-open --dev` so
     // that Vite (port 5173) hosts the SPA and proxies /api+/ws to the
     // daemon. `slide open` would target the daemon's own port and serve
     // the fallback "open Vite at :5173" page — useless. So in dev mode we
-    // print the full URL with token instead, on the assumption that a
-    // developer running their own toolchain on their own laptop is fine
-    // with the token in their terminal scrollback.
-    let local_addr = local_browser_addr(bind, port);
-    let bootstrap_url = if dev {
-        format!("http://localhost:5173/#bootstrap={bootstrap}")
+    // print one short-lived URL instead. Subsequent tabs use `slide open`.
+    let bootstrap_url = if needs_initial_bootstrap(dev, open_browser) {
+        let bootstrap = pairing.create_bootstrap()?;
+        Some(format!("{browser_url}/#bootstrap={bootstrap}"))
     } else {
-        format!("http://{local_addr}/#bootstrap={bootstrap}")
+        None
     };
-    let browser_url = if dev {
-        bootstrap_url.clone()
+    let displayed_url = if dev {
+        bootstrap_url.as_deref().unwrap_or(&browser_url)
     } else {
-        format!("http://{local_addr}/")
+        &browser_url
     };
     tracing::info!("slide listening on http://{addr}");
     println!();
     println!("  open slide in your browser:");
-    println!("    {browser_url}");
+    println!("    {displayed_url}");
     if !dev && !open_browser {
         println!();
         println!("  (auto-open disabled — run `slide open` to launch the browser)");
@@ -180,8 +183,7 @@ pub async fn run(
         println!();
     }
 
-    if open_browser {
-        let url = bootstrap_url.clone();
+    if let (true, Some(url)) = (open_browser, bootstrap_url) {
         tokio::task::spawn_blocking(move || {
             let _ = opener::open(&url);
         });
@@ -239,13 +241,18 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-fn write_lock_file(bootstrap: &str, bind: &str, port: u16, public_url: Option<&str>) -> Result<()> {
+fn write_lock_file(
+    bind: &str,
+    port: u16,
+    public_url: Option<&str>,
+    browser_url: &str,
+) -> Result<()> {
     let path = config::lock_path();
     let body = serde_json::json!({
         "pid": std::process::id(),
         "bind": bind,
         "port": port,
-        "bootstrap": bootstrap,
+        "browser_url": browser_url,
         "public_url": public_url,
     });
     write_secret_file(&path, body.to_string().as_bytes())?;
@@ -262,12 +269,17 @@ async fn exchange_bootstrap(
     headers: header::HeaderMap,
     Json(request): Json<ExchangeRequest>,
 ) -> Response {
-    if !request_is_loopback(&headers)
-        || !constant_time_eq(request.secret.as_bytes(), state.bootstrap.as_bytes())
-    {
+    if !request_is_loopback(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    Json(serde_json::json!({ "token": state.token.as_str() })).into_response()
+    match state.pairing.consume_bootstrap(&request.secret) {
+        Ok(true) => Json(serde_json::json!({ "token": state.token.as_str() })).into_response(),
+        Ok(false) => StatusCode::UNAUTHORIZED.into_response(),
+        Err(error) => {
+            tracing::error!("bootstrap exchange failed: {error:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 async fn exchange_pairing(
@@ -275,7 +287,7 @@ async fn exchange_pairing(
     headers: header::HeaderMap,
     Json(request): Json<ExchangeRequest>,
 ) -> Response {
-    if !request_is_https(&headers) {
+    if !request_is_secure_pairing(&headers, state.public_origin.as_deref()) {
         return (
             StatusCode::BAD_REQUEST,
             "pairing requires HTTPS through the configured reverse proxy",
@@ -310,31 +322,33 @@ fn forwarded_proto(headers: &header::HeaderMap) -> Option<&str> {
     headers
         .get("x-forwarded-proto")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
         .map(str::trim)
 }
 
-fn request_is_https(headers: &header::HeaderMap) -> bool {
+fn request_is_secure_pairing(headers: &header::HeaderMap, public_origin: Option<&str>) -> bool {
     forwarded_proto(headers) == Some("https")
-        || headers
-            .get(header::ORIGIN)
-            .and_then(|value| value.to_str().ok())
-            .map(|origin| origin.starts_with("https://"))
+        && public_origin
+            .zip(
+                headers
+                    .get(header::ORIGIN)
+                    .and_then(|value| value.to_str().ok()),
+            )
+            .map(|(expected, supplied)| origin_eq(supplied, expected))
             .unwrap_or(false)
 }
 
 fn request_is_loopback(headers: &header::HeaderMap) -> bool {
-    headers
+    let host_is_loopback = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
-        .map(|host| {
-            host_in(
-                host,
-                &["127.0.0.1".into(), "localhost".into(), "::1".into()],
-            )
-        })
-        .unwrap_or(false)
-        && forwarded_proto(headers) != Some("https")
+        .map(is_loopback_authority)
+        .unwrap_or(false);
+    let origin_is_loopback = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(is_loopback_origin)
+        .unwrap_or(true);
+    host_is_loopback && origin_is_loopback && forwarded_proto(headers) != Some("https")
 }
 
 /// Removes only this process's discovery file. If another daemon has
@@ -411,7 +425,7 @@ async fn auth_layer(
     // phone's Host header passes; rebinding-to-loopback from the public
     // internet still 403s. Reject before checking the token so a valid
     // token can't be smuggled through.
-    if !request_authority_is_allowed(&req, &state.allowed_hosts) {
+    if !request_authority_is_allowed(&req, &state.allowed_hosts, state.public_origin.as_deref()) {
         return Response::builder()
             .status(StatusCode::FORBIDDEN)
             .body(axum::body::Body::from("forbidden authority"))
@@ -451,7 +465,7 @@ pub async fn host_origin_layer(
     req: Request,
     next: Next,
 ) -> Response {
-    if !request_authority_is_allowed(&req, &state.allowed_hosts) {
+    if !request_authority_is_allowed(&req, &state.allowed_hosts, state.public_origin.as_deref()) {
         return Response::builder()
             .status(StatusCode::FORBIDDEN)
             .body(axum::body::Body::from("forbidden authority"))
@@ -460,7 +474,11 @@ pub async fn host_origin_layer(
     next.run(req).await
 }
 
-fn request_authority_is_allowed(req: &Request, allowed: &[String]) -> bool {
+fn request_authority_is_allowed(
+    req: &Request,
+    allowed: &[String],
+    public_origin: Option<&str>,
+) -> bool {
     let host_ok = req
         .headers()
         .get(header::HOST)
@@ -475,11 +493,70 @@ fn request_authority_is_allowed(req: &Request, allowed: &[String]) -> bool {
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok())
     {
-        if !host_in(origin, allowed) {
+        if !is_loopback_origin(origin)
+            && !public_origin
+                .map(|expected| origin_eq(origin, expected))
+                .unwrap_or(false)
+        {
             return false;
         }
     }
     true
+}
+
+fn origin_eq(left: &str, right: &str) -> bool {
+    normalized_origin(left)
+        .zip(normalized_origin(right))
+        .map(|(left, right)| left == right)
+        .unwrap_or(false)
+}
+
+fn normalized_origin(value: &str) -> Option<String> {
+    let uri: Uri = value.parse().ok()?;
+    if !matches!(uri.path(), "" | "/") || uri.query().is_some() {
+        return None;
+    }
+    let scheme = uri.scheme_str()?.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https") {
+        return None;
+    }
+    let authority = uri.authority()?;
+    if authority.as_str().contains('@') {
+        return None;
+    }
+    let host = authority.host().to_ascii_lowercase();
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    let port = authority
+        .port_u16()
+        .filter(|port| !matches!((scheme.as_str(), *port), ("http", 80) | ("https", 443)));
+    Some(match port {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
+    })
+}
+
+fn is_loopback_origin(value: &str) -> bool {
+    let Ok(uri) = value.parse::<Uri>() else {
+        return false;
+    };
+    uri.scheme_str() == Some("http")
+        && matches!(uri.path(), "" | "/")
+        && uri.query().is_none()
+        && uri
+            .authority()
+            .map(|authority| is_loopback_authority(authority.as_str()))
+            .unwrap_or(false)
+}
+
+fn is_loopback_authority(value: &str) -> bool {
+    value
+        .parse::<Authority>()
+        .map(|authority| matches!(authority.host(), "127.0.0.1" | "localhost" | "::1"))
+        .unwrap_or(false)
 }
 
 /// Return true when `value` (a Host header like `localhost:7777` or an Origin
@@ -521,6 +598,10 @@ fn local_browser_addr(bind: &str, port: u16) -> String {
         Ok(ip) if ip.is_unspecified() => format!("127.0.0.1:{port}"),
         _ => format!("{bind}:{port}"),
     }
+}
+
+fn needs_initial_bootstrap(dev: bool, open_browser: bool) -> bool {
+    dev || open_browser
 }
 
 /// Build the host allow-list from the bind address. Always includes
@@ -653,11 +734,43 @@ mod tests {
     }
 
     #[test]
-    fn pairing_exchange_requires_https_signal() {
+    fn pairing_exchange_requires_exact_public_origin_and_https_proxy() {
         let mut headers = header::HeaderMap::new();
-        assert!(!request_is_https(&headers));
+        headers.insert(
+            header::ORIGIN,
+            "https://slide.example:8443".parse().unwrap(),
+        );
+        assert!(!request_is_secure_pairing(
+            &headers,
+            Some("https://slide.example:8443")
+        ));
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
-        assert!(request_is_https(&headers));
+        assert!(request_is_secure_pairing(
+            &headers,
+            Some("https://slide.example:8443")
+        ));
+        assert!(!request_is_secure_pairing(&headers, None));
+        assert!(!request_is_secure_pairing(
+            &headers,
+            Some("https://slide.example")
+        ));
+
+        headers.insert("x-forwarded-proto", "https,http".parse().unwrap());
+        assert!(!request_is_secure_pairing(
+            &headers,
+            Some("https://slide.example:8443")
+        ));
+    }
+
+    #[test]
+    fn local_bootstrap_rejects_a_public_origin() {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::HOST, "127.0.0.1:7777".parse().unwrap());
+        headers.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+        assert!(!request_is_loopback(&headers));
+
+        headers.insert(header::ORIGIN, "http://localhost:5173".parse().unwrap());
+        assert!(request_is_loopback(&headers));
     }
 
     #[test]
@@ -764,14 +877,14 @@ mod tests {
             r.headers_mut()
                 .insert(header::HOST, "evil.com:7777".parse().unwrap());
         });
-        assert!(!request_authority_is_allowed(&r, &allowed));
+        assert!(!request_authority_is_allowed(&r, &allowed, None));
     }
 
     #[test]
     fn request_authority_rejects_missing_host() {
         let allowed = loopback_only();
         let r = req_with(|_| {});
-        assert!(!request_authority_is_allowed(&r, &allowed));
+        assert!(!request_authority_is_allowed(&r, &allowed, None));
     }
 
     #[test]
@@ -781,7 +894,7 @@ mod tests {
             r.headers_mut()
                 .insert(header::HOST, "127.0.0.1:7777".parse().unwrap());
         });
-        assert!(request_authority_is_allowed(&r, &allowed));
+        assert!(request_authority_is_allowed(&r, &allowed, None));
     }
 
     #[test]
@@ -793,7 +906,7 @@ mod tests {
             r.headers_mut()
                 .insert(header::ORIGIN, "http://localhost:5173".parse().unwrap());
         });
-        assert!(request_authority_is_allowed(&r, &allowed));
+        assert!(request_authority_is_allowed(&r, &allowed, None));
     }
 
     #[test]
@@ -805,7 +918,7 @@ mod tests {
             r.headers_mut()
                 .insert(header::ORIGIN, "https://evil.com".parse().unwrap());
         });
-        assert!(!request_authority_is_allowed(&r, &allowed));
+        assert!(!request_authority_is_allowed(&r, &allowed, None));
     }
 
     #[test]
@@ -817,7 +930,7 @@ mod tests {
             r.headers_mut()
                 .insert(header::ORIGIN, "null".parse().unwrap());
         });
-        assert!(!request_authority_is_allowed(&r, &allowed));
+        assert!(!request_authority_is_allowed(&r, &allowed, None));
     }
 
     #[test]
@@ -827,7 +940,58 @@ mod tests {
             r.headers_mut()
                 .insert(header::HOST, "100.64.0.5:7777".parse().unwrap());
         });
-        assert!(request_authority_is_allowed(&r, &allowed));
+        assert!(request_authority_is_allowed(&r, &allowed, None));
+    }
+
+    #[test]
+    fn public_origin_is_exact_with_proxy_rewritten_loopback_host() {
+        let public_origin = "https://slide.example:8443";
+        let allowed = build_allowed_hosts("127.0.0.1", Some(public_origin)).unwrap();
+        let request = |origin: &str| {
+            req_with(|request| {
+                request
+                    .headers_mut()
+                    .insert(header::HOST, "127.0.0.1:7777".parse().unwrap());
+                request
+                    .headers_mut()
+                    .insert(header::ORIGIN, origin.parse().unwrap());
+            })
+        };
+
+        assert!(request_authority_is_allowed(
+            &request(public_origin),
+            &allowed,
+            Some(public_origin),
+        ));
+        assert!(!request_authority_is_allowed(
+            &request("https://slide.example"),
+            &allowed,
+            Some(public_origin),
+        ));
+        assert!(!request_authority_is_allowed(
+            &request("http://slide.example:8443"),
+            &allowed,
+            Some(public_origin),
+        ));
+    }
+
+    #[test]
+    fn public_origin_accepts_a_preserved_public_host() {
+        let public_origin = "https://slide.example";
+        let allowed = build_allowed_hosts("127.0.0.1", Some(public_origin)).unwrap();
+        let request = req_with(|request| {
+            request
+                .headers_mut()
+                .insert(header::HOST, "slide.example".parse().unwrap());
+            request
+                .headers_mut()
+                .insert(header::ORIGIN, public_origin.parse().unwrap());
+        });
+        assert!(request_authority_is_allowed(
+            &request,
+            &allowed,
+            Some(public_origin),
+        ));
     }
 
     #[test]
@@ -862,6 +1026,13 @@ mod tests {
         // User picked the address explicitly; allow-list contains it.
         assert_eq!(local_browser_addr("192.168.1.5", 7777), "192.168.1.5:7777");
         assert_eq!(local_browser_addr("100.64.0.5", 7777), "100.64.0.5:7777");
+    }
+
+    #[test]
+    fn production_no_open_does_not_mint_an_unused_bootstrap() {
+        assert!(!needs_initial_bootstrap(false, false));
+        assert!(needs_initial_bootstrap(false, true));
+        assert!(needs_initial_bootstrap(true, false));
     }
 
     #[test]

@@ -24,7 +24,7 @@ Slide launches agent CLIs already installed on the daemon host. Install and auth
 ./scripts/dev.sh
 ```
 
-This starts the Rust daemon on `127.0.0.1:7777` and the Vite development server on `127.0.0.1:5173`. Vite serves the UI with hot reload and proxies `/api` and `/ws` to the daemon. Open the fragment-bootstrap URL printed in the terminal. Stop both processes with `Ctrl+C`. Development servers remain loopback-only; phone pairing is a production-build flow behind HTTPS.
+This starts the Rust daemon on `127.0.0.1:7777` and the Vite development server on `127.0.0.1:5173`. Vite serves the UI with hot reload and proxies `/api` and `/ws` to the daemon. Open the five-minute, single-use fragment-bootstrap URL printed in the terminal; run `slide open` for each later tab. Stop both processes with `Ctrl+C`. Development servers remain loopback-only; phone pairing is a production-build flow behind HTTPS.
 
 ## Production mode
 
@@ -53,7 +53,7 @@ tailscale serve --bg http://127.0.0.1:7777
 ./target/release/slide pair
 ```
 
-The proxy must support WebSocket upgrades and send `X-Forwarded-Proto: https`. `slide pair` prints a QR whose secret is in the URL fragment, expires after five minutes, and works once. The SPA exchanges it for a per-device `HttpOnly; Secure; SameSite=Strict` cookie; neither the device credential nor the process bearer token is stored in `localStorage` or placed in a query string. The oldest credential is pruned after 32 paired devices.
+The proxy must support WebSocket upgrades, preserve the browser's `Origin`, and overwrite any incoming `X-Forwarded-Proto` value with `https` before forwarding. Slide requires that Origin to exactly match `--public-url`, including any non-default port. `slide pair` prints a QR whose secret is in the URL fragment, expires after five minutes, and works once. The SPA exchanges it for a per-device `HttpOnly; Secure; SameSite=Strict` cookie; neither the device credential nor the process bearer token is stored in `localStorage` or placed in a query string. The oldest credential is pruned after 32 paired devices.
 
 Direct LAN HTTP is intentionally refused: `--lan` and non-loopback `--bind` are not safe substitutes for TLS.
 
@@ -120,8 +120,8 @@ SQLite at `~/Library/Application Support/slide/slide.db` (macOS) / `$XDG_DATA_HO
 
 - Daemon binds `127.0.0.1` only.
 - Every session API and WebSocket request is centrally authenticated. Local tabs use a process bearer held in `sessionStorage`; paired devices use a host-only HttpOnly cookie.
-- The middleware rejects requests whose `Host` or `Origin` is neither loopback nor the explicitly configured `--public-url` origin.
-- The mode-0600 daemon lock contains only the local bootstrap secret and discovery metadata. Persistent pairing state is also mode 0600 and contains SHA-256 hashes, never cleartext tickets or device credentials.
+- The middleware rejects requests whose `Host` is neither loopback nor the configured public host. A public `Origin` must exactly match `--public-url`, including scheme and port.
+- The mode-0600 daemon lock contains discovery metadata and a non-secret local browser URL. The mode-0600 auth state contains only SHA-256 hashes, never cleartext bootstrap tickets, pairing tickets, or device credentials. Both ticket types expire after five minutes and work once.
 - `SIGINT` / `SIGTERM` trigger a graceful drain: axum finishes in-flight requests, then direct-supervised backends are killed so they don't outlive the daemon as orphans. Tmux-supervised sessions are left alive on purpose.
 
 ## License
