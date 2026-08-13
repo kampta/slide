@@ -10,6 +10,7 @@ import { SessionList } from "./components/SessionList";
 import { SessionView } from "./components/SessionView";
 import { NewSessionDialog } from "./components/NewSessionDialog";
 import { DiagnosticsModal } from "./components/DiagnosticsModal";
+import { StatusBanners } from "./components/StatusBanners";
 import { useSessions } from "./state/sessionStore";
 import { useIsMobile } from "./hooks/useMediaQuery";
 import { setToken } from "./state/api";
@@ -52,9 +53,7 @@ export function App() {
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(loadSidebarCollapsed);
   const connect = useSessions((s) => s.connect);
-  const refresh = useSessions((s) => s.refresh);
   const setActive = useSessions((s) => s.setActive);
-  const reportError = useSessions((s) => s.reportError);
   // Subscribe to activeId so the mobile single-pane render swaps when the
   // user picks (or backs out of) a session. Desktop layout doesn't need
   // this subscription but the cost is one selector.
@@ -74,10 +73,9 @@ export function App() {
       url.searchParams.delete("token");
       window.history.replaceState({}, "", url.toString());
     }
-    refresh().catch(reportError);
     const stop = connect();
     return stop;
-  }, [connect, refresh, reportError]);
+  }, [connect]);
 
   useEffect(() => {
     try {
@@ -161,6 +159,7 @@ export function App() {
   if (isMobile) {
     return (
       <div className="app app-mobile">
+        {activeId && <StatusBanners floating />}
         {activeId ? (
           <main className="main">
             <SessionView />

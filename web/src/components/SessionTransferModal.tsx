@@ -22,6 +22,8 @@ export function SessionTransferModal({
   onSelect: (sessionId: string) => void;
 }) {
   const sessions = useSessions((state) => state.sessions);
+  const forkSession = useSessions((state) => state.forkSession);
+  const handoffSession = useSessions((state) => state.handoffSession);
   const [mode, setMode] = useState<"fork" | "handoff">("fork");
   const [backends, setBackends] = useState<BackendInfo[]>([]);
   const [name, setName] = useState("");
@@ -86,8 +88,8 @@ export function SessionTransferModal({
     setError(null);
     try {
       const target = mode === "fork"
-        ? await api.forkSession(source.id, { name, focus: focus.trim() || undefined })
-        : await api.handoffSession(source.id, {
+        ? await forkSession(source.id, { name, focus: focus.trim() || undefined })
+        : await handoffSession(source.id, {
             target_session_id: targetId,
             focus: focus.trim(),
           });

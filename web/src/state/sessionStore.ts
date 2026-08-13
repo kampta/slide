@@ -14,8 +14,8 @@ interface Store {
   activeId: string | null;
   connected: boolean;
   /// Set when the daemon closes a WebSocket with code 4401 (stale or
-  /// missing bearer token). Surfaced in the sidebar so the user sees the
-  /// same instructions HTTP errors print, instead of an indefinite
+  /// missing bearer token). Surfaced by the shared status banner so the user
+  /// sees the same instructions HTTP errors print, instead of an indefinite
   /// "disconnected" spinner that hides the real cause.
   authError: string | null;
   error: string | null;
@@ -25,7 +25,22 @@ interface Store {
   loadSnapshot: (list: Session[]) => void;
   upsert: (s: Session) => void;
   remove: (id: string) => void;
-  refresh: () => Promise<void>;
+  createSession: (
+    request: Parameters<typeof api.createSession>[0],
+  ) => Promise<Session>;
+  updateSession: (
+    id: string,
+    patch: Parameters<typeof api.updateSession>[1],
+  ) => Promise<Session>;
+  deleteSession: (id: string) => Promise<void>;
+  forkSession: (
+    id: string,
+    request: Parameters<typeof api.forkSession>[1],
+  ) => Promise<Session>;
+  handoffSession: (
+    sourceId: string,
+    request: Parameters<typeof api.handoffSession>[1],
+  ) => Promise<Session>;
   connect: () => () => void;
 }
 
@@ -97,9 +112,29 @@ export const useSessions = create<Store>((set, get) => ({
     const activeId = get().activeId === id ? null : get().activeId;
     set({ sessions, order, activeId });
   },
-  refresh: async () => {
-    const list = await api.listSessions();
-    get().loadSnapshot(list);
+  createSession: async (request) => {
+    const session = await api.createSession(request);
+    get().upsert(session);
+    return session;
+  },
+  updateSession: async (id, patch) => {
+    const session = await api.updateSession(id, patch);
+    get().upsert(session);
+    return session;
+  },
+  deleteSession: async (id) => {
+    await api.deleteSession(id);
+    get().remove(id);
+  },
+  forkSession: async (id, request) => {
+    const session = await api.forkSession(id, request);
+    get().upsert(session);
+    return session;
+  },
+  handoffSession: async (sourceId, request) => {
+    const session = await api.handoffSession(sourceId, request);
+    get().upsert(session);
+    return session;
   },
   connect: () => {
     let ws: WebSocket | null = null;

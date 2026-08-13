@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { useSessions } from "../state/sessionStore";
 import { SessionItem } from "./SessionItem";
+import { StatusBanners } from "./StatusBanners";
 import type { Session } from "../state/api";
 
 export function matchesSession(session: Session, query: string): boolean {
@@ -33,9 +34,6 @@ export function SessionList({
   const activeId = useSessions((s) => s.activeId);
   const setActive = useSessions((s) => s.setActive);
   const connected = useSessions((s) => s.connected);
-  const authError = useSessions((s) => s.authError);
-  const error = useSessions((s) => s.error);
-  const clearError = useSessions((s) => s.clearError);
   const [query, setQuery] = useState("");
 
   const visible = useMemo(
@@ -45,15 +43,7 @@ export function SessionList({
 
   return (
     <aside className="session-list">
-      {!connected && (
-        <div
-          className="disconnect-banner"
-          role="status"
-          aria-live="polite"
-        >
-          Disconnected — retrying…
-        </div>
-      )}
+      <StatusBanners />
       <header className="session-list-header">
         <div className="brand">
           <svg
@@ -95,16 +85,6 @@ export function SessionList({
           )}
         </div>
       </header>
-      {(authError || error) && (
-        <div className="error-banner" role="alert">
-          <span>{authError || error}</span>
-          {error && !authError && (
-            <button type="button" onClick={clearError} aria-label="Dismiss error">
-              ×
-            </button>
-          )}
-        </div>
-      )}
       <label className="session-filter">
         <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
           <circle cx="11" cy="11" r="6" />

@@ -73,6 +73,8 @@ export function SessionView() {
   const session = useSessions((s) => (activeId ? s.sessions[activeId] : null));
   const setActive = useSessions((s) => s.setActive);
   const reportError = useSessions((s) => s.reportError);
+  const updateSession = useSessions((s) => s.updateSession);
+  const deleteSession = useSessions((s) => s.deleteSession);
   const [usage, setUsage] = useState<ContextUsage | null>(null);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [transferOpen, setTransferOpen] = useState(false);
@@ -211,7 +213,7 @@ export function SessionView() {
               disabled={pendingAction !== null}
               onClick={() =>
                 runAction("Stopping…", () =>
-                  api.updateSession(session.id, { action: "stop" }),
+                  updateSession(session.id, { action: "stop" }),
                 )
               }
             >
@@ -243,7 +245,7 @@ export function SessionView() {
                 disabled={pendingAction !== null}
                 onClick={() =>
                   runAction("Starting…", () =>
-                    api.updateSession(session.id, {
+                    updateSession(session.id, {
                       action: "resume",
                       ...(switchingBackend
                         ? { backend: selectedBackend }
@@ -261,7 +263,7 @@ export function SessionView() {
             disabled={pendingAction !== null}
             onClick={() => {
               if (confirm(`Delete session "${session.name}"? This removes the worktree if slide created it.`)) {
-                void runAction("Deleting…", () => api.deleteSession(session.id));
+                void runAction("Deleting…", () => deleteSession(session.id));
               }
             }}
           >

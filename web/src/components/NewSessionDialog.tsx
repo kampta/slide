@@ -6,6 +6,7 @@ import {
   type Location,
   type SshHost,
 } from "../state/api";
+import { useSessions } from "../state/sessionStore";
 import { DirectoryBrowser } from "./DirectoryBrowser";
 
 const RECENTS_KEY = "slide.recentBaseDirs";
@@ -81,6 +82,7 @@ export function NewSessionDialog({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const nameRef = useRef<HTMLInputElement | null>(null);
+  const createSession = useSessions((state) => state.createSession);
 
   useEffect(() => {
     api
@@ -148,7 +150,7 @@ export function NewSessionDialog({
     setSubmitting(true);
     setError(null);
     try {
-      const s = await api.createSession({
+      const s = await createSession({
         name: name.trim(),
         backend,
         location,

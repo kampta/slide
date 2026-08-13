@@ -346,6 +346,31 @@ body.is-resizing-panels * {
   font-size: 12px;
 }
 
+.status-banners {
+  flex: none;
+}
+
+.status-banners-floating {
+  position: fixed;
+  top: calc(56px + env(safe-area-inset-top));
+  right: 8px;
+  left: 8px;
+  z-index: 70;
+  overflow: hidden;
+  border: 1px solid #4b2d34;
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.status-banners-floating .disconnect-banner,
+.status-banners-floating .error-banner {
+  border-bottom: 0;
+}
+
+.status-banners-floating .disconnect-banner + .error-banner {
+  border-top: 1px solid #4b2d34;
+}
+
 .disconnect-banner {
   padding: 5px 10px;
   text-align: center;

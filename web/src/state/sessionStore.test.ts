@@ -1,6 +1,6 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { sessionDisplayPath } from "../components/SessionPath";
-import type { Session } from "./api";
+import { api, type Session } from "./api";
 import { useSessions } from "./sessionStore";
 
 function session(id: string, overrides: Partial<Session> = {}): Session {
@@ -86,5 +86,61 @@ describe("sessionDisplayPath", () => {
         session("fix", { location: "remote", ssh_host: "buildbox" }),
       ),
     ).toBe("buildbox:slide/fix");
+  });
+});
+
+describe("session store mutations", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    useSessions.setState({
+      sessions: {},
+      order: [],
+      activeId: null,
+      connected: false,
+      authError: null,
+      error: null,
+    });
+  });
+
+  it("applies create, update, and delete responses without waiting for events", async () => {
+    const created = session("created", { created_at: 10 });
+    vi.spyOn(api, "createSession").mockResolvedValue(created);
+
+    await expect(
+      useSessions.getState().createSession({
+        name: "created",
+        backend: "claude",
+        base_dir: "/code/slide",
+      }),
+    ).resolves.toEqual(created);
+    expect(useSessions.getState().sessions.created).toEqual(created);
+
+    const stopped = { ...created, state: "stopped" as const };
+    vi.spyOn(api, "updateSession").mockResolvedValue(stopped);
+    await useSessions.getState().updateSession(created.id, { action: "stop" });
+    expect(useSessions.getState().sessions.created).toEqual(stopped);
+
+    useSessions.getState().setActive(created.id);
+    vi.spyOn(api, "deleteSession").mockResolvedValue({ ok: true });
+    await useSessions.getState().deleteSession(created.id);
+    expect(useSessions.getState().sessions.created).toBeUndefined();
+    expect(useSessions.getState().activeId).toBeNull();
+  });
+
+  it("inserts fork and handoff responses before selecting them", async () => {
+    const fork = session("fork", { parent_session_id: "source" });
+    vi.spyOn(api, "forkSession").mockResolvedValue(fork);
+    await useSessions
+      .getState()
+      .forkSession("source", { name: "fork", focus: "alternate path" });
+    expect(useSessions.getState().sessions.fork).toEqual(fork);
+
+    const target = session("target", { state: "waiting", last_activity: 20 });
+    vi.spyOn(api, "handoffSession").mockResolvedValue(target);
+    await useSessions.getState().handoffSession("source", {
+      target_session_id: "target",
+      focus: "continue here",
+    });
+    expect(useSessions.getState().sessions.target).toEqual(target);
   });
 });

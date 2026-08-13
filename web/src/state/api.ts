@@ -219,7 +219,6 @@ export interface RuntimeDiagnosticsSnapshot {
 }
 
 export const api = {
-  listSessions: () => req<Session[]>("GET", "/api/sessions"),
   listBackends: () => req<BackendInfo[]>("GET", "/api/backends"),
   createSession: (r: CreateSessionRequest) =>
     req<Session>("POST", "/api/sessions", r),
