@@ -18,7 +18,7 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use tokio::sync::{broadcast, RwLock};
 
 const BROADCAST_CAP: usize = 256;
@@ -169,7 +169,7 @@ pub struct SessionManager {
     /// Serialize lifecycle mutations per session. This prevents two Resume
     /// requests from spawning duplicate attach PTYs without making a slow
     /// remote operation block unrelated sessions.
-    operation_locks: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    operation_locks: StdMutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     pub(super) backend_metadata: Arc<BackendMetadata>,
     /// Cached runtime/toolchain health per local or SSH target. The same
     /// snapshot powers the diagnostics UI and create-time preflight, so
@@ -214,7 +214,10 @@ impl SessionManager {
         state: SessionState,
         last_activity: i64,
     ) {
-        let _ = self.store.update_state(id, state, last_activity).await;
+        if let Err(error) = self.store.update_state(id, state, last_activity).await {
+            tracing::warn!(session = id, error = %format!("{error:#}"), "persist classification");
+            return;
+        }
         self.emit(SessionEvent::SessionState {
             id: id.to_string(),
             state,
@@ -225,10 +228,14 @@ impl SessionManager {
         if session.state == state {
             return;
         }
-        let _ = self
+        if let Err(error) = self
             .store
             .update_state(&session.id, state, session.last_activity)
-            .await;
+            .await
+        {
+            tracing::warn!(session = %session.id, error = %format!("{error:#}"), "persist unattached state");
+            return;
+        }
         self.emit(SessionEvent::SessionState {
             id: session.id.clone(),
             state,
@@ -236,12 +243,17 @@ impl SessionManager {
     }
 
     pub(super) fn operation_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        self.operation_locks
+        let mut locks = self
+            .operation_locks
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(id.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(id.to_string(), Arc::downgrade(&lock));
+        lock
     }
 
     async fn running_session(&self, id: &str) -> Option<Arc<RunningSession>> {
