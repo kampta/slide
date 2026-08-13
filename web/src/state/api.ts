@@ -193,6 +193,7 @@ export type RuntimeStatus =
 
 export interface RuntimeDiagnostic {
   backend: Backend;
+  label: string;
   status: RuntimeStatus;
   available: boolean;
   installed: boolean;

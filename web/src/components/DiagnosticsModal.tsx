@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import {
   api,
-  type RuntimeDiagnostic,
   type RuntimeDiagnosticsSnapshot,
   type RuntimeStatus,
   type SshHost,
@@ -24,21 +23,6 @@ export function runtimeLabel(status: RuntimeStatus): string {
       return "Sign-in required";
     case "broken":
       return "Probe failed";
-  }
-}
-
-function backendLabel(backend: RuntimeDiagnostic["backend"]): string {
-  switch (backend) {
-    case "claude":
-      return "Claude Code";
-    case "codex":
-      return "Codex";
-    case "grok":
-      return "Grok";
-    case "agy":
-      return "Antigravity";
-    case "opencode":
-      return "OpenCode";
   }
 }
 
@@ -165,7 +149,7 @@ export function DiagnosticsModal({
                   className={`diagnostic-card diagnostic-${runtimeTone(diagnostic.status)}`}
                 >
                   <div className="diagnostic-card-title">
-                    <strong>{backendLabel(diagnostic.backend)}</strong>
+                    <strong>{diagnostic.label}</strong>
                     <span>{runtimeLabel(diagnostic.status)}</span>
                     {diagnostic.version && <code>{diagnostic.version}</code>}
                   </div>

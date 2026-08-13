@@ -28,6 +28,7 @@ pub enum RuntimeStatus {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RuntimeDiagnostic {
     pub backend: BackendKind,
+    pub label: &'static str,
     pub status: RuntimeStatus,
     pub available: bool,
     pub installed: bool,
@@ -327,6 +328,7 @@ fn unreachable_snapshot(host: &str) -> RuntimeDiagnosticsSnapshot {
             .into_iter()
             .map(|backend| RuntimeDiagnostic {
                 backend,
+                label: runtime_spec(backend).label,
                 status: RuntimeStatus::Broken,
                 available: false,
                 installed: false,
@@ -554,6 +556,7 @@ fn ready(
 ) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
         backend: spec.backend,
+        label: spec.label,
         status: RuntimeStatus::Ready,
         available: true,
         installed: true,
@@ -568,6 +571,7 @@ fn ready(
 fn missing(spec: RuntimeSpec) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
         backend: spec.backend,
+        label: spec.label,
         status: RuntimeStatus::Missing,
         available: false,
         installed: false,
@@ -585,6 +589,7 @@ fn missing(spec: RuntimeSpec) -> RuntimeDiagnostic {
 fn unauthenticated(spec: RuntimeSpec, version: Option<String>) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
         backend: spec.backend,
+        label: spec.label,
         status: RuntimeStatus::Unauthenticated,
         available: false,
         installed: true,
@@ -599,6 +604,7 @@ fn unauthenticated(spec: RuntimeSpec, version: Option<String>) -> RuntimeDiagnos
 fn broken(spec: RuntimeSpec, message: &str) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
         backend: spec.backend,
+        label: spec.label,
         status: RuntimeStatus::Broken,
         available: false,
         installed: true,
