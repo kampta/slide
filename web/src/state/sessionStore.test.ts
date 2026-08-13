@@ -8,6 +8,7 @@ function session(id: string, overrides: Partial<Session> = {}): Session {
     id,
     name: id,
     backend: "claude",
+    execution_policy: "unrestricted",
     location: "local",
     base_dir: "/code/slide",
     project_path: `/code/slide/.slide-worktrees/${id}`,

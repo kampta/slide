@@ -2,6 +2,7 @@ export type Backend = "claude" | "codex" | "grok" | "agy" | "opencode";
 export type Location = "local" | "remote";
 export type SessionState = "active" | "waiting" | "unknown" | "stopped";
 export type Supervisor = "direct" | "tmux";
+export type ExecutionPolicy = "unrestricted" | "sandboxed_auto";
 
 export interface BackendInfo {
   id: Backend;
@@ -9,6 +10,7 @@ export interface BackendInfo {
   context_usage: boolean;
   subagents: boolean;
   fork: boolean;
+  execution_policies: ExecutionPolicy[];
 }
 
 export interface SshHost {
@@ -22,6 +24,7 @@ export interface Session {
   id: string;
   name: string;
   backend: Backend;
+  execution_policy: ExecutionPolicy;
   location: Location;
   ssh_host?: string | null;
   base_dir: string;
@@ -40,6 +43,7 @@ export interface Session {
 export interface CreateSessionRequest {
   name: string;
   backend: Backend;
+  execution_policy?: ExecutionPolicy;
   base_dir: string;
   location?: Location;
   ssh_host?: string;
@@ -225,7 +229,12 @@ export const api = {
     req<Session>("POST", "/api/sessions", r),
   updateSession: (
     id: string,
-    patch: { name?: string; action?: "stop" | "resume"; backend?: Backend },
+    patch: {
+      name?: string;
+      action?: "stop" | "resume";
+      backend?: Backend;
+      execution_policy?: ExecutionPolicy;
+    },
   ) => req<Session>("PATCH", sessionPath(id), patch),
   deleteSession: (id: string) =>
     req<{ ok: boolean }>("DELETE", sessionPath(id)),

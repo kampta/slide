@@ -277,13 +277,14 @@ pub fn for_session(s: &Session) -> Box<dyn Supervisor> {
 mod tests {
     use super::*;
     use crate::backend::BackendKind;
-    use crate::session::{Location, SessionState};
+    use crate::session::{ExecutionPolicy, Location, SessionState};
 
     fn local_session(supervisor: SupervisorKind) -> Session {
         Session {
             id: "abc".into(),
             name: "smoke".into(),
             backend: BackendKind::Claude,
+            execution_policy: ExecutionPolicy::Unrestricted,
             location: Location::Local,
             ssh_host: None,
             base_dir: "/tmp".into(),

@@ -7,7 +7,9 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 use slide_core::backend::BackendKind;
-use slide_core::session::{CreateSessionRequest, ForkSessionRequest, HandoffRequest};
+use slide_core::session::{
+    CreateSessionRequest, ExecutionPolicy, ForkSessionRequest, HandoffRequest,
+};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -75,6 +77,10 @@ struct UpdateReq {
     /// workspace (provider conversation ids are not portable).
     #[serde(default)]
     backend: Option<BackendKind>,
+    /// Optional process permission policy for a resume. Unsupported backend
+    /// combinations are rejected by slide-core.
+    #[serde(default)]
+    execution_policy: Option<ExecutionPolicy>,
 }
 
 async fn update_session(
@@ -84,8 +90,10 @@ async fn update_session(
 ) -> Response {
     let mgr = &state.manager;
     let result = async {
-        if req.backend.is_some() && req.action.as_deref() != Some("resume") {
-            anyhow::bail!("backend can only be set when action is \"resume\"");
+        if (req.backend.is_some() || req.execution_policy.is_some())
+            && req.action.as_deref() != Some("resume")
+        {
+            anyhow::bail!("launch settings can only be set when action is \"resume\"");
         }
         let mut session = None;
         if let Some(name) = req.name.as_deref() {
@@ -93,7 +101,9 @@ async fn update_session(
         }
         match req.action.as_deref() {
             Some("stop") => session = Some(mgr.stop(&id).await?),
-            Some("resume") => session = Some(mgr.resume(&id, req.backend).await?),
+            Some("resume") => {
+                session = Some(mgr.resume(&id, req.backend, req.execution_policy).await?)
+            }
             Some(other) => anyhow::bail!("unknown action: {other}"),
             None => {}
         }

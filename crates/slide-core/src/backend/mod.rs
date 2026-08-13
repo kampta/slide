@@ -1,5 +1,6 @@
 use crate::classifier::Signals;
-use anyhow::Result;
+use crate::session::ExecutionPolicy;
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::SystemTime;
@@ -82,7 +83,14 @@ pub struct BackendInfo {
     pub context_usage: bool,
     pub subagents: bool,
     pub fork: bool,
+    pub execution_policies: &'static [ExecutionPolicy],
 }
+
+const UNRESTRICTED_ONLY: &[ExecutionPolicy] = &[ExecutionPolicy::Unrestricted];
+const CODEX_POLICIES: &[ExecutionPolicy] = &[
+    ExecutionPolicy::Unrestricted,
+    ExecutionPolicy::SandboxedAuto,
+];
 
 impl BackendKind {
     pub const ALL: [Self; 5] = [
@@ -123,6 +131,7 @@ impl BackendKind {
                 context_usage: true,
                 subagents: false,
                 fork: true,
+                execution_policies: UNRESTRICTED_ONLY,
             },
             Self::Codex => BackendInfo {
                 id: self,
@@ -130,6 +139,7 @@ impl BackendKind {
                 context_usage: false,
                 subagents: true,
                 fork: true,
+                execution_policies: CODEX_POLICIES,
             },
             Self::Grok => BackendInfo {
                 id: self,
@@ -137,6 +147,7 @@ impl BackendKind {
                 context_usage: false,
                 subagents: false,
                 fork: false,
+                execution_policies: UNRESTRICTED_ONLY,
             },
             Self::Antigravity => BackendInfo {
                 id: self,
@@ -144,6 +155,7 @@ impl BackendKind {
                 context_usage: false,
                 subagents: false,
                 fork: false,
+                execution_policies: UNRESTRICTED_ONLY,
             },
             Self::OpenCode => BackendInfo {
                 id: self,
@@ -151,6 +163,7 @@ impl BackendKind {
                 context_usage: false,
                 subagents: false,
                 fork: false,
+                execution_policies: UNRESTRICTED_ONLY,
             },
         }
     }
@@ -166,6 +179,25 @@ pub fn available() -> Vec<BackendInfo> {
 pub trait Backend: Send + Sync {
     fn kind(&self) -> BackendKind;
     fn argv(&self, cwd: &Path) -> Vec<String>;
+
+    /// Apply a session's persisted execution policy to a complete launch
+    /// command. Backends opt in explicitly so Slide never labels an
+    /// unrestricted process as sandboxed.
+    fn apply_execution_policy(
+        &self,
+        policy: ExecutionPolicy,
+        argv: Vec<String>,
+    ) -> Result<Vec<String>> {
+        if matches!(policy, ExecutionPolicy::Unrestricted) {
+            Ok(argv)
+        } else {
+            bail!(
+                "{} does not support the {} execution policy",
+                self.kind().as_str(),
+                policy.as_str()
+            )
+        }
+    }
 
     /// Environment overrides applied only to the backend process. This is
     /// preferable to editing a user's global CLI configuration when a backend
@@ -360,6 +392,11 @@ mod tests {
         let available = available();
         assert_eq!(available.len(), BackendKind::ALL.len());
         assert!(available.iter().all(|backend| !backend.label.is_empty()));
+        assert_eq!(BackendKind::Codex.info().execution_policies, CODEX_POLICIES);
+        assert!(BackendKind::ALL
+            .into_iter()
+            .filter(|kind| *kind != BackendKind::Codex)
+            .all(|kind| kind.info().execution_policies == UNRESTRICTED_ONLY));
         let fork_backends = available
             .iter()
             .filter(|backend| backend.fork)

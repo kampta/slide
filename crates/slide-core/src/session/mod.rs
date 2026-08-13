@@ -7,6 +7,32 @@ mod running;
 use crate::backend::BackendKind;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPolicy {
+    #[default]
+    Unrestricted,
+    SandboxedAuto,
+}
+
+impl ExecutionPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unrestricted => "unrestricted",
+            Self::SandboxedAuto => "sandboxed_auto",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "unrestricted" => Some(Self::Unrestricted),
+            "sandboxed_auto" => Some(Self::SandboxedAuto),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionState {
@@ -106,6 +132,8 @@ pub struct Session {
     pub id: String,
     pub name: String,
     pub backend: BackendKind,
+    #[serde(default)]
+    pub execution_policy: ExecutionPolicy,
     pub location: Location,
     pub ssh_host: Option<String>,
     pub base_dir: String,
@@ -144,6 +172,8 @@ fn default_supervisor() -> SupervisorKind {
 pub struct CreateSessionRequest {
     pub name: String,
     pub backend: BackendKind,
+    #[serde(default)]
+    pub execution_policy: ExecutionPolicy,
     pub base_dir: String,
     #[serde(default)]
     pub project_path: Option<String>,
@@ -196,6 +226,18 @@ mod tests {
             assert_eq!(state.as_str(), s);
             assert_eq!(SessionState::from_str(s), Some(state));
         }
+    }
+
+    #[test]
+    fn execution_policy_roundtrip() {
+        for (policy, value) in [
+            (ExecutionPolicy::Unrestricted, "unrestricted"),
+            (ExecutionPolicy::SandboxedAuto, "sandboxed_auto"),
+        ] {
+            assert_eq!(policy.as_str(), value);
+            assert_eq!(ExecutionPolicy::from_str(value), Some(policy));
+        }
+        assert_eq!(ExecutionPolicy::from_str("sandboxed"), None);
     }
 
     #[test]

@@ -3,8 +3,8 @@ use super::pty;
 use super::recovery::RecoveryCoordinator;
 use super::running::RunningSession;
 use super::{
-    CreateSessionRequest, ForkSessionRequest, HandoffRequest, Location, Session, SessionEvent,
-    SessionState, SupervisorKind,
+    CreateSessionRequest, ExecutionPolicy, ForkSessionRequest, HandoffRequest, Location, Session,
+    SessionEvent, SessionState, SupervisorKind,
 };
 use crate::backend::{self, BackendKind, ContextUsage, SubagentList};
 use crate::config;
@@ -43,6 +43,18 @@ pub(super) fn check_id(id: &str) -> Result<()> {
         bail!("invalid session id");
     }
     Ok(())
+}
+
+fn validate_execution_policy(backend: BackendKind, policy: ExecutionPolicy) -> Result<()> {
+    if backend.info().execution_policies.contains(&policy) {
+        Ok(())
+    } else {
+        bail!(
+            "{} does not support the {} execution policy",
+            backend.as_str(),
+            policy.as_str()
+        )
+    }
 }
 
 fn normalize_focus(value: Option<&str>, required: bool) -> Result<Option<String>> {
@@ -479,6 +491,7 @@ impl SessionManager {
         if matches!(req.location, Location::Remote) && req.ssh_host.is_none() {
             bail!("ssh_host is required for remote sessions");
         }
+        validate_execution_policy(req.backend, req.execution_policy)?;
         // Fail before creating a branch/worktree when the selected runtime
         // cannot launch. This reuses the diagnostics cache populated by the
         // UI, so the common path is only an in-memory lookup.
@@ -543,6 +556,7 @@ impl SessionManager {
             id: id.clone(),
             name: req.name,
             backend: req.backend,
+            execution_policy: req.execution_policy,
             location: req.location,
             ssh_host: req.ssh_host,
             base_dir: base.to_string_lossy().into_owned(),
@@ -635,6 +649,7 @@ impl SessionManager {
         let create = CreateSessionRequest {
             name: request.name,
             backend: source.backend,
+            execution_policy: source.execution_policy,
             base_dir: source.base_dir.clone(),
             project_path: None,
             location: Location::Local,
@@ -705,22 +720,39 @@ impl SessionManager {
         self: &Arc<Self>,
         id: &str,
         backend: Option<BackendKind>,
+        execution_policy: Option<ExecutionPolicy>,
     ) -> Result<Session> {
         check_id(id)?;
         let operation = self.operation_lock(id);
         let _guard = operation.lock().await;
         let mut session = self.find(id).await?;
-        // If already running, no-op — unless a backend switch was requested.
+        // If already running, no-op unless the launch configuration changes.
         if self.running.read().await.contains_key(id) {
-            if backend.is_some_and(|b| b != session.backend) {
-                bail!("cannot switch backend while session is running; stop it first");
+            if backend.is_some_and(|value| value != session.backend)
+                || execution_policy.is_some_and(|value| value != session.execution_policy)
+            {
+                bail!("cannot change launch settings while session is running; stop it first");
             }
             return Ok(session);
         }
         let switch_backend = backend.filter(|b| *b != session.backend);
         let previous_backend = session.backend;
+        let previous_execution_policy = session.execution_policy;
         let previous_backend_session_id = session.backend_session_id.clone();
         let requested_backend = switch_backend.unwrap_or(session.backend);
+        // A backend switch without an explicit policy adopts that backend's
+        // safe-to-describe default. Today all non-Codex backends support only
+        // unrestricted execution, so retaining a Codex sandbox label would
+        // be false and is never allowed.
+        let requested_execution_policy = execution_policy.unwrap_or_else(|| {
+            if switch_backend.is_some() {
+                ExecutionPolicy::Unrestricted
+            } else {
+                session.execution_policy
+            }
+        });
+        validate_execution_policy(requested_backend, requested_execution_policy)?;
+        let switch_execution_policy = requested_execution_policy != session.execution_policy;
         // Preflight before changing persisted provider identity. A missing or
         // unauthenticated runtime must leave the old resume target untouched.
         let diagnostic_host = session
@@ -730,9 +762,16 @@ impl SessionManager {
         self.preflight_runtime(requested_backend, diagnostic_host)
             .await?;
         if let Some(new_backend) = switch_backend {
-            self.store.update_backend(id, new_backend).await?;
+            self.store
+                .update_backend(id, new_backend, requested_execution_policy)
+                .await?;
             // Provider-scoped metadata is invalid after a backend switch.
             self.backend_metadata.clear_session(id).await;
+            session = self.find(id).await?;
+        } else if switch_execution_policy {
+            self.store
+                .update_execution_policy(id, requested_execution_policy)
+                .await?;
             session = self.find(id).await?;
         }
         session.state = SessionState::Active;
@@ -759,9 +798,19 @@ impl SessionManager {
             if switch_backend.is_some() {
                 let _ = self
                     .store
-                    .restore_backend(id, previous_backend, previous_backend_session_id.as_deref())
+                    .restore_backend(
+                        id,
+                        previous_backend,
+                        previous_execution_policy,
+                        previous_backend_session_id.as_deref(),
+                    )
                     .await;
                 self.backend_metadata.clear_session(id).await;
+            } else if switch_execution_policy {
+                let _ = self
+                    .store
+                    .update_execution_policy(id, previous_execution_policy)
+                    .await;
             }
             self.runtime_diagnostics
                 .record_launch_failure(session.backend, session.ssh_host.as_deref());
@@ -851,6 +900,8 @@ impl SessionManager {
                     .fork_argv(&host_cwd, provider_session_id, prompt.as_deref())
                     .context("backend does not support provider-native forks")?,
             };
+            let backend_argv =
+                backend.apply_execution_policy(session.execution_policy, backend_argv)?;
             let mut backend_env = backend.env();
             backend_env.push(("SLIDE_SESSION_ID".to_string(), session.id.clone()));
 
@@ -933,7 +984,11 @@ impl SessionManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_handoff_prompt, newest_chars, normalize_focus, valid_id};
+    use super::{
+        build_handoff_prompt, newest_chars, normalize_focus, valid_id, validate_execution_policy,
+    };
+    use crate::backend::BackendKind;
+    use crate::session::ExecutionPolicy;
 
     #[test]
     fn valid_id_accepts_uuid_shape() {
@@ -962,6 +1017,17 @@ mod tests {
         ] {
             assert!(!valid_id(bad), "accepted {bad:?}");
         }
+    }
+
+    #[test]
+    fn sandboxed_auto_is_only_accepted_for_codex() {
+        assert!(
+            validate_execution_policy(BackendKind::Codex, ExecutionPolicy::SandboxedAuto,).is_ok()
+        );
+        assert!(
+            validate_execution_policy(BackendKind::Claude, ExecutionPolicy::SandboxedAuto,)
+                .is_err()
+        );
     }
 
     #[test]

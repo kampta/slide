@@ -1,5 +1,5 @@
 use crate::backend::BackendKind;
-use crate::session::{Location, Session, SessionState, SupervisorKind};
+use crate::session::{ExecutionPolicy, Location, Session, SessionState, SupervisorKind};
 use anyhow::{Context, Result};
 use rusqlite::{params, OptionalExtension, Row};
 use std::path::Path;
@@ -87,6 +87,11 @@ const MIGRATIONS: &[&str] = &[
     r#"
     DROP TABLE IF EXISTS turn_diffs;
     "#,
+    // v8 → v9: durable process permission policy. Existing sessions retain
+    // the historical unrestricted behavior.
+    r#"
+    ALTER TABLE sessions ADD COLUMN execution_policy TEXT NOT NULL DEFAULT 'unrestricted';
+    "#,
 ];
 
 async fn migrate(conn: &Connection) -> Result<()> {
@@ -133,6 +138,8 @@ fn session_from_row(r: &Row<'_>) -> rusqlite::Result<Session> {
         id: r.get(0)?,
         name: r.get(1)?,
         backend: BackendKind::from_str(&r.get::<_, String>(2)?).unwrap_or(BackendKind::Claude),
+        execution_policy: ExecutionPolicy::from_str(&r.get::<_, String>(16)?)
+            .unwrap_or(ExecutionPolicy::Unrestricted),
         location: Location::from_str(&r.get::<_, String>(3)?).unwrap_or(Location::Local),
         ssh_host: r.get(4)?,
         base_dir: r.get(5)?,
@@ -152,7 +159,7 @@ fn session_from_row(r: &Row<'_>) -> rusqlite::Result<Session> {
 
 const SESSION_COLUMNS: &str =
     "id, name, backend, location, ssh_host, base_dir, project_path, worktree, state, \
-     created_at, last_activity, supervisor, host_log_path, log_offset, backend_session_id, parent_session_id";
+     created_at, last_activity, supervisor, host_log_path, log_offset, backend_session_id, parent_session_id, execution_policy";
 impl Store {
     pub async fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -170,8 +177,8 @@ impl Store {
                 c.execute(
                     "INSERT INTO sessions \
                      (id, name, backend, location, ssh_host, base_dir, project_path, worktree, state, created_at, last_activity, \
-                      supervisor, host_log_path, log_offset, backend_session_id, parent_session_id) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                      supervisor, host_log_path, log_offset, backend_session_id, parent_session_id, execution_policy) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                     params![
                         s.id,
                         s.name,
@@ -189,6 +196,7 @@ impl Store {
                         s.log_offset,
                         s.backend_session_id,
                         s.parent_session_id,
+                        s.execution_policy.as_str(),
                     ],
                 )?;
                 Ok(())
@@ -234,14 +242,20 @@ impl Store {
     /// Switch the session's LLM backend. Clears `backend_session_id` because
     /// provider conversation ids are not portable across backends — resume
     /// after a switch always starts a fresh conversation.
-    pub async fn update_backend(&self, id: &str, backend: BackendKind) -> Result<()> {
+    pub async fn update_backend(
+        &self,
+        id: &str,
+        backend: BackendKind,
+        execution_policy: ExecutionPolicy,
+    ) -> Result<()> {
         let id = id.to_string();
         let backend = backend.as_str().to_string();
+        let execution_policy = execution_policy.as_str().to_string();
         self.conn
             .call(move |c| {
                 c.execute(
-                    "UPDATE sessions SET backend=?1, backend_session_id=NULL WHERE id=?2",
-                    params![backend, id],
+                    "UPDATE sessions SET backend=?1, execution_policy=?2, backend_session_id=NULL WHERE id=?3",
+                    params![backend, execution_policy, id],
                 )?;
                 Ok(())
             })
@@ -250,20 +264,42 @@ impl Store {
         Ok(())
     }
 
+    pub async fn update_execution_policy(
+        &self,
+        id: &str,
+        execution_policy: ExecutionPolicy,
+    ) -> Result<()> {
+        let id = id.to_string();
+        let execution_policy = execution_policy.as_str().to_string();
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE sessions SET execution_policy=?1 WHERE id=?2",
+                    params![execution_policy, id],
+                )?;
+                Ok(())
+            })
+            .await
+            .context("update execution policy")?;
+        Ok(())
+    }
+
     pub async fn restore_backend(
         &self,
         id: &str,
         backend: BackendKind,
+        execution_policy: ExecutionPolicy,
         backend_session_id: Option<&str>,
     ) -> Result<()> {
         let id = id.to_string();
         let backend = backend.as_str().to_string();
+        let execution_policy = execution_policy.as_str().to_string();
         let backend_session_id = backend_session_id.map(str::to_string);
         self.conn
             .call(move |c| {
                 c.execute(
-                    "UPDATE sessions SET backend=?1, backend_session_id=?2 WHERE id=?3",
-                    params![backend, backend_session_id, id],
+                    "UPDATE sessions SET backend=?1, execution_policy=?2, backend_session_id=?3 WHERE id=?4",
+                    params![backend, execution_policy, backend_session_id, id],
                 )?;
                 Ok(())
             })
@@ -385,6 +421,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             backend: BackendKind::Claude,
+            execution_policy: ExecutionPolicy::Unrestricted,
             location: Location::Local,
             ssh_host: None,
             base_dir: "/tmp".to_string(),
@@ -463,12 +500,31 @@ mod tests {
         store.insert(&session).await.unwrap();
 
         store
-            .update_backend("id1", BackendKind::Codex)
+            .update_backend("id1", BackendKind::Codex, ExecutionPolicy::SandboxedAuto)
             .await
             .unwrap();
         let got = store.get("id1").await.unwrap().unwrap();
         assert_eq!(got.backend, BackendKind::Codex);
+        assert_eq!(got.execution_policy, ExecutionPolicy::SandboxedAuto);
         assert!(got.backend_session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_execution_policy_preserves_backend_identity() {
+        let store = mem_store().await;
+        let mut session = make_session("id1", "s1");
+        session.backend = BackendKind::Codex;
+        session.backend_session_id = Some("codex-thread".into());
+        store.insert(&session).await.unwrap();
+
+        store
+            .update_execution_policy("id1", ExecutionPolicy::SandboxedAuto)
+            .await
+            .unwrap();
+        let got = store.get("id1").await.unwrap().unwrap();
+        assert_eq!(got.backend, BackendKind::Codex);
+        assert_eq!(got.execution_policy, ExecutionPolicy::SandboxedAuto);
+        assert_eq!(got.backend_session_id.as_deref(), Some("codex-thread"));
     }
 
     #[tokio::test]
@@ -479,11 +535,16 @@ mod tests {
         store.insert(&session).await.unwrap();
 
         store
-            .update_backend("id1", BackendKind::Codex)
+            .update_backend("id1", BackendKind::Codex, ExecutionPolicy::SandboxedAuto)
             .await
             .unwrap();
         store
-            .restore_backend("id1", BackendKind::Claude, Some("claude-thread"))
+            .restore_backend(
+                "id1",
+                BackendKind::Claude,
+                ExecutionPolicy::Unrestricted,
+                Some("claude-thread"),
+            )
             .await
             .unwrap();
 
@@ -505,7 +566,7 @@ mod tests {
             .await
             .unwrap());
         store
-            .update_backend("id1", BackendKind::Codex)
+            .update_backend("id1", BackendKind::Codex, ExecutionPolicy::Unrestricted)
             .await
             .unwrap();
         assert!(!store
@@ -550,6 +611,7 @@ mod tests {
             id: "abc".to_string(),
             name: "remote-session".to_string(),
             backend: BackendKind::Codex,
+            execution_policy: ExecutionPolicy::SandboxedAuto,
             location: Location::Remote,
             ssh_host: Some("user@host".to_string()),
             base_dir: "/home/user".to_string(),
@@ -568,6 +630,7 @@ mod tests {
         let list = store.list().await.unwrap();
         let got = &list[0];
         assert_eq!(got.backend, BackendKind::Codex);
+        assert_eq!(got.execution_policy, ExecutionPolicy::SandboxedAuto);
         assert_eq!(got.location, Location::Remote);
         assert_eq!(got.ssh_host.as_deref(), Some("user@host"));
         assert!(got.worktree);
@@ -629,6 +692,7 @@ mod tests {
         assert_eq!(got.log_offset, 0);
         assert!(got.backend_session_id.is_none());
         assert!(got.parent_session_id.is_none());
+        assert_eq!(got.execution_policy, ExecutionPolicy::Unrestricted);
 
         // user_version should now match the current schema.
         let conn = SyncConnection::open(path).unwrap();
@@ -725,6 +789,32 @@ mod tests {
             )
             .unwrap();
         assert!(!exists);
+    }
+
+    #[tokio::test]
+    async fn migration_v9_preserves_unrestricted_behavior() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        {
+            let conn = SyncConnection::open(path).unwrap();
+            for migration in &MIGRATIONS[..8] {
+                conn.execute_batch(migration).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO sessions
+                 (id, name, backend, location, base_dir, project_path, worktree, state,
+                  created_at, last_activity, supervisor)
+                 VALUES ('existing', 'existing', 'codex', 'local', '/tmp', '/tmp/p',
+                         0, 'stopped', 1, 2, 'direct')",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA user_version = 8").unwrap();
+        }
+
+        let store = Store::open(path).await.unwrap();
+        let session = store.get("existing").await.unwrap().unwrap();
+        assert_eq!(session.execution_policy, ExecutionPolicy::Unrestricted);
     }
 
     #[tokio::test]

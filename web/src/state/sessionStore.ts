@@ -53,13 +53,14 @@ function sortOrder(a: Session, b: Session): number {
 
 /// Field-by-field equality so `upsert` can skip rebuilding `sessions` and
 /// re-sorting `order` when an event delivers no observable change.
-/// Cheap (15 primitive comparisons) and dodges every memoized child
+/// Cheap primitive comparisons that dodge every memoized child
 /// re-render that would have followed a no-op store write.
 function sessionsEqual(a: Session, b: Session): boolean {
   return (
     a.id === b.id &&
     a.name === b.name &&
     a.backend === b.backend &&
+    a.execution_policy === b.execution_policy &&
     a.location === b.location &&
     a.ssh_host === b.ssh_host &&
     a.base_dir === b.base_dir &&

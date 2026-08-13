@@ -100,7 +100,7 @@ fn shell_quote(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::backend::BackendKind;
-    use crate::session::{SessionState, SupervisorKind};
+    use crate::session::{ExecutionPolicy, SessionState, SupervisorKind};
 
     #[test]
     fn local_tail_reads_only_the_requested_suffix() {
@@ -111,6 +111,7 @@ mod tests {
             id: "tail".to_string(),
             name: "tail".to_string(),
             backend: BackendKind::Codex,
+            execution_policy: ExecutionPolicy::Unrestricted,
             location: Location::Local,
             ssh_host: None,
             base_dir: "/tmp".to_string(),
@@ -145,6 +146,7 @@ mod tests {
             id: "large".to_string(),
             name: "large".to_string(),
             backend: BackendKind::Codex,
+            execution_policy: ExecutionPolicy::Unrestricted,
             location: Location::Local,
             ssh_host: None,
             base_dir: "/tmp".to_string(),

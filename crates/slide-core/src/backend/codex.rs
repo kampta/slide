@@ -1,6 +1,7 @@
 use super::{codex_subagents, Backend, BackendKind, SubagentSnapshot};
 use crate::classifier::{common_needs_input_signals, Signals};
-use anyhow::Result;
+use crate::session::ExecutionPolicy;
+use anyhow::{Context, Result};
 use regex::Regex;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -149,6 +150,32 @@ impl Backend for CodexBackend {
         argv_with_permissions()
     }
 
+    fn apply_execution_policy(
+        &self,
+        policy: ExecutionPolicy,
+        mut argv: Vec<String>,
+    ) -> Result<Vec<String>> {
+        match policy {
+            ExecutionPolicy::Unrestricted => Ok(argv),
+            ExecutionPolicy::SandboxedAuto => {
+                let bypass = argv
+                    .iter()
+                    .position(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
+                    .context("Codex launch command is missing its execution policy flag")?;
+                argv.splice(
+                    bypass..=bypass,
+                    [
+                        "--sandbox".into(),
+                        "workspace-write".into(),
+                        "--ask-for-approval".into(),
+                        "never".into(),
+                    ],
+                );
+                Ok(argv)
+            }
+        }
+    }
+
     fn signals(&self) -> &'static Signals {
         signals()
     }
@@ -227,6 +254,46 @@ mod tests {
                 "abc-123"
             ]
         );
+    }
+
+    #[test]
+    fn sandboxed_auto_replaces_unrestricted_flags_for_every_launch_kind() {
+        let backend = CodexBackend::new();
+        for argv in [
+            backend.argv(Path::new("/tmp")),
+            backend.resume_argv(Path::new("/tmp"), "abc-123").unwrap(),
+            backend.resume_latest_argv(Path::new("/tmp")).unwrap(),
+            backend
+                .fork_argv(Path::new("/tmp"), "abc-123", Some("focus"))
+                .unwrap(),
+        ] {
+            let argv = backend
+                .apply_execution_policy(ExecutionPolicy::SandboxedAuto, argv)
+                .unwrap();
+            assert_eq!(
+                &argv[..5],
+                [
+                    "codex",
+                    "--sandbox",
+                    "workspace-write",
+                    "--ask-for-approval",
+                    "never"
+                ]
+            );
+            assert!(!argv
+                .iter()
+                .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+        }
+    }
+
+    #[test]
+    fn sandboxed_auto_reports_a_malformed_launch_command() {
+        let error = CodexBackend::new()
+            .apply_execution_policy(ExecutionPolicy::SandboxedAuto, vec!["codex".to_string()])
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("missing its execution policy flag"));
     }
 
     #[test]

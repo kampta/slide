@@ -6,6 +6,7 @@ const session: Session = {
   id: "session-1",
   name: "auth-refactor",
   backend: "codex",
+  execution_policy: "unrestricted",
   location: "remote",
   ssh_host: "buildbox",
   base_dir: "/code/slide",

@@ -14,4 +14,4 @@ mod terminal_text;
 pub mod tmux;
 
 pub use session::manager::SessionManager;
-pub use session::{CreateSessionRequest, Session, SessionEvent, SessionState};
+pub use session::{CreateSessionRequest, ExecutionPolicy, Session, SessionEvent, SessionState};

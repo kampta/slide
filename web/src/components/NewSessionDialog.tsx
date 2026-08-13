@@ -3,6 +3,7 @@ import {
   api,
   type Backend,
   type BackendInfo,
+  type ExecutionPolicy,
   type Location,
   type SshHost,
 } from "../state/api";
@@ -74,6 +75,8 @@ export function NewSessionDialog({
   const [name, setName] = useState("");
   const [backend, setBackend] = useState<Backend>("claude");
   const [backends, setBackends] = useState<BackendInfo[]>([]);
+  const [executionPolicy, setExecutionPolicy] =
+    useState<ExecutionPolicy>("unrestricted");
   const [location, setLocation] = useState<Location>("local");
   const [sshHost, setSshHost] = useState("");
   const [sshHosts, setSshHosts] = useState<SshHost[]>([]);
@@ -101,6 +104,7 @@ export function NewSessionDialog({
   }, []);
 
   const cluster = clusterKey(location, sshHost);
+  const selectedBackend = backends.find((item) => item.id === backend);
 
   useEffect(() => {
     if (open) {
@@ -153,6 +157,7 @@ export function NewSessionDialog({
       const s = await createSession({
         name: name.trim(),
         backend,
+        execution_policy: executionPolicy,
         location,
         ssh_host: location === "remote" ? sshHost.trim() : undefined,
         base_dir: baseDir.trim(),
@@ -219,13 +224,40 @@ export function NewSessionDialog({
                 key={item.id}
                 type="button"
                 className={backend === item.id ? "active" : ""}
-                onClick={() => setBackend(item.id)}
+                onClick={() => {
+                  setBackend(item.id);
+                  if (!item.execution_policies.includes(executionPolicy)) {
+                    setExecutionPolicy("unrestricted");
+                  }
+                }}
               >
                 {item.label}
               </button>
             ))}
           </div>
         </fieldset>
+        {selectedBackend && selectedBackend.execution_policies.length > 1 && (
+          <fieldset className="form-field">
+            <legend>Permissions</legend>
+            <div className="btn-group btn-group-wrap">
+              {selectedBackend.execution_policies.map((policy) => (
+                <button
+                  key={policy}
+                  type="button"
+                  className={executionPolicy === policy ? "active" : ""}
+                  onClick={() => setExecutionPolicy(policy)}
+                  title={
+                    policy === "sandboxed_auto"
+                      ? "Use Codex's workspace-write sandbox and never pause for approvals"
+                      : "Bypass approvals and filesystem sandboxing"
+                  }
+                >
+                  {policy === "sandboxed_auto" ? "Sandboxed auto" : "Unrestricted"}
+                </button>
+              ))}
+            </div>
+          </fieldset>
+        )}
         <label>
           <span>{location === "remote" ? "Remote directory" : "Base directory"}</span>
           <div className="dir-input-row">
