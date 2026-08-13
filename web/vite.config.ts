@@ -23,5 +23,15 @@ export default defineConfig({
   build: {
     outDir: "dist",
     emptyOutDir: true,
+    rollupOptions: {
+      input: {
+        app: "index.html",
+        sw: "src/serviceWorker.js",
+      },
+      output: {
+        entryFileNames: (chunk) =>
+          chunk.name === "sw" ? "sw.js" : "assets/[name]-[hash].js",
+      },
+    },
   },
 });

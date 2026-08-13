@@ -53,6 +53,8 @@ It serves the embedded UI and API on `http://127.0.0.1:7777` and opens the authe
 
 For access from another device, run `./target/release/slide serve --lan`, then use `./target/release/slide pair` to print the pairing URLs and QR codes. Only expose Slide on a trusted network.
 
+On a phone, open the paired URL once, then use the browser's **Add to Home Screen** or **Install app** action. The installed shell can open offline, but session data and terminal connections still require the Slide daemon; API and WebSocket traffic is never cached.
+
 Re-run both build commands whenever the frontend changes. Rust-only changes require only the Cargo build.
 
 Restarting the Slide daemon reattaches existing tmux-backed agents; it does not relaunch them. After changing backend launch options, use Stop and then Resume on an existing session to start that backend with the new options.
