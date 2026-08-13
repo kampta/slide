@@ -36,10 +36,6 @@ export const TerminalView = forwardRef<
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  // Set once *either* the WS snapshot or the disk-log fetch has populated
-  // the terminal for the current sessionId. Prevents re-writing the disk
-  // log on Active↔Stopped toggles, which would duplicate scrollback.
-  const backfilledRef = useRef(false);
   const isMobile = useIsMobile();
 
   useImperativeHandle(
@@ -58,8 +54,6 @@ export const TerminalView = forwardRef<
   // WebSocket is torn up and down (handled in the second effect).
   useEffect(() => {
     if (!hostRef.current) return;
-    backfilledRef.current = false;
-
     const term = new Terminal({
       convertEol: false,
       cursorBlink: true,
@@ -152,7 +146,13 @@ export const TerminalView = forwardRef<
       term.dispose();
       termRef.current = null;
     };
-  }, [sessionId, isMobile]);
+  }, [sessionId, supervisor]);
+
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+    term.options.fontSize = isMobile ? 12 : 13;
+  }, [isMobile]);
 
   // Manage the data source. `live=true` opens a WebSocket whose first frame
   // is a server-side snapshot atomic with the live subscription (see
@@ -190,7 +190,6 @@ export const TerminalView = forwardRef<
         ws.onmessage = (e) => {
           if (e.data instanceof ArrayBuffer) {
             term.write(new Uint8Array(e.data));
-            backfilledRef.current = true;
             return;
           }
           if (typeof e.data !== "string") return;
@@ -222,18 +221,22 @@ export const TerminalView = forwardRef<
       };
     }
 
-    if (backfilledRef.current) return;
     let cancelled = false;
     (async () => {
       try {
         const bytes = await api.getLog(sessionId);
-        if (!cancelled && bytes.length > 0) {
+        if (!cancelled) {
+          // The persisted stopped log is the canonical final snapshot. Reset
+          // before writing so the last PTY frames cannot be lost or duplicated
+          // when lifecycle and output sockets close in different orders.
+          term.reset();
+          term.clear();
           term.write(bytes);
-          backfilledRef.current = true;
         }
       } catch {
-        // brand-new session or transient failure; if live mode is enabled
-        // later, the WS snapshot will fill the terminal.
+        if (!cancelled) {
+          term.writeln("\r\n\x1b[2m[slide] terminal history unavailable; reopen to retry\x1b[0m");
+        }
       }
     })();
     return () => {

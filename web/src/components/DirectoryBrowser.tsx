@@ -1,6 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../state/api";
 import { parentPath } from "../state/path";
+
+export function isLatestRequest(request: number, latest: number): boolean {
+  return request === latest;
+}
 
 export function DirectoryBrowser({
   startPath,
@@ -15,9 +19,11 @@ export function DirectoryBrowser({
   const [entries, setEntries] = useState<{ name: string; path: string }[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const requestId = useRef(0);
 
   const load = useCallback(
     async (target: string) => {
+      const current = ++requestId.current;
       setLoading(true);
       setError(null);
       try {
@@ -25,13 +31,15 @@ export function DirectoryBrowser({
           path: target || undefined,
           host: host ?? undefined,
         });
+        if (!isLatestRequest(current, requestId.current)) return;
         setPath(result.path);
         setEntries(result.entries);
         onSelect(result.path);
       } catch (cause) {
+        if (!isLatestRequest(current, requestId.current)) return;
         setError(cause instanceof Error ? cause.message : String(cause));
       } finally {
-        setLoading(false);
+        if (isLatestRequest(current, requestId.current)) setLoading(false);
       }
     },
     [host, onSelect],
@@ -64,7 +72,9 @@ export function DirectoryBrowser({
         </code>
       </div>
       {error ? (
-        <div className="dir-browser-error">{error}</div>
+        <div className="dir-browser-error" role="alert">
+          {error}
+        </div>
       ) : (
         <ul className="dir-browser-list">
           {entries.length === 0 && !loading && (

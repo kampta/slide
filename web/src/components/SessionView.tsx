@@ -87,23 +87,25 @@ export function SessionView() {
   // expose context usage return null, so adding one needs no frontend branch.
   useEffect(() => {
     setUsage(null);
-    if (!session?.backend_session_id) return;
+    if (!session?.backend_session_id || session.state === "stopped") return;
     let cancelled = false;
+    let timer: number | null = null;
     const tick = async () => {
       try {
         const u = await api.getContext(session.id);
         if (!cancelled) setUsage(u);
       } catch {
         if (!cancelled) setUsage(null);
+      } finally {
+        if (!cancelled) timer = window.setTimeout(tick, 5000);
       }
     };
-    tick();
-    const iv = window.setInterval(tick, 5000);
+    void tick();
     return () => {
       cancelled = true;
-      window.clearInterval(iv);
+      if (timer !== null) window.clearTimeout(timer);
     };
-  }, [session?.id, session?.backend_session_id]);
+  }, [session?.id, session?.backend_session_id, session?.state]);
 
   // Load backends once for the stopped-session resume picker.
   useEffect(() => {
