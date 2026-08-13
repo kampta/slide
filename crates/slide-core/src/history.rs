@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
+pub(crate) const DEFAULT_TAIL_BYTES: usize = 2 * 1024 * 1024;
 const REMOTE_STDERR_LIMIT: usize = 16 * 1024;
 const REMOTE_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -64,6 +65,30 @@ fn read_remote_tail(session: &Session, limit: usize) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+pub(crate) fn remove_remote_log(session: &Session) -> Result<()> {
+    let host = session
+        .ssh_host
+        .as_deref()
+        .context("remote session missing SSH host")?;
+    crate::ssh::validate_host(host)?;
+    let path = session
+        .host_log_path
+        .as_deref()
+        .context("remote session missing log path")?;
+    let remote = format!("rm -f -- {}", shell_quote(path));
+    let mut command = Command::new("ssh");
+    command
+        .args(["-o", "BatchMode=yes"])
+        .args(crate::ssh::ssh_args())
+        .arg(host)
+        .arg(remote);
+    let output = crate::process::run_bounded(command, 0, REMOTE_STDERR_LIMIT, REMOTE_TIMEOUT)?;
+    if output.timed_out || output.stderr_truncated || !output.success {
+        bail!("remote session log cleanup failed");
+    }
+    Ok(())
+}
+
 fn shell_quote(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
@@ -108,5 +133,36 @@ mod tests {
     #[test]
     fn remote_paths_are_shell_quoted() {
         assert_eq!(shell_quote("/tmp/it's here"), "'/tmp/it'\\''s here'");
+    }
+
+    #[test]
+    fn local_tail_bounds_large_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.log");
+        let file = File::create(&path).unwrap();
+        file.set_len((DEFAULT_TAIL_BYTES * 4) as u64).unwrap();
+        let session = Session {
+            id: "large".to_string(),
+            name: "large".to_string(),
+            backend: BackendKind::Codex,
+            location: Location::Local,
+            ssh_host: None,
+            base_dir: "/tmp".to_string(),
+            project_path: "/tmp/project".to_string(),
+            worktree: false,
+            state: SessionState::Stopped,
+            created_at: 1,
+            last_activity: 2,
+            supervisor: SupervisorKind::Direct,
+            host_log_path: Some(path.to_string_lossy().into_owned()),
+            log_offset: 0,
+            backend_session_id: None,
+            parent_session_id: None,
+        };
+
+        assert_eq!(
+            read_tail(&session, DEFAULT_TAIL_BYTES).unwrap().len(),
+            DEFAULT_TAIL_BYTES
+        );
     }
 }

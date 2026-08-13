@@ -9,6 +9,7 @@ use super::{
 use crate::backend::{self, BackendKind, ContextUsage, SubagentList};
 use crate::config;
 use crate::git;
+use crate::history;
 use crate::runtime::{RuntimeDiagnosticsCache, RuntimeDiagnosticsSnapshot};
 use crate::store::Store;
 use crate::supervisor::{self, SpawnReq};
@@ -269,12 +270,15 @@ impl SessionManager {
         if let Some(r) = self.running_session(id).await {
             return Ok(r.snapshot().await);
         }
-        let path = config::logs_dir().join(format!("{id}.log"));
-        if path.exists() {
-            Ok(tokio::fs::read(&path).await?)
-        } else {
-            Ok(Vec::new())
-        }
+        let session = self.find(id).await?;
+        tokio::task::spawn_blocking(move || {
+            match history::read_tail(&session, history::DEFAULT_TAIL_BYTES) {
+                Ok(bytes) => Ok(bytes),
+                Err(error) if error.downcast_ref::<std::io::Error>().is_some() => Ok(Vec::new()),
+                Err(error) => Err(error),
+            }
+        })
+        .await?
     }
 
     pub async fn list(&self) -> Result<Vec<Session>> {
@@ -417,7 +421,20 @@ impl SessionManager {
         }
         self.store.delete(id).await?;
         self.backend_metadata.clear_session(id).await;
-        let _ = tokio::fs::remove_file(config::logs_dir().join(format!("{id}.log"))).await;
+        match session.location {
+            Location::Local => {
+                let path = session
+                    .host_log_path
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| config::logs_dir().join(format!("{id}.log")));
+                let _ = tokio::fs::remove_file(path).await;
+            }
+            Location::Remote => {
+                let _ =
+                    tokio::task::spawn_blocking(move || history::remove_remote_log(&session)).await;
+            }
+        }
         self.emit(SessionEvent::SessionRemoved { id: id.to_string() });
         Ok(())
     }
@@ -502,10 +519,10 @@ impl SessionManager {
                 (kind, Some(log_path.to_string_lossy().into_owned()))
             }
             Location::Remote => {
-                // Write the remote-side log to /tmp: no $HOME probing,
-                // world-writable, good enough until reboot (which would
-                // also kill the tmux session anyway).
-                let remote_log = format!("/tmp/slide-{id}.log");
+                // Use a private per-user directory. `pipe-pane` also enforces
+                // mode 0600 before appending so terminal output never inherits
+                // a permissive remote umask.
+                let remote_log = format!("~/.local/state/slide/logs/{id}.log");
                 (SupervisorKind::Tmux, Some(remote_log))
             }
         };

@@ -246,7 +246,7 @@ pub fn create_session_with_log(
     let name = session_name(id);
     let cols_s = cols.to_string();
     let rows_s = rows.to_string();
-    let pipe = format!("cat >> {}", shell_quote(&log_path.to_string_lossy()));
+    let pipe = log_pipe_command(log_path);
     // tmux's command separator `;` must be its own argv element. The remote
     // exec_tmux path shell-quotes each element, so the `;` survives the
     // round-trip as a literal arg to tmux (not a shell separator).
@@ -290,9 +290,16 @@ pub fn setup_mouse(host: Option<&str>) -> Result<()> {
 /// `-O` opens the pipe in overwrite mode so we don't append to a stale log
 /// from a prior tmux session with the same id.
 pub fn pipe_pane(host: Option<&str>, id: &str, log_path: &Path) -> Result<()> {
-    let cmd = format!("cat >> {}", shell_quote(&log_path.to_string_lossy()));
+    let cmd = log_pipe_command(log_path);
     let name = session_name(id);
     run(host, &["pipe-pane", "-t", &name, "-O", &cmd], "pipe-pane")
+}
+
+fn log_pipe_command(log_path: &Path) -> String {
+    let path = shell_quote(&log_path.to_string_lossy());
+    format!(
+        "umask 077; mkdir -p -- \"$(dirname -- {path})\" && touch -- {path} && chmod 600 -- {path} && exec cat >> {path}"
+    )
 }
 
 /// Plain-text snapshot of the session's visible pane. tmux renders the
@@ -570,6 +577,16 @@ mod tests {
     fn shell_quote_empty() {
         // Empty string must be quoted, otherwise the shell skips it.
         assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn log_pipe_command_creates_private_files() {
+        let command = log_pipe_command(Path::new("/tmp/slide logs/out.log"));
+        assert!(command.contains("umask 077"));
+        assert!(command.contains("mkdir -p"));
+        assert!(command.contains("chmod 600"));
+        assert!(command.contains("exec cat >>"));
+        assert!(command.contains("slide logs/out.log"));
     }
 
     #[test]
