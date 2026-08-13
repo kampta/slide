@@ -18,8 +18,8 @@ pub struct Spawned {
     /// fanout (per-session broadcast subscribers) share one allocation
     /// instead of cloning a fresh `Vec<u8>` per receiver.
     pub output: mpsc::Receiver<Bytes>,
-    /// Fires with the exit code when the child exits.
-    pub exit: tokio::sync::oneshot::Receiver<Option<i32>>,
+    /// Fires when the child exits.
+    pub exit: tokio::sync::oneshot::Receiver<()>,
 }
 
 /// Capacity of the PTY → daemon channel. A misbehaving consumer (slow disk
@@ -119,8 +119,8 @@ pub fn spawn(argv: &[String], cwd: &Path, env: &[(String, String)]) -> Result<Sp
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         let mut child = child;
-        let code = child.wait().ok().map(|s| s.exit_code() as i32);
-        let _ = exit_tx.send(code);
+        let _ = child.wait();
+        let _ = exit_tx.send(());
     });
 
     Ok(Spawned {
@@ -171,13 +171,11 @@ mod tests {
             let _ = kill_tx.send(());
         });
 
-        let exit = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(2), async {
             kill_rx.await.expect("killer thread stopped unexpectedly");
             spawned.exit.await.expect("waiter stopped unexpectedly")
         })
         .await
         .expect("kill contended with the blocking child wait");
-
-        assert!(exit.is_some(), "waiter did not report the child exit");
     }
 }

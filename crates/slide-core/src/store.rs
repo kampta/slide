@@ -214,19 +214,23 @@ impl Store {
         id: &str,
         state: SessionState,
         last_activity: i64,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let id = id.to_string();
-        self.conn
+        let persisted = self
+            .conn
             .call(move |c| {
-                c.execute(
-                    "UPDATE sessions SET state=?1, last_activity=?2 WHERE id=?3",
+                Ok(c.query_row(
+                    "UPDATE sessions
+                     SET state=?1, last_activity=MAX(last_activity, ?2)
+                     WHERE id=?3
+                     RETURNING last_activity",
                     params![state.as_str(), last_activity, id],
-                )?;
-                Ok(())
+                    |row| row.get(0),
+                )?)
             })
             .await
             .context("update state")?;
-        Ok(())
+        Ok(persisted)
     }
 
     pub async fn update_name(&self, id: &str, name: &str) -> Result<()> {
@@ -467,16 +471,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_state_changes_state_and_activity() {
+    async fn update_state_changes_state_without_decreasing_activity() {
         let store = mem_store().await;
         store.insert(&make_session("id1", "s1")).await.unwrap();
-        store
+
+        let unchanged = store
+            .update_state("id1", SessionState::Active, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(unchanged, 2_000);
+        let session = store.get("id1").await.unwrap().unwrap();
+        assert_eq!(session.state, SessionState::Active);
+        assert_eq!(session.last_activity, 2_000);
+
+        let advanced = store
             .update_state("id1", SessionState::Active, 9_999)
             .await
             .unwrap();
-        let list = store.list().await.unwrap();
-        assert_eq!(list[0].state, SessionState::Active);
-        assert_eq!(list[0].last_activity, 9_999);
+        assert_eq!(advanced, 9_999);
+        assert_eq!(
+            store.get("id1").await.unwrap().unwrap().last_activity,
+            9_999,
+        );
     }
 
     #[tokio::test]
