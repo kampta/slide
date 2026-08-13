@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-pub(crate) struct BoundedOutput {
+pub struct BoundedOutput {
     pub success: bool,
     pub code: Option<i32>,
     pub stdout: Vec<u8>,
@@ -17,7 +17,7 @@ pub(crate) struct BoundedOutput {
 /// Run a child process with hard time and output bounds. Both pipes are
 /// drained concurrently so a noisy stderr cannot deadlock a stdout reader;
 /// crossing either output limit closes the pipe and terminates the child.
-pub(crate) fn run_bounded(
+pub fn run_bounded(
     mut command: Command,
     stdout_limit: usize,
     stderr_limit: usize,
@@ -101,5 +101,20 @@ mod tests {
         let output = run_bounded(command, 10, 10, Duration::from_millis(50)).unwrap();
         assert!(output.timed_out);
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn timed_out_child_cannot_perform_a_late_side_effect() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("late");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 0.15; printf late > \"$1\"", "_"])
+            .arg(&marker);
+
+        let output = run_bounded(command, 10, 10, Duration::from_millis(20)).unwrap();
+        assert!(output.timed_out);
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(!marker.exists());
     }
 }

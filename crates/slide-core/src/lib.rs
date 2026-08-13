@@ -4,7 +4,7 @@ pub mod config;
 pub mod git;
 mod git_snapshot;
 pub mod history;
-mod process;
+pub mod process;
 pub mod runtime;
 pub mod session;
 pub mod ssh;

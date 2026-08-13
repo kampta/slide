@@ -14,32 +14,15 @@ use crate::tmux;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use std::path::PathBuf;
-use std::time::Duration;
-
-/// Cap on how long any single tmux/SSH invocation may sit in the blocking
-/// pool. SSH can hang indefinitely after a successful TCP handshake (e.g.,
-/// network partition mid-read); without a timeout, every hung remote ties up
-/// one blocking worker forever. 15s is well above any healthy local or
-/// remote tmux call but short enough that the daemon stays responsive when a
-/// host disappears.
-const TMUX_OP_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// Wrap `spawn_blocking` with a timeout. Note that timing out the *await*
-/// does not cancel the underlying OS thread — Rust sync code can't be
-/// cancelled from outside. The thread keeps running until its blocking
-/// syscall returns; we just let the async task complete so the daemon's
-/// other work isn't held up.
-async fn spawn_blocking_with_timeout<F, T>(label: &'static str, f: F) -> Result<T>
+/// Run synchronous supervisor work off the async runtime. Every tmux/SSH
+/// process invoked by the closure has its own hard timeout and output bounds
+/// in `tmux::exec_tmux`, so awaiting this worker cannot leak a live command.
+async fn spawn_blocking_result<F, T>(f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    let handle = tokio::task::spawn_blocking(f);
-    match tokio::time::timeout(TMUX_OP_TIMEOUT, handle).await {
-        Ok(Ok(res)) => res,
-        Ok(Err(join_err)) => Err(join_err.into()),
-        Err(_) => bail!("{label} timed out after {}s", TMUX_OP_TIMEOUT.as_secs()),
-    }
+    tokio::task::spawn_blocking(f).await?
 }
 
 /// Request to spawn a backend under a supervisor.
@@ -186,7 +169,7 @@ impl Supervisor for TmuxSupervisor {
         // to avoid blocking the runtime and to keep the signatures sync.
         // Idempotent: if the tmux session is already alive (daemon restart,
         // resume path), we skip new-session and just re-establish pipe-pane.
-        spawn_blocking_with_timeout("tmux spawn", move || -> Result<()> {
+        spawn_blocking_result(move || -> Result<()> {
             let host = host.as_deref();
             let backend_name = argv.first().cloned().unwrap_or_default();
             // Idempotent: if the tmux session is already alive (daemon
@@ -249,7 +232,7 @@ impl Supervisor for TmuxSupervisor {
     async fn is_alive(&self, id: &str) -> Result<bool> {
         let host = self.host.clone();
         let id = id.to_string();
-        spawn_blocking_with_timeout("tmux has-session", move || -> Result<bool> {
+        spawn_blocking_result(move || -> Result<bool> {
             // Unreachable hosts say "don't know" — caller should treat that
             // as not-yet-dead, so collapse to false only on Absent.
             Ok(matches!(
@@ -263,10 +246,7 @@ impl Supervisor for TmuxSupervisor {
     async fn teardown(&self, id: &str) -> Result<()> {
         let host = self.host.clone();
         let id = id.to_string();
-        spawn_blocking_with_timeout("tmux kill-session", move || {
-            tmux::kill_session(host.as_deref(), &id)
-        })
-        .await
+        spawn_blocking_result(move || tmux::kill_session(host.as_deref(), &id)).await
     }
 }
 

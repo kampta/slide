@@ -280,6 +280,7 @@ fn list_dir_local(path: Option<&str>) -> Response {
 fn list_dir_remote(host: &str, path: Option<&str>) -> anyhow::Result<serde_json::Value> {
     use anyhow::Context;
     use std::process::Command;
+    use std::time::Duration;
 
     slide_core::ssh::validate_host(host).context("invalid ssh host")?;
 
@@ -318,8 +319,16 @@ done"#;
         cmd.arg(a);
     }
     cmd.arg(host).arg(&remote);
-    let out = cmd.output().context("spawn ssh")?;
-    if !out.status.success() {
+    let out =
+        slide_core::process::run_bounded(cmd, 1024 * 1024, 64 * 1024, Duration::from_secs(15))
+            .context("spawn ssh")?;
+    if out.timed_out {
+        anyhow::bail!("ssh ls timed out");
+    }
+    if out.stdout_truncated || out.stderr_truncated {
+        anyhow::bail!("ssh ls exceeded its output limit");
+    }
+    if !out.success {
         let stderr = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("ssh ls failed: {}", stderr.trim());
     }

@@ -9,12 +9,18 @@
 
 use anyhow::{bail, Context, Result};
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Command;
+use std::time::Duration;
+
+use crate::process::{run_bounded, BoundedOutput};
 
 /// tmux socket / server label used by slide. `-L slide` isolates us from
 /// the user's own tmux sessions.
 pub const SERVER_LABEL: &str = "slide";
 const SESSION_PREFIX: &str = "slide-";
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
+const CONTROL_STDOUT_LIMIT: usize = 2 * 1024 * 1024;
+const CONTROL_STDERR_LIMIT: usize = 64 * 1024;
 
 /// Format a tmux session name for a given slide session id.
 pub fn session_name(id: &str) -> String {
@@ -24,17 +30,22 @@ pub fn session_name(id: &str) -> String {
 /// `true` if tmux is on the local `PATH`. Remote availability is probed
 /// lazily on first use (tmux command fails if it's missing there).
 pub fn is_available() -> bool {
-    Command::new("tmux")
-        .arg("-V")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    let mut command = Command::new("tmux");
+    command.arg("-V");
+    run_bounded(
+        command,
+        CONTROL_STDOUT_LIMIT,
+        CONTROL_STDERR_LIMIT,
+        Duration::from_secs(2),
+    )
+    .map(|output| output.success && !output.timed_out)
+    .unwrap_or(false)
 }
 
 /// Build and run `tmux -L slide <tmux_args...>`, either directly or via
 /// `ssh <host> "tmux …"`. Returns the captured output so callers can
 /// inspect stderr for benign conditions like "no server running".
-fn exec_tmux(host: Option<&str>, tmux_args: &[&str], ctx: &str) -> Result<Output> {
+fn exec_tmux(host: Option<&str>, tmux_args: &[&str], ctx: &str) -> Result<BoundedOutput> {
     let cmd = match host {
         None => {
             let mut c = Command::new("tmux");
@@ -73,13 +84,25 @@ fn exec_tmux(host: Option<&str>, tmux_args: &[&str], ctx: &str) -> Result<Output
             c
         }
     };
-    let mut cmd = cmd;
-    cmd.output().with_context(|| format!("exec tmux ({ctx})"))
+    let output = run_bounded(
+        cmd,
+        CONTROL_STDOUT_LIMIT,
+        CONTROL_STDERR_LIMIT,
+        CONTROL_TIMEOUT,
+    )
+    .with_context(|| format!("exec tmux ({ctx})"))?;
+    if output.timed_out {
+        bail!("tmux {ctx} timed out after {}s", CONTROL_TIMEOUT.as_secs());
+    }
+    if output.stdout_truncated || output.stderr_truncated {
+        bail!("tmux {ctx} exceeded its output limit");
+    }
+    Ok(output)
 }
 
 fn run(host: Option<&str>, tmux_args: &[&str], ctx: &str) -> Result<()> {
     let out = exec_tmux(host, tmux_args, ctx)?;
-    if !out.status.success() {
+    if !out.success {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!("tmux {ctx} failed: {}", stderr.trim());
     }
@@ -282,7 +305,7 @@ pub fn pipe_pane(host: Option<&str>, id: &str, log_path: &Path) -> Result<()> {
 pub fn capture_pane(host: Option<&str>, id: &str) -> Result<String> {
     let name = session_name(id);
     let out = exec_tmux(host, &["capture-pane", "-p", "-t", &name], "capture-pane")?;
-    if out.status.success() {
+    if out.success {
         return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -332,7 +355,7 @@ pub fn has_session(host: Option<&str>, id: &str) -> Result<SessionProbe> {
     let name = session_name(id);
     let out = exec_tmux(host, &["has-session", "-t", &name], "has-session")?;
     // has-session exits 0 if found, 1 if not, other codes on real errors.
-    if out.status.success() {
+    if out.success {
         return Ok(SessionProbe::Present);
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -359,7 +382,7 @@ pub fn has_session(host: Option<&str>, id: &str) -> Result<SessionProbe> {
 pub fn kill_session(host: Option<&str>, id: &str) -> Result<()> {
     let name = session_name(id);
     let out = exec_tmux(host, &["kill-session", "-t", &name], "kill-session")?;
-    if !out.status.success() {
+    if !out.success {
         let stderr = String::from_utf8_lossy(&out.stderr);
         // "no server running" means tmux had no sessions at all — same
         // outcome as "can't find session" for idempotent kill. Some tmux
@@ -385,7 +408,7 @@ pub fn list_session_ids(host: Option<&str>) -> Result<Vec<String>> {
         &["list-sessions", "-F", "#{session_name}"],
         "list-sessions",
     )?;
-    if !out.status.success() {
+    if !out.success {
         let stderr = String::from_utf8_lossy(&out.stderr);
         if stderr.contains("no server running") || stderr.contains("error connecting") {
             return Ok(Vec::new());
