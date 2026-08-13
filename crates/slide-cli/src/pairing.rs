@@ -327,7 +327,12 @@ pub fn validate_public_url(value: &str) -> Result<String> {
     if uri.scheme_str() != Some("https") || uri.authority().is_none() {
         bail!("--public-url must be an https:// URL served by a trusted reverse proxy")
     }
-    if !matches!(uri.path(), "" | "/") || uri.query().is_some() {
+    if uri
+        .authority()
+        .is_some_and(|authority| authority.as_str().contains('@'))
+        || !matches!(uri.path(), "" | "/")
+        || uri.query().is_some()
+    {
         bail!("--public-url must contain only an HTTPS origin (for example https://slide.example.ts.net)")
     }
     Ok(value.trim_end_matches('/').to_string())
@@ -337,7 +342,13 @@ pub fn public_url_host(value: &str) -> Result<String> {
     let value = validate_public_url(value)?;
     let uri: Uri = value.parse().context("--public-url is not a valid URL")?;
     uri.authority()
-        .map(|authority| authority.host().to_string())
+        .map(|authority| {
+            let host = authority.host();
+            host.strip_prefix('[')
+                .and_then(|host| host.strip_suffix(']'))
+                .unwrap_or(host)
+                .to_ascii_lowercase()
+        })
         .context("--public-url has no host")
 }
 
@@ -452,10 +463,12 @@ mod tests {
         );
         assert!(validate_public_url("http://slide.example.ts.net").is_err());
         assert!(validate_public_url("https://slide.example.ts.net/path").is_err());
+        assert!(validate_public_url("https://user@slide.example.ts.net").is_err());
         assert_eq!(
             public_url_host("https://slide.example.ts.net:8443").unwrap(),
             "slide.example.ts.net"
         );
+        assert_eq!(public_url_host("https://[::1]:8443").unwrap(), "::1");
     }
 
     #[test]

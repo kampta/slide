@@ -41,7 +41,7 @@ pub async fn run(
     // Claim the port before mutating the daemon lock or reconciling stored
     // sessions. A second `slide serve` must fail without corrupting the
     // first daemon's discovery file.
-    let addr = format!("{bind}:{port}");
+    let addr = authority_with_port(bind, port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
@@ -57,11 +57,10 @@ pub async fn run(
     // bootstrap. Phone clients receive independent persistent credentials.
     let token = generate_token();
     let pairing = PairingStore::open(config::data_dir().join("pairing.json"))?;
-    let local_addr = local_browser_addr(bind, port);
     let browser_url = if dev {
         "http://localhost:5173".to_string()
     } else {
-        format!("http://{local_addr}")
+        format!("http://{addr}")
     };
     write_lock_file(bind, port, public_url.as_deref(), &browser_url)?;
     let _lock_guard = DaemonLockGuard;
@@ -348,7 +347,9 @@ fn request_is_loopback(headers: &header::HeaderMap) -> bool {
         .and_then(|value| value.to_str().ok())
         .map(is_loopback_origin)
         .unwrap_or(true);
-    host_is_loopback && origin_is_loopback && forwarded_proto(headers) != Some("https")
+    host_is_loopback
+        && origin_is_loopback
+        && matches!(forwarded_proto(headers), None | Some("http"))
 }
 
 /// Removes only this process's discovery file. If another daemon has
@@ -372,11 +373,10 @@ fn lock_owned_by(path: &std::path::Path, pid: u32) -> bool {
         == Some(pid as u64)
 }
 
-/// Write a 0o600 file containing secrets (token, daemon.lock). On Unix the
+/// Write a private daemon discovery file. On Unix the
 /// file is created via `OpenOptions::mode(0o600).create_new(true)` so the
 /// permission bits are set at `open(2)` time — there is no umask-derived
-/// window between `write` and `set_permissions`. We unlink any pre-existing
-/// file first so a stale token from a prior boot doesn't keep its old mode.
+/// window between `write` and `set_permissions`.
 fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> Result<()> {
     use std::io::Write;
     #[cfg(unix)]
@@ -388,14 +388,14 @@ fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> Result<()> {
             .create_new(true)
             .mode(0o600)
             .open(path)
-            .with_context(|| format!("create secret file {}", path.display()))?;
+            .with_context(|| format!("create private file {}", path.display()))?;
         f.write_all(contents)?;
         f.sync_all().ok();
     }
     #[cfg(not(unix))]
     {
         let mut f = std::fs::File::create(path)
-            .with_context(|| format!("create secret file {}", path.display()))?;
+            .with_context(|| format!("create private file {}", path.display()))?;
         f.write_all(contents)?;
     }
     Ok(())
@@ -417,14 +417,11 @@ async fn auth_layer(
     req: Request,
     next: Next,
 ) -> Response {
-    // DNS rebinding hardening. By default the daemon binds 127.0.0.1, so
+    // DNS rebinding hardening. The daemon binds loopback, so
     // any request whose Host (or Origin) claims a non-loopback authority
     // is either a rebinding attempt by a malicious page or a misrouted
-    // reverse proxy. With `--lan` the allowed-hosts list is widened to
-    // include the daemon's actual LAN IPs (computed at startup) so the
-    // phone's Host header passes; rebinding-to-loopback from the public
-    // internet still 403s. Reject before checking the token so a valid
-    // token can't be smuggled through.
+    // reverse proxy. An explicitly configured public origin is the only
+    // exception. Reject before checking credentials.
     if !request_authority_is_allowed(&req, &state.allowed_hosts, state.public_origin.as_deref()) {
         return Response::builder()
             .status(StatusCode::FORBIDDEN)
@@ -521,10 +518,7 @@ fn normalized_origin(value: &str) -> Option<String> {
         return None;
     }
     let authority = uri.authority()?;
-    if authority.as_str().contains('@') {
-        return None;
-    }
-    let host = authority.host().to_ascii_lowercase();
+    let host = authority_host(authority)?.to_ascii_lowercase();
     let host = if host.contains(':') {
         format!("[{host}]")
     } else {
@@ -555,48 +549,48 @@ fn is_loopback_origin(value: &str) -> bool {
 fn is_loopback_authority(value: &str) -> bool {
     value
         .parse::<Authority>()
-        .map(|authority| matches!(authority.host(), "127.0.0.1" | "localhost" | "::1"))
-        .unwrap_or(false)
+        .ok()
+        .and_then(|authority| {
+            authority_host(&authority).map(|host| {
+                host == "127.0.0.1" || host == "::1" || host.eq_ignore_ascii_case("localhost")
+            })
+        })
+        .unwrap_or_default()
 }
 
-/// Return true when `value` (a Host header like `localhost:7777` or an Origin
-/// like `http://127.0.0.1:5173`) parses to a host in `allowed`. We only
-/// inspect the host portion; the port is irrelevant because the listener
-/// already picks it.
+fn authority_host(authority: &Authority) -> Option<&str> {
+    if authority.as_str().contains('@') {
+        return None;
+    }
+    let host = authority.host();
+    Some(
+        host.strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host),
+    )
+}
+
+/// Match a syntactically valid Host authority against the configured hosts.
+/// Ports are irrelevant because the listener already constrains them.
 fn host_in(value: &str, allowed: &[String]) -> bool {
-    let authority = value
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(value);
-    let authority = authority.split('/').next().unwrap_or("");
-    let host = if let Some(rest) = authority.strip_prefix('[') {
-        match rest.split_once(']') {
-            Some((host, _)) => host,
-            None => return false,
-        }
-    } else {
-        match authority.rsplit_once(':') {
-            Some((host, _)) => host,
-            None => authority,
-        }
-    };
-    allowed.iter().any(|a| a == host)
+    value
+        .parse::<Authority>()
+        .ok()
+        .and_then(|authority| {
+            authority_host(&authority).map(|authority_host| {
+                allowed
+                    .iter()
+                    .any(|host| host.eq_ignore_ascii_case(authority_host))
+            })
+        })
+        .unwrap_or_default()
 }
 
-/// Pick the address to use for the local browser tab — what `opener::open`
-/// receives and what we print to stdout. When `bind` is unspecified
-/// (`0.0.0.0` / `::`, set by `--lan`) we MUST substitute loopback:
-/// `http://0.0.0.0:7777/` reaches the daemon at the TCP layer, but the
-/// request's `Host: 0.0.0.0:7777` isn't in `build_allowed_hosts`'s
-/// allow-list, so the DNS-rebinding check 403s every /api and /ws
-/// request. The phone-facing URLs in `print_lan_summary` are unaffected
-/// because they use real LAN IPs, which the allow-list contains by
-/// construction. A specific non-loopback `--bind 192.168.1.5` is kept
-/// verbatim; the user picked it and the allow-list includes it.
-fn local_browser_addr(bind: &str, port: u16) -> String {
-    match bind.parse::<std::net::IpAddr>() {
-        Ok(ip) if ip.is_unspecified() => format!("127.0.0.1:{port}"),
-        _ => format!("{bind}:{port}"),
+fn authority_with_port(host: &str, port: u16) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
     }
 }
 
@@ -604,17 +598,7 @@ fn needs_initial_bootstrap(dev: bool, open_browser: bool) -> bool {
     dev || open_browser
 }
 
-/// Build the host allow-list from the bind address. Always includes
-/// loopback names. When `bind` is `0.0.0.0` / `::`, also adds every
-/// non-loopback IPv4 currently exposed by the host (so the phone's QR
-/// URL passes the rebinding check). When `bind` is a specific
-/// non-loopback address, only that address is added.
-//
-// TODO(stage-b): when the daemon gains `--tls-cert`, the phone will
-// reach us via the cert's CN (e.g. a Tailscale MagicDNS name like
-// `mybox.tail-scale.ts.net`), not an IP. Add a `--allow-host=<name>`
-// flag (or derive from the cert) and append the names here, otherwise
-// the rebinding check will 403 the hostname-based requests.
+/// Build the Host allow-list from loopback plus the configured public origin.
 fn build_allowed_hosts(bind: &str, public_url: Option<&str>) -> Result<Vec<String>> {
     let mut hosts = vec![
         "127.0.0.1".to_string(),
@@ -771,6 +755,11 @@ mod tests {
 
         headers.insert(header::ORIGIN, "http://localhost:5173".parse().unwrap());
         assert!(request_is_loopback(&headers));
+
+        headers.insert("x-forwarded-proto", "https,http".parse().unwrap());
+        assert!(!request_is_loopback(&headers));
+        headers.insert("x-forwarded-proto", "http".parse().unwrap());
+        assert!(request_is_loopback(&headers));
     }
 
     #[test]
@@ -833,12 +822,10 @@ mod tests {
             "127.0.0.1",
             "127.0.0.1:7777",
             "localhost",
+            "LOCALHOST",
             "localhost:5173",
             "[::1]",
             "[::1]:7777",
-            "http://localhost:5173",
-            "http://127.0.0.1:7777/some/path",
-            "http://[::1]:7777",
         ] {
             assert!(host_in(v, &allowed), "expected loopback: {v}");
         }
@@ -850,8 +837,8 @@ mod tests {
         for v in [
             "evil.com",
             "evil.com:7777",
-            "http://evil.com",
-            "http://evil.com:7777",
+            "evil.com:not-a-port",
+            "evil.com@localhost",
             "192.168.1.5",
             "192.168.1.5:7777",
             "10.0.0.1:7777",
@@ -863,11 +850,16 @@ mod tests {
     }
 
     #[test]
-    fn host_in_accepts_lan_ip_when_allowed() {
+    fn host_in_accepts_configured_ip() {
         let allowed = vec!["100.64.0.5".to_string()];
         assert!(host_in("100.64.0.5:7777", &allowed));
-        assert!(host_in("http://100.64.0.5:7777/x", &allowed));
         assert!(!host_in("192.168.1.5:7777", &allowed));
+    }
+
+    #[test]
+    fn exact_origin_normalizes_ipv6_brackets() {
+        assert!(origin_eq("https://[::1]:8443", "https://[::1]:8443"));
+        assert!(!origin_eq("https://[::1]:8443", "https://[::1]"));
     }
 
     #[test]
@@ -934,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn request_authority_accepts_lan_host_when_in_allow_list() {
+    fn request_authority_accepts_configured_host() {
         let allowed = vec!["127.0.0.1".to_string(), "100.64.0.5".to_string()];
         let r = req_with(|r| {
             r.headers_mut()
@@ -1008,24 +1000,10 @@ mod tests {
     }
 
     #[test]
-    fn local_browser_addr_unspecified_uses_loopback() {
-        // --lan / --bind 0.0.0.0: browser must hit loopback so the Host
-        // header passes the rebinding allow-list.
-        assert_eq!(local_browser_addr("0.0.0.0", 7777), "127.0.0.1:7777");
-        assert_eq!(local_browser_addr("::", 7777), "127.0.0.1:7777");
-    }
-
-    #[test]
-    fn local_browser_addr_loopback_passes_through() {
-        assert_eq!(local_browser_addr("127.0.0.1", 7777), "127.0.0.1:7777");
-        assert_eq!(local_browser_addr("localhost", 7777), "localhost:7777");
-    }
-
-    #[test]
-    fn local_browser_addr_specific_bind_passes_through() {
-        // User picked the address explicitly; allow-list contains it.
-        assert_eq!(local_browser_addr("192.168.1.5", 7777), "192.168.1.5:7777");
-        assert_eq!(local_browser_addr("100.64.0.5", 7777), "100.64.0.5:7777");
+    fn authority_formats_ipv4_names_and_ipv6() {
+        assert_eq!(authority_with_port("127.0.0.1", 7777), "127.0.0.1:7777");
+        assert_eq!(authority_with_port("localhost", 7777), "localhost:7777");
+        assert_eq!(authority_with_port("::1", 7777), "[::1]:7777");
     }
 
     #[test]
