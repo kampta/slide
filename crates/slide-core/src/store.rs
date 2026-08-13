@@ -241,6 +241,28 @@ impl Store {
         Ok(())
     }
 
+    pub async fn restore_backend(
+        &self,
+        id: &str,
+        backend: BackendKind,
+        backend_session_id: Option<&str>,
+    ) -> Result<()> {
+        let id = id.to_string();
+        let backend = backend.as_str().to_string();
+        let backend_session_id = backend_session_id.map(str::to_string);
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE sessions SET backend=?1, backend_session_id=?2 WHERE id=?3",
+                    params![backend, backend_session_id, id],
+                )?;
+                Ok(())
+            })
+            .await
+            .context("restore backend")?;
+        Ok(())
+    }
+
     /// Record the backend-native session id (e.g. claude's `--resume`
     /// target) once discovery has found it.
     pub async fn set_backend_session_id_if_current(
@@ -412,6 +434,30 @@ mod tests {
         let got = store.get("id1").await.unwrap().unwrap();
         assert_eq!(got.backend, BackendKind::Codex);
         assert!(got.backend_session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn restore_backend_preserves_provider_session_id() {
+        let store = mem_store().await;
+        let mut session = make_session("id1", "one");
+        session.backend_session_id = Some("claude-thread".into());
+        store.insert(&session).await.unwrap();
+
+        store
+            .update_backend("id1", BackendKind::Codex)
+            .await
+            .unwrap();
+        store
+            .restore_backend("id1", BackendKind::Claude, Some("claude-thread"))
+            .await
+            .unwrap();
+
+        let restored = store.get("id1").await.unwrap().unwrap();
+        assert_eq!(restored.backend, BackendKind::Claude);
+        assert_eq!(
+            restored.backend_session_id.as_deref(),
+            Some("claude-thread")
+        );
     }
 
     #[tokio::test]

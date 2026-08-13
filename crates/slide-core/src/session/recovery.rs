@@ -132,6 +132,17 @@ impl RecoveryCoordinator {
 
     async fn reattach_survivors(manager: Arc<SessionManager>, survivors: Vec<Session>) {
         for session in survivors {
+            let operation = manager.operation_lock(&session.id);
+            let _guard = operation.lock().await;
+            let session = match manager.find(&session.id).await {
+                Ok(current)
+                    if !matches!(current.state, SessionState::Stopped)
+                        && !manager.running.read().await.contains_key(&current.id) =>
+                {
+                    current
+                }
+                _ => continue,
+            };
             if let Err(error) = manager.spawn_process(&session, SpawnIntent::Existing).await {
                 tracing::warn!(
                     session = %session.id,
@@ -161,12 +172,15 @@ impl RecoveryCoordinator {
             let mut still_pending = Vec::new();
             let mut resolved_any = false;
             for prior in pending.drain(..) {
-                if manager.running.read().await.contains_key(&prior.id) {
-                    resolved_any = true;
-                    continue;
-                }
+                let operation = manager.operation_lock(&prior.id);
+                let _guard = operation.lock().await;
                 let session = match manager.find(&prior.id).await {
-                    Ok(session) if !matches!(session.state, SessionState::Stopped) => session,
+                    Ok(session)
+                        if !matches!(session.state, SessionState::Stopped)
+                            && !manager.running.read().await.contains_key(&session.id) =>
+                    {
+                        session
+                    }
                     _ => {
                         resolved_any = true;
                         continue;

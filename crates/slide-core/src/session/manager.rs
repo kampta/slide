@@ -547,6 +547,11 @@ impl SessionManager {
             // user would see a green session that hits "session not running"
             // on every WS attach. Also drop the worktree we just created so
             // retrying with the same name isn't blocked by a stale dir.
+            if matches!(session.supervisor, SupervisorKind::Tmux) {
+                let _ = supervisor::for_session(&session)
+                    .teardown(&session.id)
+                    .await;
+            }
             let _ = self.store.delete(&session.id).await;
             self.runtime_diagnostics
                 .record_launch_failure(session.backend, session.ssh_host.as_deref());
@@ -684,20 +689,23 @@ impl SessionManager {
             return Ok(session);
         }
         let switch_backend = backend.filter(|b| *b != session.backend);
+        let previous_backend = session.backend;
+        let previous_backend_session_id = session.backend_session_id.clone();
+        let requested_backend = switch_backend.unwrap_or(session.backend);
+        // Preflight before changing persisted provider identity. A missing or
+        // unauthenticated runtime must leave the old resume target untouched.
+        let diagnostic_host = session
+            .ssh_host
+            .as_deref()
+            .filter(|_| matches!(session.location, Location::Remote));
+        self.preflight_runtime(requested_backend, diagnostic_host)
+            .await?;
         if let Some(new_backend) = switch_backend {
             self.store.update_backend(id, new_backend).await?;
             // Provider-scoped metadata is invalid after a backend switch.
             self.backend_metadata.clear_session(id).await;
             session = self.find(id).await?;
         }
-        // Match create(): only remote sessions probe through SSH. A stale
-        // ssh_host on a local row must not force an unreachable-host preflight.
-        let diagnostic_host = session
-            .ssh_host
-            .as_deref()
-            .filter(|_| matches!(session.location, Location::Remote));
-        self.preflight_runtime(session.backend, diagnostic_host)
-            .await?;
         session.state = SessionState::Active;
         session.last_activity = now_ms();
         self.store
@@ -719,6 +727,13 @@ impl SessionManager {
                 .store
                 .update_state(id, SessionState::Stopped, now_ms())
                 .await;
+            if switch_backend.is_some() {
+                let _ = self
+                    .store
+                    .restore_backend(id, previous_backend, previous_backend_session_id.as_deref())
+                    .await;
+                self.backend_metadata.clear_session(id).await;
+            }
             self.runtime_diagnostics
                 .record_launch_failure(session.backend, session.ssh_host.as_deref());
             self.emit(SessionEvent::SessionState {
