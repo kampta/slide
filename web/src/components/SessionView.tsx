@@ -5,6 +5,7 @@ import {
   type Backend,
   type BackendInfo,
   type ContextUsage,
+  type ExecutionPolicy,
 } from "../state/api";
 import type { TerminalHandle } from "./Terminal";
 import { MobileKeyBar } from "./MobileKeyBar";
@@ -35,6 +36,15 @@ export function resumeActionTitle(
     return "Resume the prior conversation.";
   }
   return "Resume the most recent conversation for this workspace when supported; otherwise start fresh.";
+}
+
+export function policyForBackend(
+  backend: BackendInfo | undefined,
+  current: ExecutionPolicy,
+): ExecutionPolicy {
+  return !backend || backend.execution_policies.includes(current)
+    ? current
+    : "unrestricted";
 }
 
 function formatTokens(n: number): string {
@@ -80,6 +90,8 @@ export function SessionView() {
   const [transferOpen, setTransferOpen] = useState(false);
   const [backends, setBackends] = useState<BackendInfo[]>([]);
   const [resumeBackend, setResumeBackend] = useState<Backend | null>(null);
+  const [resumePolicy, setResumePolicy] =
+    useState<ExecutionPolicy>("unrestricted");
   const termRef = useRef<TerminalHandle>(null);
   const isMobile = useIsMobile();
 
@@ -126,8 +138,11 @@ export function SessionView() {
   // Default the picker to the session's stored backend when the active
   // session changes (or when the store reports a switched backend after start).
   useEffect(() => {
-    if (session) setResumeBackend(session.backend);
-  }, [session?.id, session?.backend]);
+    if (session) {
+      setResumeBackend(session.backend);
+      setResumePolicy(session.execution_policy);
+    }
+  }, [session?.id, session?.backend, session?.execution_policy]);
 
   if (!session) {
     return (
@@ -143,6 +158,10 @@ export function SessionView() {
   // Unknown means classification is uncertain, not that the process stopped.
   const isRunning = session.state !== "stopped";
   const selectedBackend = resumeBackend ?? session.backend;
+  const selectedBackendInfo = backends.find(
+    (item) => item.id === selectedBackend,
+  );
+  const selectedPolicy = policyForBackend(selectedBackendInfo, resumePolicy);
   const resumeLabel = resumeActionLabel(session.backend, selectedBackend);
   const resumeTitle = resumeActionTitle(
     session.backend,
@@ -150,6 +169,7 @@ export function SessionView() {
     Boolean(session.backend_session_id),
   );
   const switchingBackend = selectedBackend !== session.backend;
+  const switchingPolicy = selectedPolicy !== session.execution_policy;
 
   async function runAction(label: string, action: () => Promise<unknown>) {
     setPendingAction(label);
@@ -185,6 +205,12 @@ export function SessionView() {
             <span>{session.state}</span>
             <span className="sep">·</span>
             <span>{session.backend}</span>
+            {session.execution_policy === "sandboxed_auto" && (
+              <>
+                <span className="sep">·</span>
+                <span>sandboxed</span>
+              </>
+            )}
             {session.parent_session_id && (
               <>
                 <span className="sep">·</span>
@@ -229,9 +255,16 @@ export function SessionView() {
                   <select
                     value={selectedBackend}
                     disabled={pendingAction !== null}
-                    onChange={(event) =>
-                      setResumeBackend(event.target.value as Backend)
-                    }
+                    onChange={(event) => {
+                      const next = event.target.value as Backend;
+                      setResumeBackend(next);
+                      setResumePolicy(
+                        policyForBackend(
+                          backends.find((item) => item.id === next),
+                          resumePolicy,
+                        ),
+                      );
+                    }}
                     aria-label="Backend to launch on resume"
                   >
                     {backends.map((item) => (
@@ -242,6 +275,23 @@ export function SessionView() {
                   </select>
                 </label>
               )}
+              {selectedBackendInfo &&
+                selectedBackendInfo.execution_policies.length > 1 && (
+                  <label className="resume-backend" title="Execution policy">
+                    <span className="sr-only">Execution policy</span>
+                    <select
+                      value={selectedPolicy}
+                      disabled={pendingAction !== null}
+                      onChange={(event) =>
+                        setResumePolicy(event.target.value as ExecutionPolicy)
+                      }
+                      aria-label="Execution policy to use on resume"
+                    >
+                      <option value="unrestricted">Unrestricted</option>
+                      <option value="sandboxed_auto">Sandboxed auto</option>
+                    </select>
+                  </label>
+                )}
               <button
                 title={resumeTitle}
                 disabled={pendingAction !== null}
@@ -251,6 +301,9 @@ export function SessionView() {
                       action: "resume",
                       ...(switchingBackend
                         ? { backend: selectedBackend }
+                        : {}),
+                      ...(switchingBackend || switchingPolicy
+                        ? { execution_policy: selectedPolicy }
                         : {}),
                     }),
                   )

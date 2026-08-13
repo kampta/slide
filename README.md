@@ -89,6 +89,7 @@ A handoff works across backends and local or SSH sessions. Choose another Waitin
 
 - **Name** (required) — shown in the left panel and used as the worktree folder / branch if auto-creating one.
 - **Backend** — reported by the daemon rather than hardcoded in the dialog. Current choices are Claude, Codex, Grok, Antigravity, and OpenCode.
+- **Permissions** (Codex) — **Sandboxed auto** runs Codex with its `workspace-write` sandbox and never pauses for approval; **Unrestricted** preserves the full-access launch behavior. Slide stores this choice per session and applies it to fresh starts, resumes, and forks. Stop a session to change it before resuming.
 - **Base directory** (required) — a git repo. Remembered across dialogs.
 - **Location** — Local or Remote (SSH host).
 
