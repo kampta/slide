@@ -6,6 +6,10 @@ interface KeyDef {
   title?: string;
 }
 
+export function shouldSendClick(detail: number): boolean {
+  return detail === 0;
+}
+
 const enc = (s: string) => new TextEncoder().encode(s);
 
 // xterm key codes: arrows are ESC [ A/B/C/D, Esc is 0x1b, Tab 0x09,
@@ -82,6 +86,11 @@ export function MobileKeyBar({
           onMouseDown={(e) => {
             e.preventDefault();
             onSend(k.bytes);
+          }}
+          // Keyboard activation produces a click with detail=0. Pointer clicks
+          // were already handled above, so ignore their synthetic click.
+          onClick={(e) => {
+            if (shouldSendClick(e.detail)) onSend(k.bytes);
           }}
         >
           {k.label}

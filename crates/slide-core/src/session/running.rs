@@ -220,6 +220,24 @@ async fn classifier_task(ctx: ClassifierCtx) {
     loop {
         let activity = ctx.last_activity.load(Ordering::SeqCst);
         let elapsed = now_ms().saturating_sub(activity);
+        // Raw byte arrival is sufficient to classify a session Active. Avoid
+        // spawning tmux/SSH capture commands for every burst; wait until the
+        // backend has settled before inspecting the rendered prompt.
+        if elapsed < signals.settle_ms as i64 {
+            if last_state != SessionState::Active {
+                ctx.manager
+                    .persist_classification(&ctx.id, SessionState::Active, activity)
+                    .await;
+                last_state = SessionState::Active;
+            }
+            unknown_recheck = UNKNOWN_RECHECK_INITIAL;
+            let remaining = (signals.settle_ms as i64 - elapsed).max(1) as u64;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(remaining)) => {}
+                _ = ctx.activity_notify.notified() => {}
+            }
+            continue;
+        }
         let pane = match ctx.supervisor {
             SupervisorKind::Tmux => {
                 let host = ctx.ssh_host.clone();
@@ -272,13 +290,6 @@ async fn classifier_task(ctx: ClassifierCtx) {
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}
                 _ = ctx.activity_notify.notified() => unknown_recheck = UNKNOWN_RECHECK_INITIAL,
-            }
-        } else if elapsed < signals.settle_ms as i64 {
-            unknown_recheck = UNKNOWN_RECHECK_INITIAL;
-            let remaining = (signals.settle_ms as i64 - elapsed).max(1) as u64;
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(remaining)) => {}
-                _ = ctx.activity_notify.notified() => {}
             }
         } else {
             unknown_recheck = UNKNOWN_RECHECK_INITIAL;
