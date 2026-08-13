@@ -3,7 +3,6 @@ version: 2
 updates:
   - package-ecosystem: cargo
     directory: /
-    versioning-strategy: increase-if-necessary
     schedule:
       interval: weekly
     # Routine PRs stay low-risk. Security updates are not restricted by
