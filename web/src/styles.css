@@ -183,6 +183,16 @@ body.is-resizing-panels * {
   user-select: none !important;
 }
 
+.app-auth-loading {
+  display: grid;
+  width: 100vw;
+  height: 100dvh;
+  place-items: center;
+  background: var(--canvas);
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
 .sidebar-expand-btn {
   position: absolute;
   top: 10px;
@@ -1182,8 +1192,19 @@ body.is-resizing-panels * {
   }
 
   .session-view-header {
+    flex-wrap: wrap;
     min-height: calc(56px + env(safe-area-inset-top));
     padding-top: calc(8px + env(safe-area-inset-top));
+  }
+
+  .session-view-header .hdr-main {
+    flex-basis: calc(100% - 44px);
+  }
+
+  .session-view-header .hdr-actions {
+    width: 100%;
+    flex-wrap: wrap;
+    justify-content: flex-end;
   }
 
   .session-view-header .hdr-actions button {

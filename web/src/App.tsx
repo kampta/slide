@@ -48,6 +48,8 @@ function loadSidebarCollapsed(): boolean {
 }
 
 export function App() {
+  const [authReady, setAuthReady] = useState(false);
+  const [authFailure, setAuthFailure] = useState<string | null>(null);
   const [newOpen, setNewOpen] = useState(false);
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
@@ -67,10 +69,16 @@ export function App() {
     let stop: (() => void) | undefined;
     prepareAuth()
       .then(() => {
-        if (!cancelled) stop = connect();
+        if (!cancelled) {
+          setAuthReady(true);
+          stop = connect();
+        }
       })
       .catch((error) => {
-        if (!cancelled) reportError(error);
+        if (!cancelled) {
+          reportError(error);
+          setAuthFailure(error instanceof Error ? error.message : String(error));
+        }
       });
     return () => {
       cancelled = true;
@@ -152,6 +160,20 @@ export function App() {
     },
     [],
   );
+
+  // Protected component effects must not race the one-shot fragment
+  // exchange. In particular, backend metadata is intentionally loaded once.
+  if (!authReady) {
+    return (
+      <div
+        className={`app-auth-loading${authFailure ? " app-auth-failed" : ""}`}
+        role={authFailure ? "alert" : "status"}
+        aria-live={authFailure ? "assertive" : "polite"}
+      >
+        {authFailure ?? "Connecting…"}
+      </div>
+    );
+  }
 
   // Mobile: single pane. List when no session is focused; SessionView
   // (with its own back button) when one is. Skip the resizer entirely —
