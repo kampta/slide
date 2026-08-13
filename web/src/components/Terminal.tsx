@@ -17,6 +17,7 @@ import { useIsMobile } from "../hooks/useMediaQuery";
 import {
   attachMouseSelection,
   attachTouchNavigation,
+  attachVisibleReconnect,
   clipboardAction,
   filterTerminalResponse,
 } from "./terminalInteractions";
@@ -168,6 +169,7 @@ export const TerminalView = forwardRef<
       let retryTimer: number | null = null;
       let attempts = 0;
       let connectedOnce = false;
+      let authFailed = false;
 
       const resetTerminal = () => {
         term.reset();
@@ -204,16 +206,33 @@ export const TerminalView = forwardRef<
           }
         };
         ws.onclose = (event) => {
-          if (wsRef.current === ws) wsRef.current = null;
-          if (disposed || event.code === WS_CLOSE_AUTH_FAILED) return;
+          // A visibility-driven reconnect replaces the socket immediately.
+          // Ignore the late close from that superseded connection so it cannot
+          // schedule a second reconnect over the new one.
+          if (wsRef.current !== ws) return;
+          wsRef.current = null;
+          if (event.code === WS_CLOSE_AUTH_FAILED) authFailed = true;
+          if (disposed || authFailed) return;
           retryTimer = window.setTimeout(connect, Math.min(500 * 2 ** attempts, 5000));
         };
         ws.onerror = () => ws.close();
       };
 
       connect();
+      const detachVisibility = attachVisibleReconnect(() => {
+        if (disposed || authFailed) return;
+        if (retryTimer !== null) {
+          window.clearTimeout(retryTimer);
+          retryTimer = null;
+        }
+        const stale = wsRef.current;
+        wsRef.current = null;
+        stale?.close();
+        connect();
+      });
       return () => {
         disposed = true;
+        detachVisibility();
         if (retryTimer !== null) window.clearTimeout(retryTimer);
         const ws = wsRef.current;
         wsRef.current = null;

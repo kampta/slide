@@ -1,5 +1,9 @@
-import { describe, expect, it } from "vitest";
-import { clipboardAction, filterTerminalResponse } from "./terminalInteractions";
+import { describe, expect, it, vi } from "vitest";
+import {
+  attachVisibleReconnect,
+  clipboardAction,
+  filterTerminalResponse,
+} from "./terminalInteractions";
 
 function key(
   value: string,
@@ -54,5 +58,27 @@ describe("filterTerminalResponse", () => {
     expect(filterTerminalResponse("\x1b[>0;276;0c", "direct")).toBe(
       "\x1b[>0;276;0c",
     );
+  });
+});
+
+describe("attachVisibleReconnect", () => {
+  it("reconnects only when the document becomes visible and detaches cleanly", () => {
+    const visibility = vi
+      .spyOn(document, "visibilityState", "get")
+      .mockReturnValue("hidden");
+    const reconnect = vi.fn();
+    const detach = attachVisibleReconnect(reconnect);
+
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(reconnect).not.toHaveBeenCalled();
+
+    visibility.mockReturnValue("visible");
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(reconnect).toHaveBeenCalledOnce();
+
+    detach();
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(reconnect).toHaveBeenCalledOnce();
+    visibility.mockRestore();
   });
 });

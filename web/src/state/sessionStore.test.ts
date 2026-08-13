@@ -127,20 +127,56 @@ describe("session store mutations", () => {
     expect(useSessions.getState().activeId).toBeNull();
   });
 
-  it("inserts fork and handoff responses before selecting them", async () => {
+  it("inserts fork responses without waiting for events", async () => {
     const fork = session("fork", { parent_session_id: "source" });
     vi.spyOn(api, "forkSession").mockResolvedValue(fork);
     await useSessions
       .getState()
       .forkSession("source", { name: "fork", focus: "alternate path" });
     expect(useSessions.getState().sessions.fork).toEqual(fork);
+  });
 
-    const target = session("target", { state: "waiting", last_activity: 20 });
-    vi.spyOn(api, "handoffSession").mockResolvedValue(target);
-    await useSessions.getState().handoffSession("source", {
+  it("does not let a stale handoff response overwrite a newer state event", async () => {
+    const waiting = session("target", { state: "waiting", last_activity: 20 });
+    const active = { ...waiting, state: "active" as const, last_activity: 30 };
+    useSessions.getState().loadSnapshot([waiting]);
+    vi.spyOn(api, "handoffSession").mockImplementation(async () => {
+      useSessions.getState().upsert(active);
+      return waiting;
+    });
+
+    await expect(useSessions.getState().handoffSession("source", {
       target_session_id: "target",
       focus: "continue here",
+    })).resolves.toEqual(waiting);
+    expect(useSessions.getState().sessions.target).toEqual(active);
+  });
+
+  it("preserves newer events that beat create and update responses", async () => {
+    const original = session("existing", { last_activity: 10 });
+    const updated = { ...original, state: "waiting" as const, last_activity: 30 };
+    const staleUpdate = { ...original, state: "stopped" as const, last_activity: 20 };
+    useSessions.getState().loadSnapshot([original]);
+    vi.spyOn(api, "updateSession").mockImplementation(async () => {
+      useSessions.getState().upsert(updated);
+      return staleUpdate;
     });
-    expect(useSessions.getState().sessions.target).toEqual(target);
+
+    await useSessions.getState().updateSession(original.id, { action: "stop" });
+    expect(useSessions.getState().sessions.existing).toEqual(updated);
+
+    const staleCreate = session("created", { last_activity: 10 });
+    const createdEvent = { ...staleCreate, backend_session_id: "provider-id" };
+    vi.spyOn(api, "createSession").mockImplementation(async () => {
+      useSessions.getState().upsert(createdEvent);
+      return staleCreate;
+    });
+
+    await useSessions.getState().createSession({
+      name: "created",
+      backend: "claude",
+      base_dir: "/code/slide",
+    });
+    expect(useSessions.getState().sessions.created).toEqual(createdEvent);
   });
 });

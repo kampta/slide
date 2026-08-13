@@ -1,10 +1,19 @@
 import {
   APP_SHELL,
+  assetPathsToPrune,
   staticRequestStrategy,
 } from "./serviceWorkerPolicy.ts";
 
 const CACHE_PREFIX = "slide-static-";
 const CACHE_NAME = `${CACHE_PREFIX}v1`;
+
+async function trimCachedAssets(cache) {
+  const requests = await cache.keys();
+  const stale = assetPathsToPrune(
+    requests.map((request) => new URL(request.url).pathname),
+  );
+  await Promise.all(stale.map((path) => cache.delete(path)));
+}
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -20,6 +29,7 @@ self.addEventListener("install", (event) => {
         (match) => match[1],
       );
       if (assets.length > 0) await cache.addAll(assets);
+      await trimCachedAssets(cache);
       await self.skipWaiting();
     })(),
   );
@@ -74,6 +84,7 @@ self.addEventListener("fetch", (event) => {
           if (response.ok) {
             const cache = await caches.open(CACHE_NAME);
             await cache.put(request, response.clone());
+            await trimCachedAssets(cache);
           }
           return response;
         })(),

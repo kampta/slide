@@ -212,6 +212,7 @@ export function App() {
           : `${sidebarWidth}px 10px minmax(0, 1fr)`,
       }}
     >
+      {sidebarCollapsed && <StatusBanners floating />}
       {!sidebarCollapsed && (
         <SessionList
           onNew={() => setNewOpen(true)}

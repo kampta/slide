@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { isDaemonPath, staticRequestStrategy } from "./serviceWorkerPolicy";
+import {
+  assetPathsToPrune,
+  isDaemonPath,
+  staticRequestStrategy,
+} from "./serviceWorkerPolicy";
 
 describe("service worker request policy", () => {
   it("never intercepts daemon HTTP or WebSocket paths", () => {
@@ -21,5 +25,20 @@ describe("service worker request policy", () => {
     );
     expect(staticRequestStrategy("/sessions/one", true)).toBe("network-first");
     expect(staticRequestStrategy("/unknown.txt", false)).toBe("network-only");
+  });
+
+  it("bounds old fingerprinted assets without counting app-shell entries", () => {
+    expect(
+      assetPathsToPrune(
+        [
+          "/",
+          "/manifest.webmanifest",
+          "/assets/app-old.js",
+          "/assets/app-current.js",
+          "/assets/Terminal-current.js",
+        ],
+        2,
+      ),
+    ).toEqual(["/assets/app-old.js"]);
   });
 });

@@ -37,6 +37,15 @@ export function clipboardAction(
   return null;
 }
 
+/** Reconnect sockets that mobile browsers may silently suspend in the background. */
+export function attachVisibleReconnect(reconnect: () => void): () => void {
+  const onVisibility = () => {
+    if (document.visibilityState === "visible") reconnect();
+  };
+  document.addEventListener("visibilitychange", onVisibility);
+  return () => document.removeEventListener("visibilitychange", onVisibility);
+}
+
 type Cell = { col: number; row: number };
 type Drag = Cell & { x: number; y: number; moved: boolean };
 

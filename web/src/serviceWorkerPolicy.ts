@@ -8,6 +8,8 @@ export const APP_SHELL = [
   "/icon-512-maskable.png",
 ] as const;
 
+export const MAX_CACHED_ASSETS = 12;
+
 const APP_SHELL_PATHS = new Set<string>(APP_SHELL);
 
 export function isDaemonPath(pathname: string): boolean {
@@ -26,4 +28,13 @@ export function staticRequestStrategy(
   if (navigation || APP_SHELL_PATHS.has(pathname)) return "network-first";
   if (pathname.startsWith("/assets/")) return "cache-first";
   return "network-only";
+}
+
+/** Keep the newest fingerprinted bundles and discard older release artifacts. */
+export function assetPathsToPrune(
+  cachedPaths: string[],
+  limit = MAX_CACHED_ASSETS,
+): string[] {
+  const assets = cachedPaths.filter((path) => path.startsWith("/assets/"));
+  return assets.slice(0, Math.max(0, assets.length - limit));
 }

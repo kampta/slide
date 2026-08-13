@@ -76,6 +76,14 @@ function sessionsEqual(a: Session, b: Session): boolean {
   );
 }
 
+function upsertIfUnchanged(
+  get: () => Store,
+  previous: Session | undefined,
+  response: Session,
+): void {
+  if (get().sessions[response.id] === previous) get().upsert(response);
+}
+
 export const useSessions = create<Store>((set, get) => ({
   sessions: {},
   order: [],
@@ -114,12 +122,13 @@ export const useSessions = create<Store>((set, get) => ({
   },
   createSession: async (request) => {
     const session = await api.createSession(request);
-    get().upsert(session);
+    upsertIfUnchanged(get, undefined, session);
     return session;
   },
   updateSession: async (id, patch) => {
+    const previous = get().sessions[id];
     const session = await api.updateSession(id, patch);
-    get().upsert(session);
+    upsertIfUnchanged(get, previous, session);
     return session;
   },
   deleteSession: async (id) => {
@@ -128,12 +137,13 @@ export const useSessions = create<Store>((set, get) => ({
   },
   forkSession: async (id, request) => {
     const session = await api.forkSession(id, request);
-    get().upsert(session);
+    upsertIfUnchanged(get, undefined, session);
     return session;
   },
   handoffSession: async (sourceId, request) => {
+    const previous = get().sessions[request.target_session_id];
     const session = await api.handoffSession(sourceId, request);
-    get().upsert(session);
+    upsertIfUnchanged(get, previous, session);
     return session;
   },
   connect: () => {

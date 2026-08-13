@@ -25,7 +25,7 @@ const backends: BackendInfo[] = [
   },
 ];
 
-describe("NewSessionDialog execution policy", () => {
+describe("NewSessionDialog", () => {
   let container: HTMLDivElement;
   let root: Root;
 
@@ -49,13 +49,20 @@ describe("NewSessionDialog execution policy", () => {
         <NewSessionDialog open onClose={() => {}} onCreated={() => {}} />,
       );
     });
+    const local = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent === "Local",
+    );
+    const codex = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent === "Codex",
+    );
+    expect(local?.getAttribute("aria-pressed")).toBe("true");
+    expect(codex?.getAttribute("aria-pressed")).toBe("false");
     expect(container.textContent).not.toContain("Sandboxed auto");
 
     await act(async () => {
-      Array.from(container.querySelectorAll("button"))
-        .find((button) => button.textContent === "Codex")
-        ?.click();
+      codex?.click();
     });
+    expect(codex?.getAttribute("aria-pressed")).toBe("true");
     expect(container.textContent).toContain("Sandboxed auto");
 
     await act(async () => {
@@ -64,6 +71,33 @@ describe("NewSessionDialog execution policy", () => {
         ?.click();
     });
     expect(container.textContent).not.toContain("Sandboxed auto");
+  });
+
+  it("closes with Escape and restores the previous focus", async () => {
+    const opener = document.createElement("button");
+    document.body.appendChild(opener);
+    opener.focus();
+    const onClose = vi.fn();
+
+    await act(async () => {
+      root.render(
+        <NewSessionDialog open onClose={onClose} onCreated={() => {}} />,
+      );
+    });
+    await act(async () => {
+      document.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+      );
+    });
+    expect(onClose).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      root.render(
+        <NewSessionDialog open={false} onClose={onClose} onCreated={() => {}} />,
+      );
+    });
+    expect(document.activeElement).toBe(opener);
+    opener.remove();
   });
 
   it("submits the selected Codex execution policy", async () => {

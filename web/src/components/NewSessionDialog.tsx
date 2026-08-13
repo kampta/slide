@@ -8,6 +8,7 @@ import {
   type SshHost,
 } from "../state/api";
 import { useSessions } from "../state/sessionStore";
+import { useModalDialog } from "../hooks/useModalDialog";
 import { DirectoryBrowser } from "./DirectoryBrowser";
 
 const RECENTS_KEY = "slide.recentBaseDirs";
@@ -86,6 +87,7 @@ export function NewSessionDialog({
   const [error, setError] = useState<string | null>(null);
   const nameRef = useRef<HTMLInputElement | null>(null);
   const createSession = useSessions((state) => state.createSession);
+  const dialogRef = useModalDialog<HTMLFormElement>(open, onClose, !submitting);
 
   useEffect(() => {
     api
@@ -107,11 +109,11 @@ export function NewSessionDialog({
   const selectedBackend = backends.find((item) => item.id === backend);
 
   useEffect(() => {
-    if (open) {
-      setError(null);
-      setSubmitting(false);
-      setTimeout(() => nameRef.current?.focus(), 10);
-    }
+    if (!open) return;
+    setError(null);
+    setSubmitting(false);
+    const timer = window.setTimeout(() => nameRef.current?.focus(), 10);
+    return () => window.clearTimeout(timer);
   }, [open]);
 
   // Whenever the dialog opens or the cluster (Local / SSH host) changes,
@@ -173,12 +175,17 @@ export function NewSessionDialog({
   }
 
   return (
-    <div className="modal-backdrop" onMouseDown={onClose}>
+    <div
+      className="modal-backdrop"
+      onMouseDown={() => !submitting && onClose()}
+    >
       <form
+        ref={dialogRef}
         className="modal"
         role="dialog"
         aria-modal="true"
         aria-labelledby="new-session-title"
+        tabIndex={-1}
         onMouseDown={(e) => e.stopPropagation()}
         onSubmit={submit}
       >
@@ -189,6 +196,7 @@ export function NewSessionDialog({
             <button
               type="button"
               className={location === "local" ? "active" : ""}
+              aria-pressed={location === "local"}
               onClick={() => {
                 setLocation("local");
                 setSshHost("");
@@ -204,6 +212,7 @@ export function NewSessionDialog({
                   key={h.alias}
                   type="button"
                   className={active ? "active" : ""}
+                  aria-pressed={active}
                   onClick={() => {
                     setLocation("remote");
                     setSshHost(h.alias);
@@ -224,6 +233,7 @@ export function NewSessionDialog({
                 key={item.id}
                 type="button"
                 className={backend === item.id ? "active" : ""}
+                aria-pressed={backend === item.id}
                 onClick={() => {
                   setBackend(item.id);
                   if (!item.execution_policies.includes(executionPolicy)) {
@@ -245,6 +255,7 @@ export function NewSessionDialog({
                   key={policy}
                   type="button"
                   className={executionPolicy === policy ? "active" : ""}
+                  aria-pressed={executionPolicy === policy}
                   onClick={() => setExecutionPolicy(policy)}
                   title={
                     policy === "sandboxed_auto"
