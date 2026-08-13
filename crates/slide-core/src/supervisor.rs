@@ -81,13 +81,6 @@ pub trait Supervisor: Send + Sync {
     /// just returns the original argv back.
     async fn spawn(&self, req: &SpawnReq) -> Result<Spawned>;
 
-    /// Is the backend still alive independently of the daemon?
-    ///
-    /// For tmux this is `tmux has-session`. For direct it's always
-    /// `false` — the daemon IS the lifeline, so if we lost it, the
-    /// backend is gone.
-    async fn is_alive(&self, id: &str) -> Result<bool>;
-
     /// Clean up everything this supervisor owns for `id`. Called on
     /// explicit kill/delete, not on archive.
     async fn teardown(&self, id: &str) -> Result<()>;
@@ -110,10 +103,6 @@ impl Supervisor for DirectPtySupervisor {
             attach_cwd: req.cwd.clone(),
             writes_log: WritesLog::Daemon,
         })
-    }
-
-    async fn is_alive(&self, _id: &str) -> Result<bool> {
-        Ok(false)
     }
 
     async fn teardown(&self, _id: &str) -> Result<()> {
@@ -229,20 +218,6 @@ impl Supervisor for TmuxSupervisor {
         })
     }
 
-    async fn is_alive(&self, id: &str) -> Result<bool> {
-        let host = self.host.clone();
-        let id = id.to_string();
-        spawn_blocking_result(move || -> Result<bool> {
-            // Unreachable hosts say "don't know" — caller should treat that
-            // as not-yet-dead, so collapse to false only on Absent.
-            Ok(matches!(
-                tmux::has_session(host.as_deref(), &id)?,
-                tmux::SessionProbe::Present,
-            ))
-        })
-        .await
-    }
-
     async fn teardown(&self, id: &str) -> Result<()> {
         let host = self.host.clone();
         let id = id.to_string();
@@ -345,12 +320,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_is_never_alive_across_daemon() {
-        let sup = DirectPtySupervisor;
-        assert!(!sup.is_alive("anything").await.unwrap());
-    }
-
-    #[tokio::test]
     async fn tmux_spawn_and_teardown_roundtrip() {
         if !tmux::is_available() {
             eprintln!("tmux not on PATH; skipping");
@@ -370,11 +339,17 @@ mod tests {
         };
         let s = sup.spawn(&req).await.unwrap();
         assert_eq!(s.writes_log, WritesLog::Supervisor);
-        assert!(sup.is_alive(&id).await.unwrap());
+        assert_eq!(
+            tmux::has_session(None, &id).unwrap(),
+            tmux::SessionProbe::Present
+        );
         assert_eq!(s.attach_argv[0], "tmux");
 
         sup.teardown(&id).await.unwrap();
-        assert!(!sup.is_alive(&id).await.unwrap());
+        assert_eq!(
+            tmux::has_session(None, &id).unwrap(),
+            tmux::SessionProbe::Absent
+        );
     }
 
     /// Spawn maps tmux's "can't find session" / "no server running" errors
