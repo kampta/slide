@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use portable_pty::{CommandBuilder, MasterPty, PtySize};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 pub struct Pty {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
 }
 
 pub struct Spawned {
@@ -50,8 +50,8 @@ impl Pty {
     }
 
     pub fn kill(&self) {
-        let mut c = self.child.lock().unwrap();
-        let _ = c.kill();
+        let mut killer = self.killer.lock().unwrap();
+        let _ = killer.kill();
     }
 }
 
@@ -82,6 +82,7 @@ pub fn spawn(argv: &[String], cwd: &Path, env: &[(String, String)]) -> Result<Sp
         .slave
         .spawn_command(cmd)
         .with_context(|| format!("spawning {}", program))?;
+    let killer = child.clone_killer();
 
     // Release the slave; only the child process needs it after spawn.
     drop(pair.slave);
@@ -115,26 +116,68 @@ pub fn spawn(argv: &[String], cwd: &Path, env: &[(String, String)]) -> Result<Sp
         }
     });
 
-    let child = Arc::new(Mutex::new(child));
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
-    {
-        let child = child.clone();
-        std::thread::spawn(move || {
-            let code = {
-                let mut c = child.lock().unwrap();
-                c.wait().ok().map(|s| s.exit_code() as i32)
-            };
-            let _ = exit_tx.send(code);
-        });
-    }
+    std::thread::spawn(move || {
+        let mut child = child;
+        let code = child.wait().ok().map(|s| s.exit_code() as i32);
+        let _ = exit_tx.send(code);
+    });
 
     Ok(Spawned {
         pty: Pty {
             master: Arc::new(Mutex::new(pair.master)),
             writer: Arc::new(Mutex::new(writer)),
-            child,
+            killer: Mutex::new(killer),
         },
         output: rx,
         exit: exit_rx,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[cfg(unix)]
+    fn long_running_command() -> Vec<String> {
+        vec!["sh".into(), "-c".into(), "sleep 5".into()]
+    }
+
+    #[cfg(windows)]
+    fn long_running_command() -> Vec<String> {
+        vec![
+            "powershell.exe".into(),
+            "-NoLogo".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            "Start-Sleep -Seconds 5".into(),
+        ]
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kill_does_not_wait_for_child_exit() {
+        let cwd = tempfile::tempdir().unwrap();
+        let spawned = spawn(&long_running_command(), cwd.path(), &[]).unwrap();
+
+        // Give the waiter time to enter its blocking wait. The killer must
+        // remain usable independently while that wait is in progress.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (kill_tx, kill_rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            spawned.pty.kill();
+            let _ = kill_tx.send(());
+        });
+
+        let exit = tokio::time::timeout(Duration::from_secs(2), async {
+            kill_rx.await.expect("killer thread stopped unexpectedly");
+            spawned.exit.await.expect("waiter stopped unexpectedly")
+        })
+        .await
+        .expect("kill contended with the blocking child wait");
+
+        assert!(exit.is_some(), "waiter did not report the child exit");
+    }
 }
