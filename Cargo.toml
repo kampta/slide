@@ -19,9 +19,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
-portable-pty = "0.8"
-dirs = "5"
-rand = "0.8"
+portable-pty = "0.9"
+dirs = "6"
+rand = "0.10"
 futures = "0.3"
 bytes = "1"
 async-trait = "0.1"
