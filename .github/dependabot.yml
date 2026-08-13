@@ -33,6 +33,5 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    groups:
-      actions:
-        patterns: ["*"]
+    # Action majors can change runner/runtime behavior. Keep them as
+    # individual PRs so each pin is reviewed against its release notes.
