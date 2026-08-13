@@ -150,6 +150,39 @@ async fn rollback_owned_worktree(
     Ok(())
 }
 
+async fn attach_process(
+    sup: &dyn supervisor::Supervisor,
+    session_id: &str,
+    handoff: &supervisor::Spawned,
+) -> Result<pty::Spawned> {
+    let spawned = pty::spawn(
+        &handoff.attach_argv,
+        &handoff.attach_cwd,
+        &handoff.attach_env,
+    )
+    .with_context(|| {
+        format!(
+            "spawn {} in {}",
+            handoff.attach_argv.join(" "),
+            handoff.attach_cwd.display()
+        )
+    });
+
+    match spawned {
+        Ok(spawned) => Ok(spawned),
+        Err(error) => {
+            if handoff.created_backend {
+                if let Err(cleanup_error) = sup.teardown(session_id).await {
+                    return Err(anyhow!(
+                        "{error:#}; failed to tear down newly created supervisor backend: {cleanup_error:#}"
+                    ));
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SpawnIntent {
     Fresh,
@@ -735,9 +768,7 @@ impl SessionManager {
             return Ok(session);
         }
         let switch_backend = backend.filter(|b| *b != session.backend);
-        let previous_backend = session.backend;
-        let previous_execution_policy = session.execution_policy;
-        let previous_backend_session_id = session.backend_session_id.clone();
+        let previous_session = session.clone();
         let requested_backend = switch_backend.unwrap_or(session.backend);
         // A backend switch without an explicit policy adopts that backend's
         // safe-to-describe default. Today all non-Codex backends support only
@@ -751,7 +782,6 @@ impl SessionManager {
             }
         });
         validate_execution_policy(requested_backend, requested_execution_policy)?;
-        let switch_execution_policy = requested_execution_policy != session.execution_policy;
         // Preflight before changing persisted provider identity. A missing or
         // unauthenticated runtime must leave the old resume target untouched.
         let diagnostic_host = session
@@ -760,24 +790,20 @@ impl SessionManager {
             .filter(|_| matches!(session.location, Location::Remote));
         self.preflight_runtime(requested_backend, diagnostic_host)
             .await?;
-        if let Some(new_backend) = switch_backend {
-            self.store
-                .update_backend(id, new_backend, requested_execution_policy)
-                .await?;
-            // Provider-scoped metadata is invalid after a backend switch.
-            self.backend_metadata.clear_session(id).await;
-            session = self.find(id).await?;
-        } else if switch_execution_policy {
-            self.store
-                .update_execution_policy(id, requested_execution_policy)
-                .await?;
-            session = self.find(id).await?;
+        session.backend = requested_backend;
+        session.execution_policy = requested_execution_policy;
+        if switch_backend.is_some() {
+            session.backend_session_id = None;
         }
         session.state = SessionState::Active;
         session.last_activity = now_ms();
         self.store
-            .update_state(id, SessionState::Active, session.last_activity)
+            .begin_resume(&session, switch_backend.is_some())
             .await?;
+        if switch_backend.is_some() {
+            // Provider-scoped metadata is invalid after a backend switch.
+            self.backend_metadata.clear_session(id).await;
+        }
         // A backend switch always starts a new conversation; same-backend
         // resume keeps Existing so --resume / resume-latest still apply.
         let intent = if switch_backend.is_some() {
@@ -786,37 +812,21 @@ impl SessionManager {
             SpawnIntent::Existing
         };
         if let Err(e) = self.spawn_process(&session, intent).await {
-            // Same rollback as create(): leaving Active here means the
-            // sidebar shows green but every WS attach gets "session not
-            // running" until the user manually stops it. Emit the state
-            // event so connected clients update without a refresh.
-            let _ = self
-                .store
-                .update_state(id, SessionState::Stopped, now_ms())
-                .await;
-            if switch_backend.is_some() {
-                let _ = self
-                    .store
-                    .restore_backend(
-                        id,
-                        previous_backend,
-                        previous_execution_policy,
-                        previous_backend_session_id.as_deref(),
-                    )
-                    .await;
-                self.backend_metadata.clear_session(id).await;
-            } else if switch_execution_policy {
-                let _ = self
-                    .store
-                    .update_execution_policy(id, previous_execution_policy)
-                    .await;
-            }
             self.runtime_diagnostics
                 .record_launch_failure(session.backend, session.ssh_host.as_deref());
-            self.emit(SessionEvent::SessionState {
-                id: id.to_string(),
-                state: SessionState::Stopped,
-            });
+            let mut restored = previous_session;
+            restored.state = SessionState::Stopped;
+            restored.last_activity = now_ms();
+            if let Err(rollback_error) = self
+                .store
+                .rollback_resume(&restored, switch_backend.is_some())
+                .await
+            {
+                return Err(anyhow!(
+                    "resume launch failed: {e:#}; failed to restore stopped session: {rollback_error:#}"
+                ));
+            }
+            self.emit(SessionEvent::SessionUpdated { session: restored });
             return Err(e);
         }
         self.emit(SessionEvent::SessionUpdated {
@@ -932,18 +942,7 @@ impl SessionManager {
 
             // Step 3: open a local PTY for the attach process. For Direct this
             // is just the backend itself; for Tmux it's `tmux attach-session`.
-            let spawned = pty::spawn(
-                &handoff.attach_argv,
-                &handoff.attach_cwd,
-                &handoff.attach_env,
-            )
-            .with_context(|| {
-                format!(
-                    "spawn {} in {}",
-                    handoff.attach_argv.join(" "),
-                    handoff.attach_cwd.display()
-                )
-            })?;
+            let spawned = attach_process(sup.as_ref(), &session.id, &handoff).await?;
             let running = RunningSession::start(
                 self.clone(),
                 session,
@@ -984,10 +983,37 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_handoff_prompt, newest_chars, normalize_focus, valid_id, validate_execution_policy,
+        attach_process, build_handoff_prompt, newest_chars, normalize_focus, valid_id,
+        validate_execution_policy,
     };
     use crate::backend::BackendKind;
-    use crate::session::ExecutionPolicy;
+    use crate::session::{ExecutionPolicy, SupervisorKind};
+    use crate::supervisor::{SpawnReq, Spawned, Supervisor, WritesLog};
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct RecordingSupervisor {
+        teardown_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Supervisor for RecordingSupervisor {
+        fn kind(&self) -> SupervisorKind {
+            SupervisorKind::Direct
+        }
+
+        async fn spawn(&self, _req: &SpawnReq) -> Result<Spawned> {
+            unreachable!("attach_process tests do not spawn through the supervisor")
+        }
+
+        async fn teardown(&self, _id: &str) -> Result<()> {
+            self.teardown_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
 
     #[test]
     fn valid_id_accepts_uuid_shape() {
@@ -1050,5 +1076,30 @@ mod tests {
         assert!(prompt.contains("session 'source'"));
         assert!(prompt.contains("Focus: check tests"));
         assert!(!prompt.contains('\n'));
+    }
+
+    #[tokio::test]
+    async fn failed_attach_only_tears_down_a_new_supervisor_backend() {
+        let cwd = tempfile::tempdir().unwrap();
+        for (created_backend, expected_teardowns) in [(true, 1), (false, 0)] {
+            let sup = RecordingSupervisor::default();
+            let handoff = Spawned {
+                attach_argv: Vec::new(),
+                attach_env: Vec::new(),
+                attach_cwd: PathBuf::from(cwd.path()),
+                writes_log: WritesLog::Supervisor,
+                created_backend,
+            };
+
+            let error = attach_process(&sup, "session", &handoff)
+                .await
+                .err()
+                .expect("an empty attach argv must fail");
+            assert!(format!("{error:#}").contains("empty argv"));
+            assert_eq!(
+                sup.teardown_calls.load(Ordering::Relaxed),
+                expected_teardowns
+            );
+        }
     }
 }

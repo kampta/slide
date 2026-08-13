@@ -242,72 +242,70 @@ impl Store {
         Ok(())
     }
 
-    /// Switch the session's LLM backend. Clears `backend_session_id` because
-    /// provider conversation ids are not portable across backends — resume
-    /// after a switch always starts a fresh conversation.
-    pub async fn update_backend(
+    /// Persist the active resume transition in one statement. Same-backend
+    /// resumes preserve any provider id written concurrently by discovery;
+    /// backend switches clear it because provider ids are not portable.
+    pub async fn begin_resume(
         &self,
-        id: &str,
-        backend: BackendKind,
-        execution_policy: ExecutionPolicy,
+        session: &Session,
+        clear_backend_session_id: bool,
     ) -> Result<()> {
-        let id = id.to_string();
-        let backend = backend.as_str().to_string();
-        let execution_policy = execution_policy.as_str().to_string();
+        let session = session.clone();
         self.conn
             .call(move |c| {
                 c.execute(
-                    "UPDATE sessions SET backend=?1, execution_policy=?2, backend_session_id=NULL WHERE id=?3",
-                    params![backend, execution_policy, id],
+                    "UPDATE sessions
+                     SET backend=?1, execution_policy=?2,
+                         backend_session_id=CASE WHEN ?3 THEN NULL ELSE backend_session_id END,
+                         state=?4, last_activity=?5
+                     WHERE id=?6",
+                    params![
+                        session.backend.as_str(),
+                        session.execution_policy.as_str(),
+                        clear_backend_session_id,
+                        session.state.as_str(),
+                        session.last_activity,
+                        session.id,
+                    ],
                 )?;
                 Ok(())
             })
             .await
-            .context("update backend")?;
+            .context("begin resume")?;
         Ok(())
     }
 
-    pub async fn update_execution_policy(
+    /// Restore the stopped launch snapshot after resume fails. A backend
+    /// switch restores its prior provider id; a same-backend rollback leaves
+    /// that id untouched because the transition never changed it.
+    pub async fn rollback_resume(
         &self,
-        id: &str,
-        execution_policy: ExecutionPolicy,
+        session: &Session,
+        restore_backend_session_id: bool,
     ) -> Result<()> {
-        let id = id.to_string();
-        let execution_policy = execution_policy.as_str().to_string();
+        let session = session.clone();
         self.conn
             .call(move |c| {
                 c.execute(
-                    "UPDATE sessions SET execution_policy=?1 WHERE id=?2",
-                    params![execution_policy, id],
+                    "UPDATE sessions
+                     SET backend=?1, execution_policy=?2,
+                         backend_session_id=CASE WHEN ?3 THEN ?4 ELSE backend_session_id END,
+                         state=?5, last_activity=?6
+                     WHERE id=?7",
+                    params![
+                        session.backend.as_str(),
+                        session.execution_policy.as_str(),
+                        restore_backend_session_id,
+                        session.backend_session_id,
+                        session.state.as_str(),
+                        session.last_activity,
+                        session.id,
+                    ],
                 )?;
                 Ok(())
             })
             .await
-            .context("update execution policy")?;
-        Ok(())
-    }
-
-    pub async fn restore_backend(
-        &self,
-        id: &str,
-        backend: BackendKind,
-        execution_policy: ExecutionPolicy,
-        backend_session_id: Option<&str>,
-    ) -> Result<()> {
-        let id = id.to_string();
-        let backend = backend.as_str().to_string();
-        let execution_policy = execution_policy.as_str().to_string();
-        let backend_session_id = backend_session_id.map(str::to_string);
-        self.conn
-            .call(move |c| {
-                c.execute(
-                    "UPDATE sessions SET backend=?1, execution_policy=?2, backend_session_id=?3 WHERE id=?4",
-                    params![backend, execution_policy, backend_session_id, id],
-                )?;
-                Ok(())
-            })
-            .await
-            .context("restore backend")?;
+            .context("rollback resume")?;
         Ok(())
     }
 
@@ -494,68 +492,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_backend_switches_backend_and_clears_provider_session_id() {
+    async fn resume_transition_and_rollback_are_complete_snapshots() {
         let store = mem_store().await;
         let mut session = make_session("id1", "s1");
         session.backend = BackendKind::Claude;
         session.backend_session_id = Some("claude-uuid".to_string());
         store.insert(&session).await.unwrap();
 
-        store
-            .update_backend("id1", BackendKind::Codex, ExecutionPolicy::SandboxedAuto)
-            .await
-            .unwrap();
+        let previous = session.clone();
+        session.backend = BackendKind::Codex;
+        session.execution_policy = ExecutionPolicy::SandboxedAuto;
+        session.backend_session_id = None;
+        session.state = SessionState::Active;
+        session.last_activity = 3_000;
+        store.begin_resume(&session, true).await.unwrap();
         let got = store.get("id1").await.unwrap().unwrap();
         assert_eq!(got.backend, BackendKind::Codex);
         assert_eq!(got.execution_policy, ExecutionPolicy::SandboxedAuto);
         assert!(got.backend_session_id.is_none());
-    }
+        assert_eq!(got.state, SessionState::Active);
+        assert_eq!(got.last_activity, 3_000);
 
-    #[tokio::test]
-    async fn update_execution_policy_preserves_backend_identity() {
-        let store = mem_store().await;
-        let mut session = make_session("id1", "s1");
-        session.backend = BackendKind::Codex;
-        session.backend_session_id = Some("codex-thread".into());
-        store.insert(&session).await.unwrap();
-
-        store
-            .update_execution_policy("id1", ExecutionPolicy::SandboxedAuto)
-            .await
-            .unwrap();
-        let got = store.get("id1").await.unwrap().unwrap();
-        assert_eq!(got.backend, BackendKind::Codex);
-        assert_eq!(got.execution_policy, ExecutionPolicy::SandboxedAuto);
-        assert_eq!(got.backend_session_id.as_deref(), Some("codex-thread"));
-    }
-
-    #[tokio::test]
-    async fn restore_backend_preserves_provider_session_id() {
-        let store = mem_store().await;
-        let mut session = make_session("id1", "one");
-        session.backend_session_id = Some("claude-thread".into());
-        store.insert(&session).await.unwrap();
-
-        store
-            .update_backend("id1", BackendKind::Codex, ExecutionPolicy::SandboxedAuto)
-            .await
-            .unwrap();
-        store
-            .restore_backend(
-                "id1",
-                BackendKind::Claude,
-                ExecutionPolicy::Unrestricted,
-                Some("claude-thread"),
-            )
-            .await
-            .unwrap();
-
+        let mut rollback = previous;
+        rollback.state = SessionState::Stopped;
+        rollback.last_activity = 4_000;
+        store.rollback_resume(&rollback, true).await.unwrap();
         let restored = store.get("id1").await.unwrap().unwrap();
         assert_eq!(restored.backend, BackendKind::Claude);
+        assert_eq!(restored.execution_policy, ExecutionPolicy::Unrestricted);
+        assert_eq!(restored.backend_session_id.as_deref(), Some("claude-uuid"));
+        assert_eq!(restored.state, SessionState::Stopped);
+        assert_eq!(restored.last_activity, 4_000);
+    }
+
+    #[tokio::test]
+    async fn same_backend_resume_preserves_provider_id_from_store() {
+        let store = mem_store().await;
+        let mut persisted = make_session("id1", "s1");
+        persisted.backend = BackendKind::Codex;
+        persisted.backend_session_id = Some("codex-thread".into());
+        store.insert(&persisted).await.unwrap();
+
+        let mut stale_snapshot = persisted;
+        stale_snapshot.backend_session_id = None;
+        stale_snapshot.state = SessionState::Active;
+        store.begin_resume(&stale_snapshot, false).await.unwrap();
+
+        let resumed = store.get("id1").await.unwrap().unwrap();
+        assert_eq!(resumed.backend_session_id.as_deref(), Some("codex-thread"));
+
+        stale_snapshot.state = SessionState::Stopped;
+        store.rollback_resume(&stale_snapshot, false).await.unwrap();
+        let rolled_back = store.get("id1").await.unwrap().unwrap();
         assert_eq!(
-            restored.backend_session_id.as_deref(),
-            Some("claude-thread")
+            rolled_back.backend_session_id.as_deref(),
+            Some("codex-thread")
         );
+        assert_eq!(rolled_back.state, SessionState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn failed_resume_transition_changes_no_resume_fields() {
+        let store = mem_store().await;
+        let mut initial = make_session("id1", "s1");
+        initial.backend_session_id = Some("claude-uuid".into());
+        store.insert(&initial).await.unwrap();
+        store
+            .conn
+            .call(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER reject_launch_update
+                     BEFORE UPDATE OF backend, execution_policy, backend_session_id, state, last_activity
+                     ON sessions BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let mut transition = initial.clone();
+        transition.backend = BackendKind::Codex;
+        transition.execution_policy = ExecutionPolicy::SandboxedAuto;
+        transition.backend_session_id = None;
+        transition.state = SessionState::Active;
+        transition.last_activity = 3_000;
+        assert!(store.begin_resume(&transition, true).await.is_err());
+
+        let unchanged = store.get("id1").await.unwrap().unwrap();
+        assert_eq!(unchanged.backend, initial.backend);
+        assert_eq!(unchanged.execution_policy, initial.execution_policy);
+        assert_eq!(unchanged.backend_session_id, initial.backend_session_id);
+        assert_eq!(unchanged.state, initial.state);
+        assert_eq!(unchanged.last_activity, initial.last_activity);
     }
 
     #[tokio::test]
@@ -567,10 +595,10 @@ mod tests {
             .set_backend_session_id_if_current("id1", BackendKind::Claude, "claude-id")
             .await
             .unwrap());
-        store
-            .update_backend("id1", BackendKind::Codex, ExecutionPolicy::Unrestricted)
-            .await
-            .unwrap();
+        let mut switched = store.get("id1").await.unwrap().unwrap();
+        switched.backend = BackendKind::Codex;
+        switched.backend_session_id = None;
+        store.begin_resume(&switched, true).await.unwrap();
         assert!(!store
             .set_backend_session_id_if_current("id1", BackendKind::Claude, "stale-id")
             .await

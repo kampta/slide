@@ -59,6 +59,10 @@ pub struct Spawned {
     pub attach_cwd: PathBuf,
     /// Who is responsible for persisting the session log to disk.
     pub writes_log: WritesLog,
+    /// Whether this call created a supervisor-owned backend that must be
+    /// removed if the daemon cannot open its attach PTY. False for direct
+    /// processes and when reattaching to an existing tmux session.
+    pub created_backend: bool,
 }
 
 /// Which side of the daemon boundary writes bytes to `log_path`.
@@ -102,6 +106,7 @@ impl Supervisor for DirectPtySupervisor {
             attach_env: req.env.clone(),
             attach_cwd: req.cwd.clone(),
             writes_log: WritesLog::Daemon,
+            created_backend: false,
         })
     }
 
@@ -158,7 +163,7 @@ impl Supervisor for TmuxSupervisor {
         // to avoid blocking the runtime and to keep the signatures sync.
         // Idempotent: if the tmux session is already alive (daemon restart,
         // resume path), we skip new-session and just re-establish pipe-pane.
-        spawn_blocking_result(move || -> Result<()> {
+        let created_backend = spawn_blocking_result(move || -> Result<bool> {
             let host = host.as_deref();
             let backend_name = argv.first().cloned().unwrap_or_default();
             // Idempotent: if the tmux session is already alive (daemon
@@ -175,6 +180,7 @@ impl Supervisor for TmuxSupervisor {
                     tmux::setup_mouse(host).ok();
                     tmux::pipe_pane(host, &id, &log_path)
                         .map_err(|e| translate_dead_session_err(e, &backend_name))?;
+                    Ok(false)
                 }
                 tmux::SessionProbe::Absent => {
                     // start-server is folded in via the chained call so an
@@ -195,6 +201,7 @@ impl Supervisor for TmuxSupervisor {
                         &log_path,
                     )
                     .map_err(|e| translate_dead_session_err(e, &backend_name))?;
+                    Ok(true)
                 }
                 tmux::SessionProbe::Unreachable => {
                     // Don't blindly create-new on an unreachable host: we
@@ -204,7 +211,6 @@ impl Supervisor for TmuxSupervisor {
                     bail!("ssh host unreachable — couldn't probe tmux session for {id}");
                 }
             }
-            Ok(())
         })
         .await?;
 
@@ -215,6 +221,7 @@ impl Supervisor for TmuxSupervisor {
             // matter what since tmux owns the backend's real cwd.
             attach_cwd: dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")),
             writes_log: WritesLog::Supervisor,
+            created_backend,
         })
     }
 
@@ -317,6 +324,7 @@ mod tests {
         assert_eq!(s.attach_env, req.env);
         assert_eq!(s.attach_cwd, req.cwd);
         assert_eq!(s.writes_log, WritesLog::Daemon);
+        assert!(!s.created_backend);
     }
 
     #[tokio::test]
@@ -339,11 +347,15 @@ mod tests {
         };
         let s = sup.spawn(&req).await.unwrap();
         assert_eq!(s.writes_log, WritesLog::Supervisor);
+        assert!(s.created_backend);
         assert_eq!(
             tmux::has_session(None, &id).unwrap(),
             tmux::SessionProbe::Present
         );
         assert_eq!(s.attach_argv[0], "tmux");
+
+        let existing = sup.spawn(&req).await.unwrap();
+        assert!(!existing.created_backend);
 
         sup.teardown(&id).await.unwrap();
         assert_eq!(
