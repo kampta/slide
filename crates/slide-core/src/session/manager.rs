@@ -106,7 +106,7 @@ pub(super) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn next_activity(previous: i64) -> Result<i64> {
+pub(super) fn next_activity(previous: i64) -> Result<i64> {
     let next = previous
         .checked_add(1)
         .context("session last_activity cannot advance")?;
@@ -260,38 +260,52 @@ impl SessionManager {
         let _ = self.events.send(Arc::new(ev));
     }
 
+    /// Persist a state transition and publish the exact timestamp SQLite kept.
+    /// Keeping both operations at this seam prevents an event from claiming a
+    /// timestamp that a newer database row has already superseded.
+    pub(super) async fn persist_state_event(
+        &self,
+        id: &str,
+        state: SessionState,
+        last_activity: i64,
+    ) -> Result<i64> {
+        let last_activity = self.store.update_state(id, state, last_activity).await?;
+        self.emit(SessionEvent::SessionState {
+            id: id.to_string(),
+            state,
+            last_activity,
+        });
+        Ok(last_activity)
+    }
+
     pub(super) async fn persist_classification(
         &self,
         id: &str,
         state: SessionState,
         last_activity: i64,
     ) {
-        if let Err(error) = self.store.update_state(id, state, last_activity).await {
+        if let Err(error) = self.persist_state_event(id, state, last_activity).await {
             tracing::warn!(session = id, error = %format!("{error:#}"), "persist classification");
-            return;
         }
-        self.emit(SessionEvent::SessionState {
-            id: id.to_string(),
-            state,
-        });
     }
 
     pub(super) async fn persist_unattached_state(&self, session: &Session, state: SessionState) {
         if session.state == state {
             return;
         }
+        let last_activity = match next_activity(session.last_activity) {
+            Ok(last_activity) => last_activity,
+            Err(error) => {
+                tracing::warn!(session = %session.id, error = %format!("{error:#}"), "advance unattached state");
+                return;
+            }
+        };
         if let Err(error) = self
-            .store
-            .update_state(&session.id, state, session.last_activity)
+            .persist_state_event(&session.id, state, last_activity)
             .await
         {
             tracing::warn!(session = %session.id, error = %format!("{error:#}"), "persist unattached state");
-            return;
         }
-        self.emit(SessionEvent::SessionState {
-            id: session.id.clone(),
-            state,
-        });
     }
 
     pub(super) fn operation_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -973,8 +987,8 @@ impl SessionManager {
             let id2 = session.id.clone();
             let mgr2 = self.clone();
             tokio::spawn(async move {
-                let code = spawned.exit.await.ok().flatten();
-                RecoveryCoordinator::handle_exit(mgr2, id2, running, code).await;
+                let _ = spawned.exit.await;
+                RecoveryCoordinator::handle_exit(mgr2, id2, running).await;
             });
 
             // Discover the backend's native session id so we can `--resume`
@@ -1238,8 +1252,10 @@ mod tests {
             &*live_event,
             SessionEvent::SessionState {
                 state: SessionState::Waiting,
+                last_activity,
                 ..
             }
+                if *last_activity == live_activity
         ));
         drop(commit);
 

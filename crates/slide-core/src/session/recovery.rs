@@ -1,4 +1,4 @@
-use super::manager::{now_ms, SessionManager, SpawnIntent};
+use super::manager::{next_activity, SessionManager, SpawnIntent};
 use super::running::RunningSession;
 use super::{Location, Session, SessionEvent, SessionState, SupervisorKind};
 use anyhow::Result;
@@ -58,19 +58,13 @@ impl RecoveryCoordinator {
                         path = %session.project_path,
                         "project path missing on cold start; marking stopped",
                     );
-                    let _ = manager
-                        .store
-                        .update_state(&session.id, SessionState::Stopped, now_ms())
-                        .await;
+                    persist_stopped(manager, &session).await?;
                 }
                 ColdStartStatus::Probe(crate::tmux::SessionProbe::Present) => {
                     survivors.push(session);
                 }
                 ColdStartStatus::Probe(crate::tmux::SessionProbe::Absent) => {
-                    let _ = manager
-                        .store
-                        .update_state(&session.id, SessionState::Stopped, now_ms())
-                        .await;
+                    persist_stopped(manager, &session).await?;
                 }
                 ColdStartStatus::Probe(crate::tmux::SessionProbe::Unreachable) => {
                     tracing::info!(
@@ -104,7 +98,6 @@ impl RecoveryCoordinator {
         manager: Arc<SessionManager>,
         id: String,
         running: Arc<RunningSession>,
-        code: Option<i32>,
     ) {
         let operation = manager.operation_lock(&id);
         let guard = operation.lock().await;
@@ -126,12 +119,12 @@ impl RecoveryCoordinator {
             Err(_) => return,
         };
         if !matches!(session.supervisor, SupervisorKind::Tmux) {
-            Self::mark_exited(&manager, &id, code).await;
+            Self::mark_exited(&manager, &session).await;
             return;
         }
 
         drop(guard);
-        Self::recover_tmux_attachment(manager, id, code).await;
+        Self::recover_tmux_attachment(manager, id).await;
     }
 
     async fn reattach_survivors(manager: Arc<SessionManager>, survivors: Vec<Session>) {
@@ -162,7 +155,7 @@ impl RecoveryCoordinator {
                 let manager = manager.clone();
                 let id = session.id.clone();
                 tokio::spawn(async move {
-                    Self::recover_tmux_attachment(manager, id, None).await;
+                    Self::recover_tmux_attachment(manager, id).await;
                 });
             }
         }
@@ -217,14 +210,14 @@ impl RecoveryCoordinator {
                     }
                     crate::tmux::SessionProbe::Absent => {
                         resolved_any = true;
-                        let _ = manager
-                            .store
-                            .update_state(&session.id, SessionState::Stopped, now_ms())
-                            .await;
-                        manager.emit(SessionEvent::SessionState {
-                            id: session.id,
-                            state: SessionState::Stopped,
-                        });
+                        if let Err(error) = persist_stopped(&manager, &session).await {
+                            tracing::warn!(
+                                session = %session.id,
+                                error = %format!("{error:#}"),
+                                "persist stopped session after deferred probe",
+                            );
+                            still_pending.push(session);
+                        }
                     }
                     crate::tmux::SessionProbe::Unreachable => {
                         manager
@@ -246,7 +239,7 @@ impl RecoveryCoordinator {
         }
     }
 
-    async fn recover_tmux_attachment(manager: Arc<SessionManager>, id: String, code: Option<i32>) {
+    async fn recover_tmux_attachment(manager: Arc<SessionManager>, id: String) {
         let mut delay = ATTACH_RETRY_INITIAL;
         tokio::time::sleep(delay).await;
         loop {
@@ -280,7 +273,7 @@ impl RecoveryCoordinator {
                     }
                 }
                 TmuxExitAction::Stop => {
-                    Self::mark_exited(&manager, &id, code).await;
+                    Self::mark_exited(&manager, &session).await;
                     return;
                 }
                 TmuxExitAction::Retry => tracing::warn!(
@@ -296,21 +289,26 @@ impl RecoveryCoordinator {
         }
     }
 
-    async fn mark_exited(manager: &SessionManager, id: &str, code: Option<i32>) {
-        manager.backend_metadata.cancel_discovery(id);
-        let _ = manager
-            .store
-            .update_state(id, SessionState::Stopped, now_ms())
-            .await;
-        manager.emit(SessionEvent::SessionExit {
-            id: id.to_string(),
-            code,
-        });
-        manager.emit(SessionEvent::SessionState {
-            id: id.to_string(),
-            state: SessionState::Stopped,
-        });
+    async fn mark_exited(manager: &SessionManager, session: &Session) {
+        manager.backend_metadata.cancel_discovery(&session.id);
+        if let Err(error) = persist_stopped(manager, session).await {
+            tracing::warn!(
+                session = %session.id,
+                error = %format!("{error:#}"),
+                "persist stopped session after process exit",
+            );
+        }
     }
+}
+
+/// Recovery transitions are lifecycle events, so they advance strictly past
+/// the row that was inspected. `persist_state_event` then emits only after the
+/// write succeeds and uses the exact timestamp retained by SQLite.
+async fn persist_stopped(manager: &SessionManager, session: &Session) -> Result<i64> {
+    let last_activity = next_activity(session.last_activity)?;
+    manager
+        .persist_state_event(&session.id, SessionState::Stopped, last_activity)
+        .await
 }
 
 async fn inspect_cold_session(session: Session) -> (Session, ColdStartStatus) {

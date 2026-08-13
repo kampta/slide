@@ -21,6 +21,14 @@ const BROADCAST_CAP: usize = 256;
 const UNKNOWN_RECHECK_INITIAL: Duration = Duration::from_secs(5);
 const UNKNOWN_RECHECK_MAX: Duration = Duration::from_secs(30);
 
+fn initial_activity(persisted: i64, observed: i64) -> i64 {
+    persisted.max(observed)
+}
+
+fn record_activity(last_activity: &AtomicI64, observed: i64) {
+    last_activity.fetch_max(observed, Ordering::SeqCst);
+}
+
 /// Bounded terminal history without repeatedly shifting a full buffer when
 /// old output expires.
 struct ByteRing {
@@ -79,7 +87,10 @@ impl RunningSession {
     ) -> Arc<Self> {
         let (output_tx, _) = broadcast::channel(BROADCAST_CAP);
         let ring = Arc::new(Mutex::new(ByteRing::new()));
-        let last_activity = Arc::new(AtomicI64::new(now_ms()));
+        let last_activity = Arc::new(AtomicI64::new(initial_activity(
+            session.last_activity,
+            now_ms(),
+        )));
         let activity_notify = Arc::new(Notify::new());
         let classification = Arc::new(ClassificationFence::new());
         let classifier_handle = tokio::spawn(classifier_task(ClassifierCtx {
@@ -205,7 +216,7 @@ fn spawn_output_reader(
 ) {
     tokio::spawn(async move {
         while let Some(chunk) = output.recv().await {
-            last_activity.store(now_ms(), Ordering::SeqCst);
+            record_activity(&last_activity, now_ms());
             {
                 let mut ring = ring.lock().await;
                 ring.push(&chunk);
@@ -411,5 +422,17 @@ mod tests {
         let sizes = HashMap::from([(1, (200, 30)), (2, (60, 80)), (3, (120, 40))]);
         assert_eq!(effective_min_size(&sizes), Some((60, 30)));
         assert_eq!(effective_min_size(&HashMap::new()), None);
+    }
+
+    #[test]
+    fn activity_clock_never_moves_backward() {
+        assert_eq!(initial_activity(20, 10), 20);
+        assert_eq!(initial_activity(10, 20), 20);
+
+        let activity = AtomicI64::new(20);
+        record_activity(&activity, 10);
+        assert_eq!(activity.load(Ordering::SeqCst), 20);
+        record_activity(&activity, 30);
+        assert_eq!(activity.load(Ordering::SeqCst), 30);
     }
 }

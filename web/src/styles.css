@@ -411,6 +411,21 @@ body.is-resizing-panels * {
   overflow-y: auto;
 }
 
+.session-group {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+}
+
+.session-group-stopped {
+  margin-top: auto;
+}
+
+.session-group-live + .session-group-stopped {
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+}
+
 .session-filter {
   position: relative;
   display: flex;
