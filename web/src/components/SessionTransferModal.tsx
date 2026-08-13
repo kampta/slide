@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { api, type BackendInfo, type Session } from "../state/api";
 import { useSessions } from "../state/sessionStore";
+import { useModalDialog } from "../hooks/useModalDialog";
 
 export function suggestedForkName(source: string, existing: Set<string>): string {
   const stem = `${source}-fork`;
@@ -31,6 +32,7 @@ export function SessionTransferModal({
   const [focus, setFocus] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const dialogRef = useModalDialog<HTMLElement>(open, onClose, !loading);
 
   const targets = useMemo(
     () =>
@@ -105,10 +107,12 @@ export function SessionTransferModal({
   return (
     <div className="modal-backdrop" onMouseDown={() => !loading && onClose()}>
       <section
+        ref={dialogRef}
         className="modal session-transfer-modal"
         role="dialog"
         aria-modal="true"
         aria-labelledby="session-transfer-title"
+        tabIndex={-1}
         onMouseDown={(event) => event.stopPropagation()}
       >
         <div className="diagnostics-heading">

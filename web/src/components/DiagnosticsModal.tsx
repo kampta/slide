@@ -6,6 +6,7 @@ import {
   type RuntimeStatus,
   type SshHost,
 } from "../state/api";
+import { useModalDialog } from "../hooks/useModalDialog";
 
 export function runtimeTone(status: RuntimeStatus): "ok" | "warn" | "danger" {
   if (status === "ready") return "ok";
@@ -60,6 +61,7 @@ export function DiagnosticsModal({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [refreshNonce, setRefreshNonce] = useState(0);
+  const dialogRef = useModalDialog<HTMLElement>(open, onClose);
 
   useEffect(() => {
     if (!open) return;
@@ -108,10 +110,12 @@ export function DiagnosticsModal({
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
       <section
+        ref={dialogRef}
         className="modal diagnostics-modal"
         role="dialog"
         aria-modal="true"
         aria-labelledby="diagnostics-title"
+        tabIndex={-1}
         onMouseDown={(event) => event.stopPropagation()}
       >
         <div className="diagnostics-heading">
