@@ -3,7 +3,7 @@ use axum::http::{header, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use rust_embed::Embed;
 
-const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; img-src 'self' data:; font-src 'self' data:; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; font-src 'self' data:; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
 const X_FRAME_OPTIONS: HeaderName = HeaderName::from_static("x-frame-options");
 const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
 const REFERRER_POLICY: HeaderName = HeaderName::from_static("referrer-policy");
@@ -118,7 +118,8 @@ mod tests {
 
     #[test]
     fn csp_allows_the_spa_transport_but_denies_embedding() {
-        assert!(CONTENT_SECURITY_POLICY.contains("connect-src 'self' ws: wss:"));
+        assert!(CONTENT_SECURITY_POLICY.contains("connect-src 'self'"));
+        assert!(!CONTENT_SECURITY_POLICY.contains("connect-src 'self' ws:"));
         assert!(CONTENT_SECURITY_POLICY.contains("frame-ancestors 'none'"));
         assert!(CONTENT_SECURITY_POLICY.contains("object-src 'none'"));
         assert!(!CONTENT_SECURITY_POLICY.contains("script-src 'self' 'unsafe-inline'"));
