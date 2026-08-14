@@ -157,14 +157,12 @@ impl Client {
             "method": method,
             "params": params
         }))?;
-        let response = self.response_with_id(id)?;
-        serde_json::from_value(
-            response
-                .get("result")
-                .cloned()
-                .context("Codex app-server response omitted result")?,
-        )
-        .with_context(|| format!("decode Codex {method} response"))
+        let mut response = self.response_with_id(id)?;
+        let result = response
+            .get_mut("result")
+            .map(Value::take)
+            .context("Codex app-server response omitted result")?;
+        serde_json::from_value(result).with_context(|| format!("decode Codex {method} response"))
     }
 
     fn notify(&mut self, method: &'static str, params: Value) -> Result<()> {
