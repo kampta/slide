@@ -5,28 +5,16 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    # Routine PRs stay low-risk. Security updates are not restricted by
-    # update-types, so a vulnerable dependency can still cross this boundary.
-    allow:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-patch"]
-    groups:
-      rust-patches:
-        patterns: ["*"]
-        update-types: ["patch"]
+    # Disable routine version PRs. Repository security updates stay enabled.
+    open-pull-requests-limit: 0
 
   - package-ecosystem: npm
     directory: /web
     versioning-strategy: increase-if-necessary
     schedule:
       interval: weekly
-    allow:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-patch"]
-    groups:
-      web-patches:
-        patterns: ["*"]
-        update-types: ["patch"]
+    # Disable routine version PRs. Repository security updates stay enabled.
+    open-pull-requests-limit: 0
 
   - package-ecosystem: github-actions
     directory: /

@@ -18,8 +18,8 @@ pub struct Spawned {
     /// fanout (per-session broadcast subscribers) share one allocation
     /// instead of cloning a fresh `Vec<u8>` per receiver.
     pub output: mpsc::Receiver<Bytes>,
-    /// Fires with the exit code when the child exits.
-    pub exit: tokio::sync::oneshot::Receiver<Option<i32>>,
+    /// Fires when the child exits.
+    pub exit: tokio::sync::oneshot::Receiver<()>,
 }
 
 /// Capacity of the PTY → daemon channel. A misbehaving consumer (slow disk
@@ -29,6 +29,8 @@ pub struct Spawned {
 /// reader thread parks; we never queue more than CAP × 8 KiB ≈ 2 MiB per
 /// session in the channel itself.
 const PTY_CHANNEL_CAP: usize = 256;
+const DEFAULT_COLS: u16 = 120;
+const DEFAULT_ROWS: u16 = 40;
 
 impl Pty {
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
@@ -56,11 +58,24 @@ impl Pty {
 }
 
 pub fn spawn(argv: &[String], cwd: &Path, env: &[(String, String)]) -> Result<Spawned> {
+    spawn_sized(argv, cwd, env, DEFAULT_COLS, DEFAULT_ROWS)
+}
+
+pub fn spawn_sized(
+    argv: &[String],
+    cwd: &Path,
+    env: &[(String, String)],
+    cols: u16,
+    rows: u16,
+) -> Result<Spawned> {
+    if cols == 0 || rows == 0 {
+        anyhow::bail!("pty dimensions must be non-zero");
+    }
     let pty_system = portable_pty::native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
-            rows: 40,
-            cols: 120,
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         })
@@ -119,8 +134,8 @@ pub fn spawn(argv: &[String], cwd: &Path, env: &[(String, String)]) -> Result<Sp
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         let mut child = child;
-        let code = child.wait().ok().map(|s| s.exit_code() as i32);
-        let _ = exit_tx.send(code);
+        let _ = child.wait();
+        let _ = exit_tx.send(());
     });
 
     Ok(Spawned {
@@ -171,13 +186,32 @@ mod tests {
             let _ = kill_tx.send(());
         });
 
-        let exit = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(2), async {
             kill_rx.await.expect("killer thread stopped unexpectedly");
             spawned.exit.await.expect("waiter stopped unexpectedly")
         })
         .await
         .expect("kill contended with the blocking child wait");
+    }
 
-        assert!(exit.is_some(), "waiter did not report the child exit");
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sized_spawn_sets_the_initial_terminal_dimensions() {
+        let cwd = tempfile::tempdir().unwrap();
+        let command = vec!["sh".into(), "-c".into(), "stty size".into()];
+        let mut spawned = spawn_sized(&command, cwd.path(), &[], 93, 27).unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(2), spawned.output.recv())
+            .await
+            .expect("command produced no output")
+            .expect("pty closed without output");
+
+        assert_eq!(String::from_utf8_lossy(&output).trim(), "27 93");
+    }
+
+    #[test]
+    fn sized_spawn_rejects_zero_dimensions() {
+        let cwd = tempfile::tempdir().unwrap();
+        assert!(spawn_sized(&long_running_command(), cwd.path(), &[], 0, 40).is_err());
+        assert!(spawn_sized(&long_running_command(), cwd.path(), &[], 120, 0).is_err());
     }
 }

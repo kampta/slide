@@ -73,8 +73,48 @@ describe("session store snapshots", () => {
     useSessions.getState().upsert({ ...newer, state: "stopped" });
     expect(useSessions.getState().order).toEqual(["older", "stopped", "newer"]);
 
-    useSessions.getState().upsert({ ...stopped, state: "active" });
+    useSessions.getState().upsert({
+      ...stopped,
+      state: "active",
+      last_activity: stopped.last_activity + 1,
+    });
     expect(useSessions.getState().order).toEqual(["stopped", "older", "newer"]);
+  });
+
+  it("does not let an older snapshot resurrect a stopped session", () => {
+    const stopped = session("one", {
+      state: "stopped",
+      last_activity: 20,
+    });
+    useSessions.getState().loadSnapshot([stopped]);
+    useSessions.getState().loadSnapshot([
+      { ...stopped, state: "active", last_activity: 10 },
+    ]);
+
+    expect(useSessions.getState().sessions.one).toEqual(stopped);
+  });
+
+  it("orders state events by lifecycle timestamp", () => {
+    const stopped = session("one", {
+      state: "stopped",
+      last_activity: 20,
+    });
+    useSessions.getState().loadSnapshot([stopped]);
+
+    useSessions.getState().setSessionState("one", "active", 19);
+    useSessions.getState().setSessionState("one", "active", 20);
+    useSessions.getState().setSessionState("one", "active");
+    expect(useSessions.getState().sessions.one).toEqual(stopped);
+
+    useSessions.getState().setSessionState("one", "active", 21);
+    useSessions.getState().setSessionState("one", "waiting", 21);
+    expect(useSessions.getState().sessions.one).toMatchObject({
+      state: "waiting",
+      last_activity: 21,
+    });
+
+    useSessions.getState().setSessionState("one", "stopped");
+    expect(useSessions.getState().sessions.one.state).toBe("stopped");
   });
 });
 
@@ -178,5 +218,63 @@ describe("session store mutations", () => {
       base_dir: "/code/slide",
     });
     expect(useSessions.getState().sessions.created).toEqual(createdEvent);
+  });
+
+  it("applies a newer lifecycle response after an intervening event", async () => {
+    const original = session("existing", { created_at: 20, last_activity: 10 });
+    const other = session("other", { created_at: 10, last_activity: 10 });
+    const waiting = { ...original, state: "waiting" as const };
+    const stopped = {
+      ...original,
+      state: "stopped" as const,
+      last_activity: 20,
+    };
+    useSessions.getState().loadSnapshot([original, other]);
+    vi.spyOn(api, "updateSession").mockImplementation(async () => {
+      useSessions.getState().upsert(waiting);
+      return stopped;
+    });
+
+    await useSessions.getState().updateSession(original.id, { action: "stop" });
+
+    expect(useSessions.getState().sessions.existing).toEqual(stopped);
+    expect(useSessions.getState().order).toEqual(["other", "existing"]);
+  });
+
+  it("does not let an older lifecycle response overwrite a newer event", async () => {
+    const stopped = session("existing", {
+      state: "stopped",
+      last_activity: 20,
+    });
+    const resumed = {
+      ...stopped,
+      state: "active" as const,
+      last_activity: 30,
+    };
+    useSessions.getState().loadSnapshot([stopped]);
+    vi.spyOn(api, "updateSession").mockImplementation(async () => {
+      useSessions.getState().upsert(resumed);
+      return stopped;
+    });
+
+    await useSessions.getState().updateSession(stopped.id, { action: "stop" });
+
+    expect(useSessions.getState().sessions.existing).toEqual(resumed);
+  });
+
+  it("does not apply an older full-session event", () => {
+    const stopped = session("existing", {
+      state: "stopped",
+      last_activity: 30,
+    });
+    useSessions.getState().loadSnapshot([stopped]);
+
+    useSessions.getState().upsert({
+      ...stopped,
+      state: "waiting",
+      last_activity: 20,
+    });
+
+    expect(useSessions.getState().sessions.existing).toEqual(stopped);
   });
 });

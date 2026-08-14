@@ -3,18 +3,40 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::response::Response;
+use futures::stream::{SplitSink, SplitStream};
 use futures::{sink::SinkExt, stream::StreamExt};
 use serde_json::json;
+use slide_core::session::manager::TerminalAttachment;
 use tokio::sync::broadcast::error::RecvError;
 
 const MAX_TERMINAL_DIMENSION: u16 = 1000;
+// Keep large pastes practical without inheriting Tungstenite's 64 MiB default.
+const MAX_CLIENT_MESSAGE_BYTES: usize = 1024 * 1024;
+const TERMINAL_ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const TERMINAL_HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-fn terminal_dimension(value: Option<&serde_json::Value>, fallback: u16) -> u16 {
+type SocketSender = SplitSink<WebSocket, Message>;
+type SocketReceiver = SplitStream<WebSocket>;
+
+fn terminal_dimension(value: Option<&serde_json::Value>) -> Option<u16> {
     value
         .and_then(serde_json::Value::as_u64)
         .and_then(|n| u16::try_from(n).ok())
         .filter(|n| (1..=MAX_TERMINAL_DIMENSION).contains(n))
-        .unwrap_or(fallback)
+}
+
+fn terminal_hello(text: &str) -> Option<(u16, u16)> {
+    let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    if !matches!(
+        value.get("type").and_then(|kind| kind.as_str()),
+        Some("hello" | "resize")
+    ) {
+        return None;
+    }
+    Some((
+        terminal_dimension(value.get("cols"))?,
+        terminal_dimension(value.get("rows"))?,
+    ))
 }
 
 async fn close_with_auth_failed(mut sock: WebSocket) {
@@ -27,13 +49,64 @@ async fn close_with_auth_failed(mut sock: WebSocket) {
         .await;
 }
 
+async fn send_terminal_error(tx: &mut SocketSender, error: &str) {
+    let _ = tx
+        .send(Message::Text(
+            json!({ "type": "error", "error": error }).to_string(),
+        ))
+        .await;
+}
+
+async fn send_terminal_ready(tx: &mut SocketSender) -> bool {
+    tx.send(Message::Text(json!({ "type": "ready" }).to_string()))
+        .await
+        .is_ok()
+}
+
+async fn receive_terminal_hello(
+    tx: &mut SocketSender,
+    rx: &mut SocketReceiver,
+) -> Option<(u16, u16)> {
+    let deadline = tokio::time::Instant::now() + TERMINAL_HELLO_TIMEOUT;
+    loop {
+        let message = match tokio::time::timeout_at(deadline, rx.next()).await {
+            Ok(Some(Ok(message))) => message,
+            _ => {
+                send_terminal_error(tx, "terminal hello required").await;
+                return None;
+            }
+        };
+        match message {
+            Message::Text(text) => match terminal_hello(&text) {
+                Some(size) => return Some(size),
+                None => {
+                    send_terminal_error(tx, "invalid terminal hello").await;
+                    return None;
+                }
+            },
+            Message::Ping(payload) => {
+                if tx.send(Message::Pong(payload)).await.is_err() {
+                    return None;
+                }
+            }
+            Message::Close(_) => return None,
+            _ => {
+                send_terminal_error(tx, "terminal hello must be the first message").await;
+                return None;
+            }
+        }
+    }
+}
+
 pub async fn events(
     State(state): State<AppState>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
     let auth_ok = request_is_authenticated(&headers, &state);
-    ws.protocols([SAFE_PROTO])
+    ws.max_message_size(MAX_CLIENT_MESSAGE_BYTES)
+        .max_frame_size(MAX_CLIENT_MESSAGE_BYTES)
+        .protocols([SAFE_PROTO])
         .on_upgrade(move |sock| async move {
             if !auth_ok {
                 close_with_auth_failed(sock).await;
@@ -97,7 +170,9 @@ pub async fn session(
     ws: WebSocketUpgrade,
 ) -> Response {
     let auth_ok = request_is_authenticated(&headers, &state);
-    ws.protocols([SAFE_PROTO])
+    ws.max_message_size(MAX_CLIENT_MESSAGE_BYTES)
+        .max_frame_size(MAX_CLIENT_MESSAGE_BYTES)
+        .protocols([SAFE_PROTO])
         .on_upgrade(move |sock| async move {
             if !auth_ok {
                 close_with_auth_failed(sock).await;
@@ -107,37 +182,182 @@ pub async fn session(
         })
 }
 
-#[allow(clippy::collapsible_match)]
 async fn handle_session(socket: WebSocket, state: AppState, id: String) {
+    let Ok(_permit) = state.terminal_slots.clone().try_acquire_owned() else {
+        let (mut tx, _) = socket.split();
+        send_terminal_error(&mut tx, "too many terminal connections; close another tab").await;
+        return;
+    };
     let (mut tx, mut rx) = socket.split();
-    // Per-WS id so SessionManager can track each attached client's
-    // viewport size independently. Without this, two clients on the
-    // same session each set the PTY to their own dimensions and
-    // trample each other's render.
-    let client_id = state.manager.next_client_id();
+    let Some((cols, rows)) = receive_terminal_hello(&mut tx, &mut rx).await else {
+        return;
+    };
 
+    match state.manager.attach_terminal(&id, cols, rows).await {
+        Ok(Some(attachment)) => {
+            handle_dedicated_terminal(tx, rx, attachment).await;
+        }
+        Ok(None) => {
+            handle_shared_terminal(tx, rx, state, id, cols, rows).await;
+        }
+        Err(error) => {
+            send_terminal_error(&mut tx, &error.to_string()).await;
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ClientEvent {
+    Input(Vec<u8>),
+    Resize(u16, u16),
+    NativePing(Vec<u8>),
+    AppPing,
+    Close,
+    Ignore,
+}
+
+fn client_event(message: Option<Result<Message, axum::Error>>) -> ClientEvent {
+    match message {
+        Some(Ok(Message::Binary(bytes))) => ClientEvent::Input(bytes),
+        Some(Ok(Message::Text(text))) => {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                return ClientEvent::Ignore;
+            };
+            match value.get("type").and_then(|kind| kind.as_str()) {
+                Some("resize") => match (
+                    terminal_dimension(value.get("cols")),
+                    terminal_dimension(value.get("rows")),
+                ) {
+                    (Some(cols), Some(rows)) => ClientEvent::Resize(cols, rows),
+                    _ => ClientEvent::Ignore,
+                },
+                Some("ping") => ClientEvent::AppPing,
+                _ => ClientEvent::Ignore,
+            }
+        }
+        Some(Ok(Message::Ping(payload))) => ClientEvent::NativePing(payload),
+        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => ClientEvent::Close,
+        _ => ClientEvent::Ignore,
+    }
+}
+
+async fn send_pong(tx: &mut SocketSender, event: &ClientEvent) -> bool {
+    match event {
+        ClientEvent::NativePing(payload) => tx.send(Message::Pong(payload.clone())).await.is_ok(),
+        ClientEvent::AppPing => tx
+            .send(Message::Text(json!({ "type": "pong" }).to_string()))
+            .await
+            .is_ok(),
+        _ => true,
+    }
+}
+
+async fn handle_dedicated_terminal(
+    mut tx: SocketSender,
+    mut rx: SocketReceiver,
+    mut terminal: TerminalAttachment,
+) {
+    // A successful tmux attachment immediately emits its initial redraw.
+    // Keep that first chunk buffered until `ready` so the frontend resets
+    // only after an output stream exists, without losing any pane bytes.
+    let first = match tokio::time::timeout(TERMINAL_ATTACH_TIMEOUT, terminal.recv()).await {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            send_terminal_error(&mut tx, "terminal attachment closed before it was ready").await;
+            return;
+        }
+        Err(_) => {
+            send_terminal_error(&mut tx, "terminal attachment timed out").await;
+            return;
+        }
+    };
+    if !send_terminal_ready(&mut tx).await
+        || tx.send(Message::Binary(first.to_vec())).await.is_err()
+    {
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            output = terminal.recv() => match output {
+                Some(bytes) if tx.send(Message::Binary(bytes.to_vec())).await.is_ok() => {}
+                _ => break,
+            },
+            message = rx.next() => {
+                let event = client_event(message);
+                match event {
+                    ClientEvent::Input(ref bytes) if terminal.write(bytes).is_err() => break,
+                    ClientEvent::Resize(cols, rows) if terminal.resize(cols, rows).is_err() => break,
+                    event @ (ClientEvent::NativePing(_) | ClientEvent::AppPing)
+                        if !send_pong(&mut tx, &event).await => break,
+                    ClientEvent::NativePing(_) | ClientEvent::AppPing => {}
+                    ClientEvent::Close => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+async fn handle_shared_terminal(
+    mut tx: SocketSender,
+    mut rx: SocketReceiver,
+    state: AppState,
+    id: String,
+    cols: u16,
+    rows: u16,
+) {
+    // Direct supervision owns one PTY, so all attached browser sizes are
+    // reconciled by SessionManager. Tmux sessions never take this path.
+    let client_id = state.manager.next_client_id();
+    let _ = state
+        .manager
+        .set_client_size(&id, client_id, cols, rows)
+        .await;
+    handle_shared_terminal_inner(&mut tx, &mut rx, &state, &id, client_id).await;
+    // This is the only post-registration exit path. `forget_client` safely
+    // no-ops if registration never happened and also covers resize failures
+    // that inserted the client before the underlying PTY resize failed.
+    state.manager.forget_client(&id, client_id).await;
+}
+
+async fn handle_shared_terminal_inner(
+    tx: &mut SocketSender,
+    rx: &mut SocketReceiver,
+    state: &AppState,
+    id: &str,
+    client_id: u64,
+) {
     // Atomic snapshot + subscribe: the manager holds the ring lock across
     // both, so the snapshot we send below contains every byte broadcast up
     // to that instant, and the subscriber sees only bytes after — no gap,
     // no duplicate. Falling back to the on-disk log when the session isn't
     // running is safe because the log file is immutable in that state.
-    let (snapshot, mut output) = match state.manager.subscribe_output_with_snapshot(&id).await {
+    let (snapshot, mut output) = match state.manager.subscribe_output_with_snapshot(id).await {
         Some(pair) => pair,
         None => {
-            if let Ok(bytes) = state.manager.get_log(&id).await {
-                if !bytes.is_empty() && tx.send(Message::Binary(bytes)).await.is_err() {
+            match state.manager.get_log(id).await {
+                Ok(bytes) => {
+                    if !send_terminal_ready(tx).await {
+                        return;
+                    }
+                    if !bytes.is_empty() && tx.send(Message::Binary(bytes)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    send_terminal_error(tx, &error.to_string()).await;
                     return;
                 }
             }
-            let _ = tx
-                .send(Message::Text(
-                    json!({ "type": "error", "error": "session not running" }).to_string(),
-                ))
-                .await;
+            send_terminal_error(tx, "session not running").await;
             return;
         }
     };
 
+    if !send_terminal_ready(tx).await {
+        return;
+    }
     if !snapshot.is_empty() && tx.send(Message::Binary(snapshot)).await.is_err() {
         return;
     }
@@ -160,7 +380,7 @@ async fn handle_session(socket: WebSocket, state: AppState, id: String) {
                     // hole in the terminal stream.
                     let Some((fresh_snapshot, fresh_output)) = state
                         .manager
-                        .subscribe_output_with_snapshot(&id)
+                        .subscribe_output_with_snapshot(id)
                         .await
                     else {
                         break;
@@ -177,53 +397,79 @@ async fn handle_session(socket: WebSocket, state: AppState, id: String) {
                 }
                 Err(RecvError::Closed) => break,
             },
-            client = rx.next() => match client {
-                Some(Ok(Message::Binary(data))) => {
-                    if state.manager.write_input(&id, &data).await.is_err() {
-                        break;
+            message = rx.next() => {
+                let event = client_event(message);
+                match event {
+                    ClientEvent::Input(ref bytes) => {
+                        if state.manager.write_input(id, bytes).await.is_err() { break; }
                     }
-                }
-                Some(Ok(Message::Text(text))) => {
-                    // JSON control messages: {"type":"resize","cols":120,"rows":40}
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                        match v.get("type").and_then(|t| t.as_str()) {
-                            Some("resize") => {
-                                let cols = terminal_dimension(v.get("cols"), 120);
-                                let rows = terminal_dimension(v.get("rows"), 40);
-                                let _ = state.manager.set_client_size(&id, client_id, cols, rows).await;
-                            }
-                            Some("input") => {
-                                if let Some(s) = v.get("bytes").and_then(|x| x.as_str()) {
-                                    let _ = state.manager.write_input(&id, s.as_bytes()).await;
-                                }
-                            }
-                            _ => {}
+                    ClientEvent::Resize(cols, rows) => {
+                        if state.manager.set_client_size(id, client_id, cols, rows).await.is_err() {
+                            break;
                         }
                     }
+                    event @ (ClientEvent::NativePing(_) | ClientEvent::AppPing)
+                        if !send_pong(tx, &event).await => break,
+                    ClientEvent::NativePing(_) | ClientEvent::AppPing => {}
+                    ClientEvent::Close => break,
+                    ClientEvent::Ignore => {}
                 }
-                Some(Ok(Message::Ping(p))) => { let _ = tx.send(Message::Pong(p)).await; }
-                Some(Ok(Message::Close(_))) | None => break,
-                Some(Err(_)) => break,
-                _ => {}
             }
         }
     }
-    // Drop this client's recorded viewport so the PTY can grow back to
-    // whatever the remaining attached clients can accommodate.
-    state.manager.forget_client(&id, client_id).await;
 }
 
 #[cfg(test)]
 mod tests {
-    use super::terminal_dimension;
+    use super::{client_event, terminal_dimension, terminal_hello, ClientEvent};
+    use axum::extract::ws::Message;
     use serde_json::json;
 
     #[test]
     fn terminal_dimensions_reject_zero_and_overflow() {
-        assert_eq!(terminal_dimension(Some(&json!(80)), 120), 80);
-        assert_eq!(terminal_dimension(Some(&json!(0)), 120), 120);
-        assert_eq!(terminal_dimension(Some(&json!(1001)), 120), 120);
-        assert_eq!(terminal_dimension(Some(&json!(70_000)), 120), 120);
-        assert_eq!(terminal_dimension(Some(&json!("80")), 120), 120);
+        assert_eq!(terminal_dimension(Some(&json!(80))), Some(80));
+        assert_eq!(terminal_dimension(Some(&json!(0))), None);
+        assert_eq!(terminal_dimension(Some(&json!(1001))), None);
+        assert_eq!(terminal_dimension(Some(&json!(70_000))), None);
+        assert_eq!(terminal_dimension(Some(&json!("80"))), None);
+    }
+
+    #[test]
+    fn initial_size_accepts_hello_and_legacy_resize() {
+        assert_eq!(
+            terminal_hello(r#"{"type":"hello","cols":120,"rows":40}"#),
+            Some((120, 40))
+        );
+        assert_eq!(
+            terminal_hello(r#"{"type":"resize","cols":120,"rows":40}"#),
+            Some((120, 40))
+        );
+        assert_eq!(
+            terminal_hello(r#"{"type":"hello","cols":0,"rows":40}"#),
+            None
+        );
+        assert_eq!(terminal_hello(r#"{"type":"hello","cols":120}"#), None);
+    }
+
+    #[test]
+    fn client_controls_cover_input_resize_and_ping() {
+        assert_eq!(
+            client_event(Some(Ok(Message::Binary(vec![1, 2, 3])))),
+            ClientEvent::Input(vec![1, 2, 3])
+        );
+        assert_eq!(
+            client_event(Some(Ok(Message::Text(
+                r#"{"type":"resize","cols":93,"rows":27}"#.to_string()
+            )))),
+            ClientEvent::Resize(93, 27)
+        );
+        assert_eq!(
+            client_event(Some(Ok(Message::Text(r#"{"type":"ping"}"#.to_string())))),
+            ClientEvent::AppPing
+        );
+        assert_eq!(
+            client_event(Some(Ok(Message::Ping(vec![4, 5])))),
+            ClientEvent::NativePing(vec![4, 5])
+        );
     }
 }

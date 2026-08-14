@@ -19,11 +19,45 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 
 const BROADCAST_CAP: usize = 256;
 const HANDOFF_TAIL_BYTES: usize = 32 * 1024;
 const HANDOFF_CONTEXT_CHARS: usize = 8_000;
+
+/// A browser-owned tmux client. Dropping it kills only the local attach
+/// process (or SSH transport); the supervised tmux session keeps running.
+pub struct TerminalAttachment {
+    pty: pty::Pty,
+    output: mpsc::Receiver<Bytes>,
+}
+
+impl TerminalAttachment {
+    fn new(spawned: pty::Spawned) -> Self {
+        Self {
+            pty: spawned.pty,
+            output: spawned.output,
+        }
+    }
+
+    pub async fn recv(&mut self) -> Option<Bytes> {
+        self.output.recv().await
+    }
+
+    pub fn write(&self, bytes: &[u8]) -> Result<()> {
+        self.pty.write(bytes)
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        self.pty.resize(cols, rows)
+    }
+}
+
+impl Drop for TerminalAttachment {
+    fn drop(&mut self) {
+        self.pty.kill();
+    }
+}
 
 /// Reject ids that could escape `logs_dir` when joined as `{id}.log`, or
 /// otherwise reach outside the caller's intent. All ids this daemon
@@ -104,6 +138,13 @@ pub(super) fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+pub(super) fn next_activity(previous: i64) -> Result<i64> {
+    let next = previous
+        .checked_add(1)
+        .context("session last_activity cannot advance")?;
+    Ok(now_ms().max(next))
 }
 
 async fn remove_owned_worktree(session: &Session) -> Result<()> {
@@ -253,38 +294,52 @@ impl SessionManager {
         let _ = self.events.send(Arc::new(ev));
     }
 
+    /// Persist a state transition and publish the exact timestamp SQLite kept.
+    /// Keeping both operations at this seam prevents an event from claiming a
+    /// timestamp that a newer database row has already superseded.
+    pub(super) async fn persist_state_event(
+        &self,
+        id: &str,
+        state: SessionState,
+        last_activity: i64,
+    ) -> Result<i64> {
+        let last_activity = self.store.update_state(id, state, last_activity).await?;
+        self.emit(SessionEvent::SessionState {
+            id: id.to_string(),
+            state,
+            last_activity,
+        });
+        Ok(last_activity)
+    }
+
     pub(super) async fn persist_classification(
         &self,
         id: &str,
         state: SessionState,
         last_activity: i64,
     ) {
-        if let Err(error) = self.store.update_state(id, state, last_activity).await {
+        if let Err(error) = self.persist_state_event(id, state, last_activity).await {
             tracing::warn!(session = id, error = %format!("{error:#}"), "persist classification");
-            return;
         }
-        self.emit(SessionEvent::SessionState {
-            id: id.to_string(),
-            state,
-        });
     }
 
     pub(super) async fn persist_unattached_state(&self, session: &Session, state: SessionState) {
         if session.state == state {
             return;
         }
+        let last_activity = match next_activity(session.last_activity) {
+            Ok(last_activity) => last_activity,
+            Err(error) => {
+                tracing::warn!(session = %session.id, error = %format!("{error:#}"), "advance unattached state");
+                return;
+            }
+        };
         if let Err(error) = self
-            .store
-            .update_state(&session.id, state, session.last_activity)
+            .persist_state_event(&session.id, state, last_activity)
             .await
         {
             tracing::warn!(session = %session.id, error = %format!("{error:#}"), "persist unattached state");
-            return;
         }
-        self.emit(SessionEvent::SessionState {
-            id: session.id.clone(),
-            state,
-        });
     }
 
     pub(super) fn operation_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -321,19 +376,52 @@ impl SessionManager {
         Some(r.subscribe_with_snapshot().await)
     }
 
+    /// Open a fresh, correctly sized tmux client for one browser WebSocket.
+    /// Direct sessions keep using the daemon-owned PTY and return `None`.
+    pub async fn attach_terminal(
+        &self,
+        id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Option<TerminalAttachment>> {
+        check_id(id)?;
+        if cols == 0 || rows == 0 {
+            bail!("terminal dimensions must be non-zero");
+        }
+        let Some(running) = self.running_session(id).await else {
+            return Ok(None);
+        };
+        if !matches!(running.supervisor(), SupervisorKind::Tmux) {
+            return Ok(None);
+        }
+
+        let session = self.find(id).await?;
+        if let Some(host) = session.ssh_host.as_deref() {
+            crate::ssh::validate_host(host)?;
+        }
+        let argv = crate::tmux::attach_argv(session.ssh_host.as_deref(), id);
+        let cwd = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        let spawned = pty::spawn_sized(&argv, &cwd, &[], cols, rows)
+            .with_context(|| format!("attach terminal for session {id}"))?;
+        Ok(Some(TerminalAttachment::new(spawned)))
+    }
+
     pub async fn get_log(&self, id: &str) -> Result<Vec<u8>> {
         check_id(id)?;
-        // Prefer in-memory ring; fall back to disk log.
+        // Prefer the live in-memory ring. Once stopped, tmux requires the
+        // rendered pane snapshot captured by explicit Stop; Direct retains
+        // the existing bounded raw-log fallback.
         if let Some(r) = self.running_session(id).await {
             return Ok(r.snapshot().await);
         }
         let session = self.find(id).await?;
-        tokio::task::spawn_blocking(move || {
-            match history::read_tail(&session, history::DEFAULT_TAIL_BYTES) {
-                Ok(bytes) => Ok(bytes),
-                Err(error) if error.downcast_ref::<std::io::Error>().is_some() => Ok(Vec::new()),
-                Err(error) => Err(error),
+        let direct = matches!(session.supervisor, SupervisorKind::Direct);
+        tokio::task::spawn_blocking(move || match history::read_stopped(&session) {
+            Ok(bytes) => Ok(bytes),
+            Err(error) if direct && error.downcast_ref::<std::io::Error>().is_some() => {
+                Ok(Vec::new())
             }
+            Err(error) => Err(error),
         })
         .await?
     }
@@ -364,7 +452,7 @@ impl SessionManager {
     ) -> Result<RuntimeDiagnosticsSnapshot> {
         let cache = self.runtime_diagnostics.clone();
         let host = host.map(str::to_string);
-        tokio::task::spawn_blocking(move || cache.get(host.as_deref(), refresh))
+        tokio::task::spawn_blocking(move || cache.diagnostics(host.as_deref(), refresh))
             .await
             .context("join runtime diagnostics probe")?
     }
@@ -451,11 +539,46 @@ impl SessionManager {
         // session Stopped. Resume spawns a fresh backend that either
         // continues the prior conversation (via `--resume`) or starts new.
         let s = self.find(id).await?;
+        if matches!(s.supervisor, SupervisorKind::Tmux) {
+            let snapshot_session = s.clone();
+            let snapshot = tokio::task::spawn_blocking(move || {
+                let bytes = crate::tmux::capture_history(
+                    snapshot_session.ssh_host.as_deref(),
+                    &snapshot_session.id,
+                )?;
+                if bytes.is_empty() {
+                    bail!("tmux session disappeared before history capture");
+                }
+                history::write_rendered(&snapshot_session.id, &bytes)
+            })
+            .await;
+            if let Err(error) = snapshot
+                .context("join rendered terminal history capture")
+                .and_then(|result| result)
+            {
+                tracing::warn!(
+                    session = id,
+                    error = %format!("{error:#}"),
+                    "capture rendered terminal history before stop"
+                );
+                if let Err(remove_error) = history::remove_rendered(id) {
+                    tracing::warn!(
+                        session = id,
+                        error = %format!("{remove_error:#}"),
+                        "invalidate stale rendered terminal history"
+                    );
+                }
+            }
+        }
         supervisor::for_session(&s).teardown(id).await?;
         self.kill_running(id).await;
         self.backend_metadata.cancel_discovery(id);
+        // Classification is now quiescent. Advance from the latest row so
+        // the terminal lifecycle update is both the last write and strictly
+        // newer than every state event that preceded it.
+        let last_activity = next_activity(self.find(id).await?.last_activity)?;
         self.store
-            .update_state(id, SessionState::Stopped, now_ms())
+            .update_state(id, SessionState::Stopped, last_activity)
             .await?;
         let session = self.find(id).await?;
         self.emit(SessionEvent::SessionUpdated {
@@ -478,6 +601,13 @@ impl SessionManager {
         }
         self.store.delete(id).await?;
         self.backend_metadata.clear_session(id).await;
+        if let Err(error) = history::remove_rendered(id) {
+            tracing::warn!(
+                session = id,
+                error = %format!("{error:#}"),
+                "remove rendered terminal history after delete"
+            );
+        }
         match session.location {
             Location::Local => {
                 let path = session
@@ -796,7 +926,7 @@ impl SessionManager {
             session.backend_session_id = None;
         }
         session.state = SessionState::Active;
-        session.last_activity = now_ms();
+        session.last_activity = next_activity(session.last_activity)?;
         self.store
             .begin_resume(&session, switch_backend.is_some())
             .await?;
@@ -816,7 +946,7 @@ impl SessionManager {
                 .record_launch_failure(session.backend, session.ssh_host.as_deref());
             let mut restored = previous_session;
             restored.state = SessionState::Stopped;
-            restored.last_activity = now_ms();
+            restored.last_activity = next_activity(session.last_activity)?;
             if let Err(rollback_error) = self
                 .store
                 .rollback_resume(&restored, switch_backend.is_some())
@@ -848,10 +978,9 @@ impl SessionManager {
         let running = self.running.write().await.remove(id);
         if let Some(r) = running {
             // Exit watchers retain an Arc<RunningSession> until the child reports
-            // its status. Abort immediately rather than waiting for Drop so
-            // metadata workers can observe their final sender closing while
-            // stop/delete still holds the per-session operation lock.
-            r.kill();
+            // its status. Quiesce classification explicitly rather than waiting
+            // for Drop so the terminal lifecycle write cannot be overtaken.
+            r.kill().await;
         }
     }
 
@@ -885,6 +1014,16 @@ impl SessionManager {
         intent: SpawnIntent,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
+            // Every backend launch starts a new terminal-generation. A
+            // rendered snapshot belongs only to the stopped generation that
+            // produced it, so remove it before attaching or spawning.
+            if let Err(error) = history::remove_rendered(&session.id) {
+                tracing::warn!(
+                    session = %session.id,
+                    error = %format!("{error:#}"),
+                    "invalidate rendered terminal history before launch"
+                );
+            }
             let backend = backend::for_kind(session.backend);
             // Step 1: build the backend argv and the cwd *on the host that runs
             // the backend*. The supervisor is responsible for wrapping this in
@@ -963,8 +1102,8 @@ impl SessionManager {
             let id2 = session.id.clone();
             let mgr2 = self.clone();
             tokio::spawn(async move {
-                let code = spawned.exit.await.ok().flatten();
-                RecoveryCoordinator::handle_exit(mgr2, id2, running, code).await;
+                let _ = spawned.exit.await;
+                RecoveryCoordinator::handle_exit(mgr2, id2, running).await;
             });
 
             // Discover the backend's native session id so we can `--resume`
@@ -983,16 +1122,25 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_process, build_handoff_prompt, newest_chars, normalize_focus, valid_id,
-        validate_execution_policy,
+        attach_process, build_handoff_prompt, newest_chars, next_activity, normalize_focus,
+        valid_id, validate_execution_policy, BackendMetadata, RunningSession, SessionManager,
+        TerminalAttachment, BROADCAST_CAP,
     };
     use crate::backend::BackendKind;
-    use crate::session::{ExecutionPolicy, SupervisorKind};
+    use crate::runtime::RuntimeDiagnosticsCache;
+    use crate::session::{
+        ExecutionPolicy, Location, Session, SessionEvent, SessionState, SupervisorKind,
+    };
+    use crate::store::Store;
     use crate::supervisor::{SpawnReq, Spawned, Supervisor, WritesLog};
     use anyhow::Result;
     use async_trait::async_trait;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration;
+    use tokio::sync::{broadcast, RwLock};
 
     #[derive(Default)]
     struct RecordingSupervisor {
@@ -1013,6 +1161,23 @@ mod tests {
             self.teardown_calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
+    }
+
+    #[cfg(unix)]
+    fn long_running_command() -> Vec<String> {
+        vec!["sh".into(), "-c".into(), "sleep 30".into()]
+    }
+
+    #[cfg(windows)]
+    fn long_running_command() -> Vec<String> {
+        vec![
+            "powershell.exe".into(),
+            "-NoLogo".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            "Start-Sleep -Seconds 30".into(),
+        ]
     }
 
     #[test]
@@ -1053,6 +1218,17 @@ mod tests {
             validate_execution_policy(BackendKind::Claude, ExecutionPolicy::SandboxedAuto,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn lifecycle_activity_is_strictly_monotonic() {
+        let prior = super::now_ms() + 10_000;
+        let stopped = next_activity(prior).unwrap();
+        let resumed = next_activity(stopped).unwrap();
+        let rollback = next_activity(resumed).unwrap();
+
+        assert!(prior < stopped && stopped < resumed && resumed < rollback);
+        assert!(next_activity(i64::MAX).is_err());
     }
 
     #[test]
@@ -1101,5 +1277,157 @@ mod tests {
                 expected_teardowns
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_terminal_attachment_kills_only_its_child() {
+        let cwd = tempfile::tempdir().unwrap();
+        let crate::session::pty::Spawned { pty, output, exit } =
+            crate::session::pty::spawn(&long_running_command(), cwd.path(), &[]).unwrap();
+        let attachment = TerminalAttachment { pty, output };
+
+        drop(attachment);
+
+        tokio::time::timeout(Duration::from_secs(2), exit)
+            .await
+            .expect("attachment child was not killed")
+            .expect("attachment waiter stopped unexpectedly");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_fences_classifier_persistence_and_events() {
+        let store = Arc::new(Store::open(Path::new(":memory:")).await.unwrap());
+        let (event_tx, _) = broadcast::channel(BROADCAST_CAP);
+        let manager = Arc::new(SessionManager {
+            store: store.clone(),
+            running: RwLock::new(HashMap::new()),
+            events: event_tx.clone(),
+            next_client_id: AtomicU64::new(1),
+            operation_locks: StdMutex::new(HashMap::new()),
+            backend_metadata: BackendMetadata::new(store, event_tx),
+            runtime_diagnostics: Arc::new(RuntimeDiagnosticsCache::default()),
+        });
+        let cwd = tempfile::tempdir().unwrap();
+        let initial_activity = super::now_ms();
+        let session = Session {
+            id: "classifier-stop-race".to_string(),
+            name: "race".to_string(),
+            backend: BackendKind::Claude,
+            execution_policy: ExecutionPolicy::Unrestricted,
+            location: Location::Local,
+            ssh_host: None,
+            base_dir: cwd.path().to_string_lossy().into_owned(),
+            project_path: cwd.path().to_string_lossy().into_owned(),
+            worktree: false,
+            state: SessionState::Active,
+            created_at: initial_activity,
+            last_activity: initial_activity,
+            supervisor: SupervisorKind::Direct,
+            host_log_path: Some(
+                cwd.path()
+                    .join("session.log")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            backend_session_id: None,
+            parent_session_id: None,
+        };
+        manager.store.insert(&session).await.unwrap();
+
+        let crate::session::pty::Spawned {
+            pty,
+            output,
+            exit: _exit,
+        } = crate::session::pty::spawn(&long_running_command(), cwd.path(), &[]).unwrap();
+        let running = RunningSession::start(
+            manager.clone(),
+            &session,
+            pty,
+            output,
+            WritesLog::Daemon,
+            &cwd.path().join("session.log"),
+        )
+        .await;
+        manager
+            .running
+            .write()
+            .await
+            .insert(session.id.clone(), running.clone());
+
+        let fence = running.classification_fence();
+        // Model a classifier that passed the enabled check and owns the
+        // commit gate before Stop starts.
+        let commit = fence.hold_commit().await;
+        let mut events = manager.subscribe_events();
+        let stop_manager = manager.clone();
+        let stop_id = session.id.clone();
+        let stop = tokio::spawn(async move { stop_manager.stop(&stop_id).await });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while fence.is_enabled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stop did not disable classification");
+
+        // This is the tail of the already-in-flight commit. Stop must wait
+        // for its database write and event before publishing Stopped.
+        let live_activity = super::now_ms() + 10_000;
+        manager
+            .persist_classification(&session.id, SessionState::Waiting, live_activity)
+            .await;
+        let live_event = events.recv().await.unwrap();
+        assert!(matches!(
+            &*live_event,
+            SessionEvent::SessionState {
+                state: SessionState::Waiting,
+                last_activity,
+                ..
+            }
+                if *last_activity == live_activity
+        ));
+        drop(commit);
+
+        let stopped = tokio::time::timeout(Duration::from_secs(2), stop)
+            .await
+            .expect("stop remained blocked")
+            .expect("stop task panicked")
+            .expect("stop failed");
+        assert_eq!(stopped.state, SessionState::Stopped);
+        assert!(stopped.last_activity > live_activity);
+        assert_eq!(
+            manager.find(&session.id).await.unwrap().state,
+            SessionState::Stopped
+        );
+        assert!(!manager.running.read().await.contains_key(&session.id));
+
+        let stopped_event = events.recv().await.unwrap();
+        assert!(matches!(
+            &*stopped_event,
+            SessionEvent::SessionUpdated { session }
+                if session.state == SessionState::Stopped
+                    && session.last_activity == stopped.last_activity
+        ));
+
+        // A classifier that was queued behind Stop observes the disabled
+        // fence and cannot write or emit after Stop completes.
+        assert!(
+            !fence
+                .persist(
+                    &manager,
+                    &session.id,
+                    SessionState::Active,
+                    stopped.last_activity + 1,
+                )
+                .await
+        );
+        let persisted = manager.find(&session.id).await.unwrap();
+        assert_eq!(persisted.state, SessionState::Stopped);
+        assert_eq!(persisted.last_activity, stopped.last_activity);
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 }

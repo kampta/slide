@@ -6,6 +6,7 @@ import {
   STALE_TOKEN_MESSAGE,
   WS_CLOSE_AUTH_FAILED,
   type Session,
+  type SessionState,
 } from "./api";
 
 interface Store {
@@ -24,6 +25,11 @@ interface Store {
   clearError: () => void;
   loadSnapshot: (list: Session[]) => void;
   upsert: (s: Session) => void;
+  setSessionState: (
+    id: string,
+    state: SessionState,
+    lastActivity?: number,
+  ) => void;
   remove: (id: string) => void;
   createSession: (
     request: Parameters<typeof api.createSession>[0],
@@ -76,12 +82,37 @@ function sessionsEqual(a: Session, b: Session): boolean {
   );
 }
 
+function shouldReplaceSession(current: Session, incoming: Session): boolean {
+  if (incoming.last_activity !== current.last_activity) {
+    return incoming.last_activity > current.last_activity;
+  }
+  // Stopped is terminal for one lifecycle. Resume always advances the
+  // timestamp, while live classifier states may legitimately share one.
+  return current.state !== "stopped" || incoming.state === "stopped";
+}
+
 function upsertIfUnchanged(
   get: () => Store,
   previous: Session | undefined,
   response: Session,
 ): void {
   if (get().sessions[response.id] === previous) get().upsert(response);
+}
+
+function upsertLifecycleResponse(
+  get: () => Store,
+  previous: Session | undefined,
+  response: Session,
+): void {
+  // Stop/resume timestamps are monotonic. They let the HTTP result beat an
+  // earlier classifier event without overwriting a genuinely newer lifecycle.
+  const current = get().sessions[response.id];
+  if (
+    current === previous ||
+    (current && response.last_activity > current.last_activity)
+  ) {
+    get().upsert(response);
+  }
 }
 
 export const useSessions = create<Store>((set, get) => ({
@@ -96,9 +127,14 @@ export const useSessions = create<Store>((set, get) => ({
     set({ error: error instanceof Error ? error.message : String(error) }),
   clearError: () => set({ error: null }),
   loadSnapshot: (list) => {
+    const current = get().sessions;
     const sessions: Record<string, Session> = {};
-    for (const s of list) sessions[s.id] = s;
-    const order = [...list].sort(sortOrder).map((s) => s.id);
+    for (const session of list) {
+      const existing = current[session.id];
+      sessions[session.id] =
+        existing && !shouldReplaceSession(existing, session) ? existing : session;
+    }
+    const order = Object.values(sessions).sort(sortOrder).map((s) => s.id);
     const activeId = get().activeId;
     set({
       sessions,
@@ -108,10 +144,24 @@ export const useSessions = create<Store>((set, get) => ({
   },
   upsert: (s) => {
     const existing = get().sessions[s.id];
-    if (existing && sessionsEqual(existing, s)) return;
+    if (
+      existing &&
+      (sessionsEqual(existing, s) || !shouldReplaceSession(existing, s))
+    ) {
+      return;
+    }
     const sessions = { ...get().sessions, [s.id]: s };
     const order = Object.values(sessions).sort(sortOrder).map((x) => x.id);
     set({ sessions, order });
+  },
+  setSessionState: (id, state, lastActivity) => {
+    const session = get().sessions[id];
+    if (!session) return;
+    get().upsert({
+      ...session,
+      state,
+      last_activity: lastActivity ?? session.last_activity,
+    });
   },
   remove: (id) => {
     const sessions = { ...get().sessions };
@@ -128,7 +178,11 @@ export const useSessions = create<Store>((set, get) => ({
   updateSession: async (id, patch) => {
     const previous = get().sessions[id];
     const session = await api.updateSession(id, patch);
-    upsertIfUnchanged(get, previous, session);
+    if (patch.action) {
+      upsertLifecycleResponse(get, previous, session);
+    } else {
+      upsertIfUnchanged(get, previous, session);
+    }
     return session;
   },
   deleteSession: async (id) => {
@@ -196,16 +250,7 @@ export const useSessions = create<Store>((set, get) => ({
             get().remove(msg.id);
             break;
           case "session_state":
-            {
-              const s = get().sessions[msg.id];
-              if (s) get().upsert({ ...s, state: msg.state });
-            }
-            break;
-          case "session_exit":
-            {
-              const s = get().sessions[msg.id];
-              if (s) get().upsert({ ...s, state: "stopped" });
-            }
+            get().setSessionState(msg.id, msg.state, msg.last_activity);
             break;
         }
       };

@@ -411,6 +411,21 @@ body.is-resizing-panels * {
   overflow-y: auto;
 }
 
+.session-group {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+}
+
+.session-group-stopped {
+  margin-top: auto;
+}
+
+.session-group-live + .session-group-stopped {
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+}
+
 .session-filter {
   position: relative;
   display: flex;
@@ -956,6 +971,75 @@ body.is-resizing-panels * {
   font: 9px var(--font-mono);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.diagnostic-rate-limits {
+  display: grid;
+  gap: 8px;
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px solid var(--border);
+}
+
+.diagnostic-rate-limit {
+  min-width: 0;
+}
+
+.diagnostic-rate-limit-heading,
+.diagnostic-rate-limit-meta {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.diagnostic-rate-limit-heading {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.diagnostic-rate-limit-heading > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.diagnostic-rate-limit-heading strong {
+  flex: none;
+  color: var(--text);
+  font: 10px var(--font-mono);
+}
+
+.diagnostic-rate-limit-meter {
+  height: 3px;
+  margin: 3px 0;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--surface-raised);
+}
+
+.diagnostic-rate-limit-meter > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--active);
+}
+
+.diagnostic-rate-limit-meter-warn > span {
+  background: var(--waiting);
+}
+
+.diagnostic-rate-limit-meter-danger > span {
+  background: var(--danger);
+}
+
+.diagnostic-rate-limit-meta {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.diagnostic-rate-limit-meta time,
+.diagnostic-rate-limit-meta span:last-child {
+  text-align: right;
 }
 
 .diagnostic-card .diagnostic-action {

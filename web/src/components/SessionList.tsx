@@ -36,9 +36,24 @@ export function SessionList({
   const connected = useSessions((s) => s.connected);
   const [query, setQuery] = useState("");
 
-  const visible = useMemo(
-    () => order.map((id) => sessions[id]).filter((session) => session && matchesSession(session, query)),
-    [order, query, sessions],
+  const groups = useMemo(() => {
+    const live: Session[] = [];
+    const stopped: Session[] = [];
+    for (const id of order) {
+      const session = sessions[id];
+      if (!session || !matchesSession(session, query)) continue;
+      (session.state === "stopped" ? stopped : live).push(session);
+    }
+    return { live, stopped };
+  }, [order, query, sessions]);
+
+  const renderSession = (session: Session) => (
+    <SessionItem
+      key={session.id}
+      session={session}
+      active={session.id === activeId}
+      onClick={() => setActive(session.id)}
+    />
   );
 
   return (
@@ -100,14 +115,16 @@ export function SessionList({
         />
       </label>
       <div className="session-list-scroll">
-        {visible.map((session) => (
-          <SessionItem
-            key={session.id}
-            session={session}
-            active={session.id === activeId}
-            onClick={() => setActive(session.id)}
-          />
-        ))}
+        {groups.live.length > 0 && (
+          <div className="session-group session-group-live">
+            {groups.live.map(renderSession)}
+          </div>
+        )}
+        {groups.stopped.length > 0 && (
+          <div className="session-group session-group-stopped">
+            {groups.stopped.map(renderSession)}
+          </div>
+        )}
         {order.length === 0 && (
           <div className="empty">
             No sessions yet.<br />
@@ -117,7 +134,7 @@ export function SessionList({
             <span className="mobile-only">Tap + to create one.</span>
           </div>
         )}
-        {order.length > 0 && visible.length === 0 && (
+        {order.length > 0 && groups.live.length + groups.stopped.length === 0 && (
           <div className="empty">No matching sessions.</div>
         )}
       </div>

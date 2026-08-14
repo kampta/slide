@@ -200,11 +200,20 @@ fn default_local() -> Location {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
-    SessionAdded { session: Session },
-    SessionUpdated { session: Session },
-    SessionRemoved { id: String },
-    SessionState { id: String, state: SessionState },
-    SessionExit { id: String, code: Option<i32> },
+    SessionAdded {
+        session: Session,
+    },
+    SessionUpdated {
+        session: Session,
+    },
+    SessionRemoved {
+        id: String,
+    },
+    SessionState {
+        id: String,
+        state: SessionState,
+        last_activity: i64,
+    },
 }
 
 #[cfg(test)]
@@ -223,6 +232,25 @@ mod tests {
             assert_eq!(state.as_str(), s);
             assert_eq!(SessionState::from_str(s), Some(state));
         }
+    }
+
+    #[test]
+    fn session_state_event_serializes_persisted_activity() {
+        let event = SessionEvent::SessionState {
+            id: "session-id".to_string(),
+            state: SessionState::Waiting,
+            last_activity: 42,
+        };
+
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            serde_json::json!({
+                "type": "session_state",
+                "id": "session-id",
+                "state": "waiting",
+                "last_activity": 42,
+            }),
+        );
     }
 
     #[test]

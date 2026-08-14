@@ -8,7 +8,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -20,6 +20,14 @@ const TAIL_SNIFF: usize = 4 * 1024;
 const BROADCAST_CAP: usize = 256;
 const UNKNOWN_RECHECK_INITIAL: Duration = Duration::from_secs(5);
 const UNKNOWN_RECHECK_MAX: Duration = Duration::from_secs(30);
+
+fn initial_activity(persisted: i64, observed: i64) -> i64 {
+    persisted.max(observed)
+}
+
+fn record_activity(last_activity: &AtomicI64, observed: i64) {
+    last_activity.fetch_max(observed, Ordering::SeqCst);
+}
 
 /// Bounded terminal history without repeatedly shifting a full buffer when
 /// old output expires.
@@ -63,6 +71,7 @@ pub(super) struct RunningSession {
     supervisor: SupervisorKind,
     output_tx: broadcast::Sender<Bytes>,
     ring: Arc<Mutex<ByteRing>>,
+    classification: Arc<ClassificationFence>,
     classifier_handle: JoinHandle<()>,
     client_sizes: Mutex<HashMap<u64, (u16, u16)>>,
 }
@@ -78,8 +87,12 @@ impl RunningSession {
     ) -> Arc<Self> {
         let (output_tx, _) = broadcast::channel(BROADCAST_CAP);
         let ring = Arc::new(Mutex::new(ByteRing::new()));
-        let last_activity = Arc::new(AtomicI64::new(now_ms()));
+        let last_activity = Arc::new(AtomicI64::new(initial_activity(
+            session.last_activity,
+            now_ms(),
+        )));
         let activity_notify = Arc::new(Notify::new());
+        let classification = Arc::new(ClassificationFence::new());
         let classifier_handle = tokio::spawn(classifier_task(ClassifierCtx {
             manager,
             id: session.id.clone(),
@@ -90,6 +103,7 @@ impl RunningSession {
             last_activity: last_activity.clone(),
             activity_notify: activity_notify.clone(),
             ring: ring.clone(),
+            classification: classification.clone(),
         }));
 
         let running = Arc::new(Self {
@@ -97,6 +111,7 @@ impl RunningSession {
             supervisor: session.supervisor,
             output_tx: output_tx.clone(),
             ring: ring.clone(),
+            classification,
             classifier_handle,
             client_sizes: Mutex::new(HashMap::new()),
         });
@@ -130,9 +145,23 @@ impl RunningSession {
         self.pty.write(bytes)
     }
 
-    pub(super) fn kill(&self) {
-        self.classifier_handle.abort();
+    /// Stop classification and wait for any state commit already in flight
+    /// before killing the attached process. The lifecycle caller writes its
+    /// terminal state after this returns, so a stale classifier can never be
+    /// the final database writer or lifecycle event.
+    pub(super) async fn kill(&self) {
+        self.quiesce_classifier().await;
         self.pty.kill();
+    }
+
+    pub(super) async fn quiesce_classifier(&self) {
+        self.classification.disable().await;
+        self.classifier_handle.abort();
+    }
+
+    #[cfg(test)]
+    pub(super) fn classification_fence(&self) -> Arc<ClassificationFence> {
+        self.classification.clone()
     }
 
     pub(super) async fn snapshot(&self) -> Vec<u8> {
@@ -172,6 +201,7 @@ impl RunningSession {
 
 impl Drop for RunningSession {
     fn drop(&mut self) {
+        self.classification.disable_now();
         self.classifier_handle.abort();
     }
 }
@@ -186,7 +216,7 @@ fn spawn_output_reader(
 ) {
     tokio::spawn(async move {
         while let Some(chunk) = output.recv().await {
-            last_activity.store(now_ms(), Ordering::SeqCst);
+            record_activity(&last_activity, now_ms());
             {
                 let mut ring = ring.lock().await;
                 ring.push(&chunk);
@@ -210,6 +240,63 @@ struct ClassifierCtx {
     last_activity: Arc<AtomicI64>,
     activity_notify: Arc<Notify>,
     ring: Arc<Mutex<ByteRing>>,
+    classification: Arc<ClassificationFence>,
+}
+
+/// A per-running-session commit fence. Classifications remain independent
+/// across sessions; only a lifecycle transition for this exact attachment
+/// waits for its possibly in-flight database write and event emission.
+pub(super) struct ClassificationFence {
+    enabled: AtomicBool,
+    commit: Mutex<()>,
+}
+
+impl ClassificationFence {
+    fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(true),
+            commit: Mutex::new(()),
+        }
+    }
+
+    pub(super) async fn persist(
+        &self,
+        manager: &SessionManager,
+        id: &str,
+        state: SessionState,
+        last_activity: i64,
+    ) -> bool {
+        let _commit = self.commit.lock().await;
+        if !self.enabled.load(Ordering::Acquire) {
+            return false;
+        }
+        manager
+            .persist_classification(id, state, last_activity)
+            .await;
+        true
+    }
+
+    async fn disable(&self) {
+        self.disable_now();
+        // Taking the gate after disabling it waits for a commit that passed
+        // the enabled check first. Future commits take the gate, observe
+        // false, and return without touching persistence or events.
+        let _commit = self.commit.lock().await;
+    }
+
+    fn disable_now(&self) {
+        self.enabled.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) async fn hold_commit(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.commit.lock().await
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
 }
 
 async fn classifier_task(ctx: ClassifierCtx) {
@@ -225,9 +312,13 @@ async fn classifier_task(ctx: ClassifierCtx) {
         // backend has settled before inspecting the rendered prompt.
         if elapsed < signals.settle_ms as i64 {
             if last_state != SessionState::Active {
-                ctx.manager
-                    .persist_classification(&ctx.id, SessionState::Active, activity)
-                    .await;
+                if !ctx
+                    .classification
+                    .persist(&ctx.manager, &ctx.id, SessionState::Active, activity)
+                    .await
+                {
+                    return;
+                }
                 last_state = SessionState::Active;
             }
             unknown_recheck = UNKNOWN_RECHECK_INITIAL;
@@ -272,9 +363,13 @@ async fn classifier_task(ctx: ClassifierCtx) {
         );
         let desired = classification.state;
         if desired != last_state {
-            ctx.manager
-                .persist_classification(&ctx.id, desired, activity)
-                .await;
+            if !ctx
+                .classification
+                .persist(&ctx.manager, &ctx.id, desired, activity)
+                .await
+            {
+                return;
+            }
             tracing::debug!(
                 session = %ctx.id,
                 state = desired.as_str(),
@@ -327,5 +422,17 @@ mod tests {
         let sizes = HashMap::from([(1, (200, 30)), (2, (60, 80)), (3, (120, 40))]);
         assert_eq!(effective_min_size(&sizes), Some((60, 30)));
         assert_eq!(effective_min_size(&HashMap::new()), None);
+    }
+
+    #[test]
+    fn activity_clock_never_moves_backward() {
+        assert_eq!(initial_activity(20, 10), 20);
+        assert_eq!(initial_activity(10, 20), 20);
+
+        let activity = AtomicI64::new(20);
+        record_activity(&activity, 10);
+        assert_eq!(activity.load(Ordering::SeqCst), 20);
+        record_activity(&activity, 30);
+        assert_eq!(activity.load(Ordering::SeqCst), 30);
     }
 }

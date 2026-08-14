@@ -8,6 +8,7 @@ use std::time::SystemTime;
 mod agy;
 mod claude;
 mod codex;
+pub(crate) mod codex_app_server;
 mod codex_subagents;
 mod grok;
 mod opencode;

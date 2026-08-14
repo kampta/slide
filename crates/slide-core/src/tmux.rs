@@ -17,6 +17,7 @@ use crate::process::{run_bounded, BoundedOutput};
 /// tmux socket / server label used by slide. `-L slide` isolates us from
 /// the user's own tmux sessions.
 pub const SERVER_LABEL: &str = "slide";
+const HISTORY_LIMIT_LINES: &str = "20000";
 const SESSION_PREFIX: &str = "slide-";
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_STDOUT_LIMIT: usize = 2 * 1024 * 1024;
@@ -45,7 +46,12 @@ pub fn is_available() -> bool {
 /// Build and run `tmux -L slide <tmux_args...>`, either directly or via
 /// `ssh <host> "tmux …"`. Returns the captured output so callers can
 /// inspect stderr for benign conditions like "no server running".
-fn exec_tmux(host: Option<&str>, tmux_args: &[&str], ctx: &str) -> Result<BoundedOutput> {
+fn exec_tmux_with_limit(
+    host: Option<&str>,
+    tmux_args: &[&str],
+    ctx: &str,
+    stdout_limit: usize,
+) -> Result<BoundedOutput> {
     let cmd = match host {
         None => {
             let mut c = Command::new("tmux");
@@ -84,13 +90,8 @@ fn exec_tmux(host: Option<&str>, tmux_args: &[&str], ctx: &str) -> Result<Bounde
             c
         }
     };
-    let output = run_bounded(
-        cmd,
-        CONTROL_STDOUT_LIMIT,
-        CONTROL_STDERR_LIMIT,
-        CONTROL_TIMEOUT,
-    )
-    .with_context(|| format!("exec tmux ({ctx})"))?;
+    let output = run_bounded(cmd, stdout_limit, CONTROL_STDERR_LIMIT, CONTROL_TIMEOUT)
+        .with_context(|| format!("exec tmux ({ctx})"))?;
     if output.timed_out {
         bail!("tmux {ctx} timed out after {}s", CONTROL_TIMEOUT.as_secs());
     }
@@ -98,6 +99,10 @@ fn exec_tmux(host: Option<&str>, tmux_args: &[&str], ctx: &str) -> Result<Bounde
         bail!("tmux {ctx} exceeded its output limit");
     }
     Ok(output)
+}
+
+fn exec_tmux(host: Option<&str>, tmux_args: &[&str], ctx: &str) -> Result<BoundedOutput> {
+    exec_tmux_with_limit(host, tmux_args, ctx, CONTROL_STDOUT_LIMIT)
 }
 
 fn run(host: Option<&str>, tmux_args: &[&str], ctx: &str) -> Result<()> {
@@ -165,25 +170,28 @@ pub fn new_session(
     let name = session_name(id);
     let cols_s = cols.to_string();
     let rows_s = rows.to_string();
-    run(
-        host,
-        &[
-            "new-session",
-            "-d",
-            "-s",
-            &name,
-            "-x",
-            &cols_s,
-            "-y",
-            &rows_s,
-            &cmd,
-        ],
+    let mut chained = vec!["start-server", ";"];
+    chained.extend(setup_server_argv());
+    chained.extend([
+        ";",
         "new-session",
-    )
+        "-d",
+        "-s",
+        &name,
+        "-x",
+        &cols_s,
+        "-y",
+        &rows_s,
+        &cmd,
+    ]);
+    run(host, &chained, "new-session")
 }
 
-/// Argv chunk that turns mouse on AND removes tmux's default drag bindings
-/// from every key table that could process drag events.
+/// Configure options that must be in place before a new window is created.
+/// `history-limit` is copied into each pane at creation time, so changing the
+/// global default after `new-session` would not enlarge that pane's history.
+/// The remaining commands turn mouse on and remove tmux's default drag
+/// bindings from every key table that could process drag events.
 ///
 /// Why both halves matter:
 ///
@@ -208,8 +216,18 @@ pub fn new_session(
 /// Returned as a Vec so callers can splice it into a longer chained
 /// tmux command (e.g. create_session_with_log inserts it between
 /// start-server and new-session).
-fn setup_mouse_argv() -> Vec<&'static str> {
-    let mut v: Vec<&'static str> = vec!["set-option", "-g", "mouse", "on"];
+fn setup_server_argv() -> Vec<&'static str> {
+    let mut v = vec![
+        "set-option",
+        "-g",
+        "history-limit",
+        HISTORY_LIMIT_LINES,
+        ";",
+        "set-option",
+        "-g",
+        "mouse",
+        "on",
+    ];
     for table in ["root", "copy-mode", "copy-mode-vi"] {
         for key in ["MouseDrag1Pane", "MouseDragEnd1Pane"] {
             v.push(";");
@@ -228,7 +246,7 @@ fn setup_mouse_argv() -> Vec<&'static str> {
 /// pipe-pane) into one round trip, which is the bulk of the latency on
 /// a VPN'd remote create.
 ///
-/// Splices the `setup_mouse_argv` chunk inline so a brand-new tmux
+/// Splices the server setup chunk inline so a brand-new tmux
 /// server is configured before the first session lands.
 pub fn create_session_with_log(
     host: Option<&str>,
@@ -251,7 +269,7 @@ pub fn create_session_with_log(
     // exec_tmux path shell-quotes each element, so the `;` survives the
     // round-trip as a literal arg to tmux (not a shell separator).
     let mut chained: Vec<&str> = vec!["start-server", ";"];
-    chained.extend(setup_mouse_argv());
+    chained.extend(setup_server_argv());
     chained.extend([
         ";",
         "new-session",
@@ -279,10 +297,10 @@ pub fn create_session_with_log(
 /// stale `mouse off` from a previous slide build, or default drag
 /// bindings from a server we didn't start) gets the right config without
 /// requiring `tmux kill-server`.
-pub fn setup_mouse(host: Option<&str>) -> Result<()> {
+pub fn setup_server(host: Option<&str>) -> Result<()> {
     let mut chained: Vec<&str> = vec!["start-server", ";"];
-    chained.extend(setup_mouse_argv());
-    run(host, &chained, "setup mouse")
+    chained.extend(setup_server_argv());
+    run(host, &chained, "setup server")
 }
 
 /// Tee all output of the session's pane to `log_path` on the host.
@@ -320,6 +338,49 @@ pub fn capture_pane(host: Option<&str>, id: &str) -> Result<String> {
         return Ok(String::new());
     }
     bail!("tmux capture-pane failed: {}", stderr.trim());
+}
+
+/// Capture the complete rendered pane history for replay in a fresh browser
+/// terminal. `-e` retains SGR styling, while CRLF line endings keep each row
+/// anchored at column zero when xterm.js replays the snapshot. This path has
+/// a larger, independent bound than ordinary tmux control commands because a
+/// 20k-line pane history legitimately exceeds their 2 MiB budget.
+pub fn capture_history(host: Option<&str>, id: &str) -> Result<Vec<u8>> {
+    let name = session_name(id);
+    let out = exec_tmux_with_limit(
+        host,
+        &["capture-pane", "-p", "-e", "-S", "-", "-t", &name],
+        "capture history",
+        crate::history::RENDERED_HISTORY_BYTES,
+    )?;
+    if !out.success {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr_means_session_gone(&stderr) {
+            return Ok(Vec::new());
+        }
+        bail!("tmux capture history failed: {}", stderr.trim());
+    }
+
+    render_history(out.stdout)
+}
+
+fn render_history(bytes: Vec<u8>) -> Result<Vec<u8>> {
+    let newline_count = bytes
+        .iter()
+        .enumerate()
+        .filter(|(index, byte)| **byte == b'\n' && (*index == 0 || bytes[*index - 1] != b'\r'))
+        .count();
+    if bytes.len() + newline_count > crate::history::RENDERED_HISTORY_BYTES {
+        bail!("tmux capture history exceeded its output limit");
+    }
+    let mut rendered = Vec::with_capacity(bytes.len() + newline_count);
+    for byte in bytes {
+        if byte == b'\n' && rendered.last() != Some(&b'\r') {
+            rendered.push(b'\r');
+        }
+        rendered.push(byte);
+    }
+    Ok(rendered)
 }
 
 /// True when tmux's stderr indicates the target session no longer exists.
@@ -443,23 +504,28 @@ pub fn resize_window(host: Option<&str>, id: &str, cols: u16, rows: u16) -> Resu
 /// argv to attach to a session from a local PTY. The daemon runs this
 /// inside its own `Pty::spawn` to get bidi I/O with the backend. For a
 /// remote host the result is `ssh -t <host> tmux …`.
-pub fn attach_argv(host: Option<&str>, id: &str) -> Vec<String> {
+fn attach_argv_with_flags(host: Option<&str>, id: &str, flags: Option<&str>) -> Vec<String> {
+    let mut tmux_args = vec![
+        "tmux".to_string(),
+        "-L".to_string(),
+        SERVER_LABEL.to_string(),
+        "attach-session".to_string(),
+    ];
+    if let Some(flags) = flags {
+        tmux_args.extend(["-f".to_string(), flags.to_string()]);
+    }
+    tmux_args.extend(["-t".to_string(), session_name(id)]);
+
     match host {
-        None => vec![
-            "tmux".to_string(),
-            "-L".to_string(),
-            SERVER_LABEL.to_string(),
-            "attach-session".to_string(),
-            "-t".to_string(),
-            session_name(id),
-        ],
+        None => tmux_args,
         Some(h) => {
             // Pass the tmux invocation as a single string so the remote
             // shell parses it. `-t` forces ssh to allocate a TTY.
-            let remote = format!(
-                "tmux -L {SERVER_LABEL} attach-session -t {}",
-                shell_quote(&session_name(id)),
-            );
+            let remote = tmux_args
+                .iter()
+                .map(|part| shell_quote(part))
+                .collect::<Vec<_>>()
+                .join(" ");
             // Reuse the multiplexed master set up by the create-time control
             // commands (no BatchMode here — attach is interactive).
             let mut argv = vec!["ssh".to_string(), "-t".to_string()];
@@ -469,6 +535,16 @@ pub fn attach_argv(host: Option<&str>, id: &str) -> Vec<String> {
             argv
         }
     }
+}
+
+pub fn attach_argv(host: Option<&str>, id: &str) -> Vec<String> {
+    attach_argv_with_flags(host, id, None)
+}
+
+/// The daemon's lifecycle monitor must not constrain the window dimensions;
+/// interactive browser attachments supply their own correctly sized PTYs.
+pub fn monitor_argv(host: Option<&str>, id: &str) -> Vec<String> {
+    attach_argv_with_flags(host, id, Some("ignore-size"))
 }
 
 /// POSIX shell single-quote a string for tmux's `-c` / inline command use.
@@ -504,8 +580,12 @@ mod tests {
     }
 
     #[test]
-    fn setup_mouse_argv_turns_mouse_on_and_unbinds_drag() {
-        let argv = setup_mouse_argv();
+    fn setup_server_argv_sets_history_before_mouse_and_unbinds_drag() {
+        let argv = setup_server_argv();
+        let history_pos = argv
+            .windows(4)
+            .position(|w| w == ["set-option", "-g", "history-limit", HISTORY_LIMIT_LINES])
+            .expect("set-option -g history-limit chunk missing");
         // Order matters: tmux processes the chained command left-to-right,
         // so `set-option mouse on` (which reactivates default bindings if
         // they were unbound by a prior config) must come BEFORE the
@@ -514,6 +594,7 @@ mod tests {
             .windows(4)
             .position(|w| w == ["set-option", "-g", "mouse", "on"])
             .expect("set-option -g mouse on chunk missing");
+        assert!(history_pos < on_pos);
         // Every table that can process drag events must have both bindings
         // dropped, otherwise tmux re-eats drag once the user is in that
         // table (e.g. wheel-up promotes them into copy-mode, where the
@@ -577,6 +658,12 @@ mod tests {
     fn shell_quote_empty() {
         // Empty string must be quoted, otherwise the shell skips it.
         assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn rendered_history_uses_crlf_without_changing_escapes() {
+        let rendered = render_history(b"\x1b[31mred\x1b[0m\nplain\r\n".to_vec()).unwrap();
+        assert_eq!(rendered, b"\x1b[31mred\x1b[0m\r\nplain\r\n");
     }
 
     #[test]
@@ -686,6 +773,18 @@ mod tests {
     }
 
     #[test]
+    fn monitor_argv_does_not_constrain_interactive_clients() {
+        let local = monitor_argv(None, "abc");
+        assert!(local.windows(2).any(|args| args == ["-f", "ignore-size"]));
+
+        let remote = monitor_argv(Some("host.example"), "abc");
+        assert!(remote
+            .last()
+            .expect("remote command")
+            .contains("attach-session -f ignore-size -t slide-abc"));
+    }
+
+    #[test]
     fn attach_argv_remote_wraps_in_ssh() {
         let argv = attach_argv(Some("host.example"), "abc");
         assert_eq!(argv[0], "ssh");
@@ -744,6 +843,17 @@ mod tests {
         pipe_pane(None, &id, &log).unwrap();
 
         assert_eq!(has_session(None, &id).unwrap(), SessionProbe::Present);
+        let name = session_name(&id);
+        let history = exec_tmux(
+            None,
+            &["display-message", "-p", "-t", &name, "#{history_limit}"],
+            "display history-limit",
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&history.stdout).trim(),
+            HISTORY_LIMIT_LINES
+        );
         let ids = list_session_ids(None).unwrap();
         assert!(ids.contains(&id));
 
@@ -751,6 +861,78 @@ mod tests {
         assert_eq!(has_session(None, &id).unwrap(), SessionProbe::Absent);
 
         // kill_session on a gone session is a no-op.
+        kill_session(None, &id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn monitor_client_does_not_constrain_interactive_attachment_size() {
+        if !is_available() {
+            eprintln!("tmux not on PATH; skipping");
+            return;
+        }
+        let id = format!("test-{}", uuid::Uuid::new_v4());
+        let tmp = tempfile::tempdir().unwrap();
+        new_session(
+            None,
+            &id,
+            tmp.path(),
+            PaneCommand {
+                argv: &["sleep".to_string(), "60".to_string()],
+                env: &[],
+            },
+            80,
+            24,
+        )
+        .unwrap();
+
+        let monitor =
+            crate::session::pty::spawn_sized(&monitor_argv(None, &id), tmp.path(), &[], 40, 10)
+                .unwrap();
+        let mut interactive =
+            crate::session::pty::spawn_sized(&attach_argv(None, &id), tmp.path(), &[], 93, 27)
+                .unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(2), interactive.output.recv())
+            .await
+            .expect("tmux attachment produced no initial redraw")
+            .expect("tmux attachment closed before its initial redraw");
+        assert!(!first.is_empty());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let name = session_name(&id);
+        let clients = exec_tmux(
+            None,
+            &[
+                "list-clients",
+                "-t",
+                &name,
+                "-F",
+                "#{client_width}x#{client_height} #{client_flags}",
+            ],
+            "list attached clients",
+        )
+        .unwrap();
+        let clients = String::from_utf8_lossy(&clients.stdout);
+        assert!(
+            clients
+                .lines()
+                .any(|line| line.contains("40x10") && line.contains("ignore-size")),
+            "{clients}"
+        );
+        assert!(
+            clients.lines().any(|line| line.starts_with("93x27")),
+            "{clients}"
+        );
+
+        let window = exec_tmux(
+            None,
+            &["display-message", "-p", "-t", &name, "#{window_width}"],
+            "display window width",
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&window.stdout).trim(), "93");
+
+        interactive.pty.kill();
+        monitor.pty.kill();
         kill_session(None, &id).unwrap();
     }
 
@@ -797,6 +979,58 @@ mod tests {
         // ticker treat "session vanished mid-probe" the same as "no prompt".
         let gone = capture_pane(None, &id).unwrap();
         assert!(gone.is_empty(), "expected empty capture, got {gone:?}");
+    }
+
+    #[test]
+    fn capture_history_includes_scrollback_styles_and_crlf() {
+        if !is_available() {
+            eprintln!("tmux not on PATH; skipping");
+            return;
+        }
+        let id = format!("test-{}", uuid::Uuid::new_v4());
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "i=1; while [ $i -le 40 ]; do printf '\\033[31mline-%02d\\033[0m\\n' \"$i\"; i=$((i + 1)); done; sleep 60";
+
+        new_session(
+            None,
+            &id,
+            tmp.path(),
+            PaneCommand {
+                argv: &["sh".to_string(), "-c".to_string(), script.to_string()],
+                env: &[],
+            },
+            80,
+            5,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let captured = loop {
+            let captured = capture_history(None, &id).unwrap();
+            if captured
+                .windows(b"line-40".len())
+                .any(|window| window == b"line-40")
+            {
+                break captured;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pane did not finish rendering: {captured:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            captured
+                .windows(b"line-01".len())
+                .any(|window| window == b"line-01"),
+            "oldest scrollback row missing"
+        );
+        assert!(captured.windows(5).any(|window| window == b"\x1b[31m"));
+        assert!(captured
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| *byte != b'\n' || (index > 0 && captured[index - 1] == b'\r')));
+
+        kill_session(None, &id).unwrap();
     }
 
     /// `create_session_with_log` is the chained equivalent of

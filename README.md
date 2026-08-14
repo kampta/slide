@@ -1,6 +1,6 @@
 # slide
 
-A lightweight IDE for juggling Claude Code, Codex, Grok, Google Antigravity, and OpenCode sessions at once. Sessions stay in creation order so lifecycle changes never move the row under your pointer. Each session runs in an auto-created git worktree on the machine where its backend runs, so concurrent agents don't stomp on each other.
+A lightweight IDE for juggling Claude Code, Codex, Grok, Google Antigravity, and OpenCode sessions at once. Sessions keep a stable creation-time order within the running and stopped groups, with stopped sessions at the bottom. Each session runs in an auto-created git worktree on the machine where its backend runs, so concurrent agents don't stomp on each other.
 
 Architecture: a small Rust daemon (`slide serve`) hosts an HTTP+WebSocket API and serves a React SPA. Open it in any browser.
 
@@ -17,14 +17,6 @@ cd slide
 The bootstrap script installs the pinned Rust toolchain, Node.js, and the web dependencies. Run it once per machine.
 
 Slide launches agent CLIs already installed on the daemon host. Install and authenticate whichever backends you plan to use: `claude`, `codex`, `grok`, Antigravity's `agy`, or `opencode`. For remote sessions, install the selected CLI on the remote host.
-
-## Development mode
-
-```bash
-./scripts/dev.sh
-```
-
-This starts the Rust daemon on `127.0.0.1:7777` and the Vite development server on `127.0.0.1:5173`. Vite serves the UI with hot reload and proxies `/api` and `/ws` to the daemon. Open the five-minute, single-use fragment-bootstrap URL printed in the terminal; run `slide open` for each later tab. Stop both processes with `Ctrl+C`. Development servers remain loopback-only; phone pairing is a production-build flow behind HTTPS.
 
 ## Production mode
 
@@ -43,41 +35,17 @@ The release binary embeds `web/dist`, so production runs as one process with no 
 
 It serves the embedded UI and API on `http://127.0.0.1:7777` and opens the authenticated page in your browser without printing the token-bearing URL. To start without opening a tab, add `--no-open`; while the daemon is running, `./target/release/slide open` opens it later.
 
-### Phone access over HTTPS
-
-Keep Slide on loopback and put an HTTPS reverse proxy in front of it. For example, configure Tailscale Serve to proxy its HTTPS URL to `http://127.0.0.1:7777`, then start Slide with the exact origin Tailscale reports:
-
-```bash
-tailscale serve --bg http://127.0.0.1:7777
-./target/release/slide serve --public-url https://your-machine.your-tailnet.ts.net
-./target/release/slide pair
-```
-
-The proxy must support WebSocket upgrades, preserve the browser's `Origin`, and overwrite any incoming `X-Forwarded-Proto` value with `https` before forwarding. Slide requires that Origin to exactly match `--public-url`, including any non-default port. `slide pair` prints a QR whose secret is in the URL fragment, expires after five minutes, and works once. The SPA exchanges it for a per-device `HttpOnly; Secure; SameSite=Strict` cookie; neither the device credential nor the process bearer token is stored in `localStorage` or placed in a query string. The oldest credential is pruned after 32 paired devices.
-
-Direct LAN HTTP is intentionally refused: `--lan` and non-loopback `--bind` are not safe substitutes for TLS.
-
-On a phone, open the paired URL once, then use the browser's **Add to Home Screen** or **Install app** action. The installed shell can open offline, but session data and terminal connections still require the Slide daemon; API and WebSocket traffic is never cached.
-
 Re-run both build commands whenever the frontend changes. Rust-only changes require only the Cargo build.
 
 Restarting the Slide daemon reattaches existing tmux-backed agents; it does not relaunch them. After changing backend launch options, use Stop and then Resume on an existing session to start that backend with the new options.
 
-## Terminal interaction
+## Development mode
 
-The terminal uses standard terminal controls. Drag to select text, use the platform clipboard keys to copy or paste, and use the mouse wheel for scrollback. In an alternate-screen TUI, the mouse wheel enters tmux copy mode; press `q` to leave it.
+```bash
+./scripts/dev.sh
+```
 
-## Subagent dock
-
-When a backend exposes structured child-agent metadata, Slide shows a collapsible dock above the terminal with each descendant's name, role, state, hierarchy, and elapsed time. Codex sessions use the CLI's app-server metadata API; the snapshot is bounded and excludes prompts, tool arguments, command output, and transcript paths. Unsupported backends continue to render as ordinary terminal sessions with no empty dock.
-
-## Runtime diagnostics
-
-Open Runtime diagnostics from the bottom of the session panel to check every backend CLI, authentication state, version, and tmux capability on the local machine or a configured SSH host. Probes mirror Slide's launch environment, are cached for 60 seconds, and never return command output or account identity. Session creation and resume reuse the same snapshot; creation fails before making a worktree when the selected runtime—or remote tmux—is unavailable.
-
-## Session filter
-
-Use the filter above the session list to narrow sessions by name, backend, state, host, repository, or worktree path. Filtering never changes the underlying fixed session order.
+This starts the Rust daemon on `127.0.0.1:7777` and the Vite development server on `127.0.0.1:5173`. Vite serves the UI with hot reload and proxies `/api` and `/ws` to the daemon. Open the five-minute, single-use fragment-bootstrap URL printed in the terminal; run `slide open` for each later tab. Stop both processes with `Ctrl+C`.
 
 ## Forks and handoffs
 
@@ -119,6 +87,7 @@ SQLite at `~/Library/Application Support/slide/slide.db` (macOS) / `$XDG_DATA_HO
 ## Security
 
 - Daemon binds `127.0.0.1` only.
+- Phone access requires an HTTPS reverse proxy to the loopback listener and `--public-url`; use `slide pair` to authorize a device. The proxy must support WebSockets, preserve `Origin`, and overwrite `X-Forwarded-Proto` with `https`. Direct LAN HTTP binds are refused.
 - Every session API and WebSocket request is centrally authenticated. Local tabs use a process bearer held in `sessionStorage`; paired devices use a host-only HttpOnly cookie.
 - The middleware rejects requests whose `Host` is neither loopback nor the configured public host. A public `Origin` must exactly match `--public-url`, including scheme and port.
 - The mode-0600 daemon lock contains discovery metadata and a non-secret local browser URL. The mode-0600 auth state contains only SHA-256 hashes, never cleartext bootstrap tickets, pairing tickets, or device credentials. Both ticket types expire after five minutes and work once.
