@@ -5,19 +5,18 @@
 //! contract Slide exposes, so prompts, turns, paths, and tool output never
 //! reach the HTTP layer.
 
-use super::{SubagentSnapshot, SubagentState};
-use anyhow::{bail, Context, Result};
+use super::{codex_app_server::Client, SubagentSnapshot, SubagentState};
+use anyhow::Result;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::process::Command;
 
-const APP_SERVER_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SUBAGENTS: usize = 50;
 const MAX_LABEL_CHARS: usize = 160;
 const MAX_STATUS_PARENTS: usize = 20;
 const RECENT_TURNS_PER_PARENT: usize = 8;
+const MAX_APP_SERVER_RESPONSE_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -143,233 +142,81 @@ fn merge_lifecycle(result: TurnsListResult, states: &mut HashMap<String, Subagen
     }
 }
 
-/// Start Codex's structured app-server locally or through the same SSH
-/// transport used by a remote Slide session. The remote command is constant;
-/// the validated host is passed as a distinct argv element.
-fn app_server_command(ssh_host: Option<&str>) -> Result<Command> {
-    if let Some(host) = ssh_host {
-        crate::ssh::validate_host(host).context("invalid ssh host")?;
-        let mut command = Command::new("ssh");
-        command.args(["-o", "BatchMode=yes"]);
-        command.args(crate::ssh::ssh_args());
-        command.arg(host).arg("codex app-server --stdio");
-        Ok(command)
-    } else {
-        let mut command = Command::new("codex");
-        command.args(["app-server", "--stdio"]);
-        Ok(command)
-    }
-}
-
-struct ChildGuard {
-    child: Child,
-    shut_down: bool,
-}
-
-impl ChildGuard {
-    fn new(child: Child) -> Self {
-        Self {
-            child,
-            shut_down: false,
-        }
-    }
-
-    fn child_mut(&mut self) -> &mut Child {
-        &mut self.child
-    }
-
-    fn shutdown(&mut self) {
-        if !self.shut_down {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-            self.shut_down = true;
-        }
-    }
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
-fn response_with_id(
-    rx: &std::sync::mpsc::Receiver<serde_json::Value>,
-    wanted_id: u64,
-    deadline: Instant,
-) -> Result<serde_json::Value> {
-    loop {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .context("Codex app-server query timed out")?;
-        let value = rx
-            .recv_timeout(remaining)
-            .context("Codex app-server stopped before replying")?;
-        if value.get("id").and_then(|id| id.as_u64()) != Some(wanted_id) {
-            continue;
-        }
-        if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
-            bail!("Codex app-server request failed: {error}");
-        }
-        return Ok(value);
-    }
-}
-
-fn write_json_line(writer: &mut impl std::io::Write, value: serde_json::Value) -> Result<()> {
-    serde_json::to_writer(&mut *writer, &value).context("encode Codex app-server request")?;
-    writer
-        .write_all(b"\n")
-        .context("write Codex app-server request")?;
-    writer.flush().context("flush Codex app-server request")
-}
-
 /// Query only descendant metadata. Deserializing into `CodexThread` drops
 /// preview text, transcript paths, turns, and provider-specific extras before
 /// the result reaches any Slide API response.
 pub(super) fn query(session_id: &str, ssh_host: Option<&str>) -> Result<Vec<SubagentSnapshot>> {
-    query_with_command(app_server_command(ssh_host)?, session_id)
+    query_with_client(
+        Client::connect(ssh_host, true, MAX_APP_SERVER_RESPONSE_LINE_BYTES)?,
+        session_id,
+    )
 }
 
-fn query_with_command(mut command: Command, session_id: &str) -> Result<Vec<SubagentSnapshot>> {
-    let child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        // App-server diagnostics can include local paths. They are neither
-        // useful to the dock nor safe to echo through an HTTP error.
-        .stderr(Stdio::null())
-        .spawn()
-        .context("start Codex app-server")?;
-    let mut child = ChildGuard::new(child);
-    let mut stdin = child
-        .child_mut()
-        .stdin
-        .take()
-        .context("open Codex app-server stdin")?;
-    let stdout = child
-        .child_mut()
-        .stdout
-        .take()
-        .context("open Codex app-server stdout")?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        for line in BufReader::new(stdout)
-            .lines()
-            .map_while(std::io::Result::ok)
-        {
-            if let Ok(value) = serde_json::from_str(&line) {
-                if tx.send(value).is_err() {
-                    break;
-                }
+#[cfg(test)]
+fn query_with_command(command: Command, session_id: &str) -> Result<Vec<SubagentSnapshot>> {
+    query_with_client(
+        Client::with_command(command, true, MAX_APP_SERVER_RESPONSE_LINE_BYTES)?,
+        session_id,
+    )
+}
+
+fn query_with_client(mut client: Client, session_id: &str) -> Result<Vec<SubagentSnapshot>> {
+    let result: ThreadListResult = client.request(
+        "thread/list",
+        serde_json::json!({
+            "ancestorThreadId": session_id,
+            "limit": MAX_SUBAGENTS,
+            "sortKey": "updated_at",
+            "sortDirection": "desc",
+            "sourceKinds": [
+                "subAgent",
+                "subAgentReview",
+                "subAgentCompact",
+                "subAgentThreadSpawn",
+                "subAgentOther"
+            ]
+        }),
+    )?;
+
+    // Query lifecycle only for threads that are parents. A flat fan-out
+    // costs one extra request (the root); nested trees add one request per
+    // internal node, capped to keep pathological trees bounded.
+    let mut seen_parents = HashSet::new();
+    let mut parents = Vec::new();
+    seen_parents.insert(session_id.to_string());
+    parents.push(session_id.to_string());
+    for thread in &result.data {
+        if let Some(parent) = thread.parent_thread_id.as_ref() {
+            if seen_parents.insert(parent.clone()) {
+                parents.push(parent.clone());
             }
         }
-    });
+    }
+    parents.truncate(MAX_STATUS_PARENTS);
 
-    let result = (|| {
-        let deadline = Instant::now() + APP_SERVER_TIMEOUT;
-        write_json_line(
-            &mut stdin,
+    let mut lifecycle = HashMap::new();
+    for parent_id in parents {
+        let turns: TurnsListResult = client.request(
+            "thread/turns/list",
             serde_json::json!({
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "clientInfo": { "name": "slide", "version": env!("CARGO_PKG_VERSION") },
-                    "capabilities": { "experimentalApi": true }
-                }
+                "threadId": parent_id,
+                "limit": RECENT_TURNS_PER_PARENT,
+                "sortDirection": "desc",
+                "itemsView": "full"
             }),
         )?;
-        response_with_id(&rx, 1, deadline)?;
+        merge_lifecycle(turns, &mut lifecycle);
+    }
 
-        write_json_line(
-            &mut stdin,
-            serde_json::json!({ "method": "initialized", "params": {} }),
-        )?;
-        write_json_line(
-            &mut stdin,
-            serde_json::json!({
-                "id": 2,
-                "method": "thread/list",
-                "params": {
-                    "ancestorThreadId": session_id,
-                    "limit": MAX_SUBAGENTS,
-                    "sortKey": "updated_at",
-                    "sortDirection": "desc",
-                    "sourceKinds": [
-                        "subAgent",
-                        "subAgentReview",
-                        "subAgentCompact",
-                        "subAgentThreadSpawn",
-                        "subAgentOther"
-                    ]
-                }
-            }),
-        )?;
-        let response = response_with_id(&rx, 2, deadline)?;
-        let result: ThreadListResult = serde_json::from_value(
-            response
-                .get("result")
-                .cloned()
-                .context("Codex app-server response omitted result")?,
-        )
-        .context("decode Codex thread list")?;
-
-        // Query lifecycle only for threads that are parents. A flat fan-out
-        // costs one extra request (the root); nested trees add one request per
-        // internal node, capped to keep pathological trees bounded.
-        let mut seen_parents = HashSet::new();
-        let mut parents = Vec::new();
-        seen_parents.insert(session_id.to_string());
-        parents.push(session_id.to_string());
-        for thread in &result.data {
-            if let Some(parent) = thread.parent_thread_id.as_ref() {
-                if seen_parents.insert(parent.clone()) {
-                    parents.push(parent.clone());
-                }
-            }
-        }
-        parents.truncate(MAX_STATUS_PARENTS);
-
-        let mut lifecycle = HashMap::new();
-        for (index, parent_id) in parents.into_iter().enumerate() {
-            let request_id = 3 + index as u64;
-            write_json_line(
-                &mut stdin,
-                serde_json::json!({
-                    "id": request_id,
-                    "method": "thread/turns/list",
-                    "params": {
-                        "threadId": parent_id,
-                        "limit": RECENT_TURNS_PER_PARENT,
-                        "sortDirection": "desc",
-                        "itemsView": "full"
-                    }
-                }),
-            )?;
-            let response = response_with_id(&rx, request_id, deadline)?;
-            let turns: TurnsListResult = serde_json::from_value(
-                response
-                    .get("result")
-                    .cloned()
-                    .context("Codex turns response omitted result")?,
-            )
-            .context("decode Codex collaboration lifecycle")?;
-            merge_lifecycle(turns, &mut lifecycle);
-        }
-
-        Ok(result
-            .data
-            .into_iter()
-            .filter_map(|thread| {
-                let state = lifecycle.get(&thread.id).copied();
-                map_thread(thread, state)
-            })
-            .take(MAX_SUBAGENTS)
-            .collect())
-    })();
-
-    drop(stdin);
-    child.shutdown();
-    let _ = reader.join();
-    result
+    Ok(result
+        .data
+        .into_iter()
+        .filter_map(|thread| {
+            let state = lifecycle.get(&thread.id).copied();
+            map_thread(thread, state)
+        })
+        .take(MAX_SUBAGENTS)
+        .collect())
 }
 
 #[cfg(test)]

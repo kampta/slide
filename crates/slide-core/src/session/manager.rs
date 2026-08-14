@@ -452,7 +452,7 @@ impl SessionManager {
     ) -> Result<RuntimeDiagnosticsSnapshot> {
         let cache = self.runtime_diagnostics.clone();
         let host = host.map(str::to_string);
-        tokio::task::spawn_blocking(move || cache.get(host.as_deref(), refresh))
+        tokio::task::spawn_blocking(move || cache.diagnostics(host.as_deref(), refresh))
             .await
             .context("join runtime diagnostics probe")?
     }
