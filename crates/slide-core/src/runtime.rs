@@ -1,4 +1,7 @@
-use crate::backend::{codex_app_server::Client as CodexClient, BackendKind};
+use crate::backend::{
+    claude_usage, codex_app_server::Client as CodexClient, grok_usage, BackendKind,
+    ProviderRateLimit,
+};
 use crate::process::BoundedOutput;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -72,7 +75,7 @@ pub struct RuntimeDiagnosticsSnapshot {
 struct CachedSnapshot {
     fetched_at: Instant,
     value: RuntimeDiagnosticsSnapshot,
-    rate_limits: Option<CachedRateLimits>,
+    rate_limits: HashMap<BackendKind, CachedRateLimits>,
 }
 
 struct CachedRateLimits {
@@ -98,9 +101,7 @@ impl RuntimeDiagnosticsCache {
     ) -> Result<RuntimeDiagnosticsSnapshot> {
         let mut snapshot = self.get(host, refresh)?;
         let key = target_key(host);
-        self.enrich_rate_limits_with(&mut snapshot, &key, refresh, || {
-            query_codex_rate_limits(host)
-        });
+        self.enrich_rate_limits(&mut snapshot, &key, host, refresh);
         Ok(snapshot)
     }
 
@@ -160,7 +161,7 @@ impl RuntimeDiagnosticsCache {
                 CachedSnapshot {
                     fetched_at: Instant::now(),
                     value: snapshot.clone(),
-                    rate_limits: None,
+                    rate_limits: HashMap::new(),
                 },
             );
             evicted
@@ -250,30 +251,99 @@ impl RuntimeDiagnosticsCache {
         }
     }
 
-    fn cached_rate_limits(&self, key: &str) -> Option<Vec<RuntimeRateLimit>> {
+    fn cached_rate_limits(&self, key: &str, backend: BackendKind) -> Option<Vec<RuntimeRateLimit>> {
         self.snapshots
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(key)
-            .and_then(|cached| cached.rate_limits.as_ref())
+            .and_then(|cached| cached.rate_limits.get(&backend))
             .filter(|cached| cached.fetched_at.elapsed() < CACHE_TTL)
             .map(|cached| cached.value.clone())
     }
 
-    fn cache_rate_limits(&self, key: &str, value: Vec<RuntimeRateLimit>) {
+    fn cache_rate_limits(&self, key: &str, backend: BackendKind, value: Vec<RuntimeRateLimit>) {
         if let Some(cached) = self
             .snapshots
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get_mut(key)
         {
-            cached.rate_limits = Some(CachedRateLimits {
-                fetched_at: Instant::now(),
-                value,
-            });
+            cached.rate_limits.insert(
+                backend,
+                CachedRateLimits {
+                    fetched_at: Instant::now(),
+                    value,
+                },
+            );
         }
     }
 
+    fn enrich_rate_limits(
+        &self,
+        snapshot: &mut RuntimeDiagnosticsSnapshot,
+        key: &str,
+        host: Option<&str>,
+        refresh: bool,
+    ) {
+        let backends = snapshot
+            .backends
+            .iter()
+            .filter(|diagnostic| {
+                matches!(
+                    diagnostic.backend,
+                    BackendKind::Claude | BackendKind::Codex | BackendKind::Grok
+                ) && diagnostic.status == RuntimeStatus::Ready
+                    && diagnostic.installed
+                    && diagnostic.authenticated != Some(false)
+                    && (diagnostic.authenticated == Some(true) || diagnostic.version.is_some())
+            })
+            .map(|diagnostic| diagnostic.backend)
+            .collect::<Vec<_>>();
+        if backends.is_empty() {
+            return;
+        }
+
+        std::thread::scope(|scope| {
+            let handles = backends.into_iter().map(|backend| {
+                scope.spawn(move || (backend, self.rate_limits_for(key, backend, host, refresh)))
+            });
+            for handle in handles {
+                if let Ok((backend, rate_limits)) = handle.join() {
+                    set_rate_limits(snapshot, backend, rate_limits);
+                }
+            }
+        });
+    }
+
+    fn rate_limits_for(
+        &self,
+        key: &str,
+        backend: BackendKind,
+        host: Option<&str>,
+        refresh: bool,
+    ) -> Vec<RuntimeRateLimit> {
+        if !refresh {
+            if let Some(rate_limits) = self.cached_rate_limits(key, backend) {
+                return rate_limits;
+            }
+        }
+
+        let query_lock = self.query_lock(&format!("{key}:rate-limits:{}", backend.as_str()));
+        let _query_guard = query_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !refresh {
+            if let Some(rate_limits) = self.cached_rate_limits(key, backend) {
+                return rate_limits;
+            }
+        }
+
+        let rate_limits = query_provider_rate_limits(backend, host).unwrap_or_default();
+        self.cache_rate_limits(key, backend, rate_limits.clone());
+        rate_limits
+    }
+
+    #[cfg(test)]
     fn enrich_rate_limits_with(
         &self,
         snapshot: &mut RuntimeDiagnosticsSnapshot,
@@ -281,8 +351,9 @@ impl RuntimeDiagnosticsCache {
         refresh: bool,
         probe: impl FnOnce() -> Result<Vec<RuntimeRateLimit>>,
     ) {
+        let backend = BackendKind::Codex;
         let should_probe = snapshot.backends.iter().any(|diagnostic| {
-            diagnostic.backend == BackendKind::Codex
+            diagnostic.backend == backend
                 && diagnostic.status == RuntimeStatus::Ready
                 && diagnostic.installed
                 && diagnostic.authenticated != Some(false)
@@ -292,26 +363,14 @@ impl RuntimeDiagnosticsCache {
             return;
         }
         if !refresh {
-            if let Some(rate_limits) = self.cached_rate_limits(key) {
-                set_rate_limits(snapshot, rate_limits);
+            if let Some(rate_limits) = self.cached_rate_limits(key, backend) {
+                set_rate_limits(snapshot, backend, rate_limits);
                 return;
             }
         }
-
-        let query_lock = self.query_lock(&format!("{key}:rate-limits"));
-        let _query_guard = query_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !refresh {
-            if let Some(rate_limits) = self.cached_rate_limits(key) {
-                set_rate_limits(snapshot, rate_limits);
-                return;
-            }
-        }
-
         let rate_limits = probe().unwrap_or_default();
-        self.cache_rate_limits(key, rate_limits.clone());
-        set_rate_limits(snapshot, rate_limits);
+        self.cache_rate_limits(key, backend, rate_limits.clone());
+        set_rate_limits(snapshot, backend, rate_limits);
     }
 }
 
@@ -587,6 +646,29 @@ fn query_codex_rate_limits_with_client(mut client: CodexClient) -> Result<Vec<Ru
     Ok(normalize_codex_rate_limits(result))
 }
 
+fn query_provider_rate_limits(
+    backend: BackendKind,
+    host: Option<&str>,
+) -> Result<Vec<RuntimeRateLimit>> {
+    match backend {
+        BackendKind::Claude => claude_usage::query(host).map(map_provider_rate_limits),
+        BackendKind::Codex => query_codex_rate_limits(host),
+        BackendKind::Grok => grok_usage::query(host).map(map_provider_rate_limits),
+        BackendKind::Antigravity | BackendKind::OpenCode => Ok(Vec::new()),
+    }
+}
+
+fn map_provider_rate_limits(rows: Vec<ProviderRateLimit>) -> Vec<RuntimeRateLimit> {
+    rows.into_iter()
+        .map(|row| RuntimeRateLimit {
+            label: row.label,
+            used_percent: row.used_percent,
+            window_minutes: row.window_minutes,
+            resets_at: row.resets_at,
+        })
+        .collect()
+}
+
 fn normalize_codex_rate_limits(result: CodexRateLimitsResult) -> Vec<RuntimeRateLimit> {
     let mut rows = Vec::new();
     if let Some(rate_limits) = result
@@ -677,11 +759,15 @@ fn humanize_rate_limit_id(id: &str) -> String {
     }
 }
 
-fn set_rate_limits(snapshot: &mut RuntimeDiagnosticsSnapshot, rate_limits: Vec<RuntimeRateLimit>) {
+fn set_rate_limits(
+    snapshot: &mut RuntimeDiagnosticsSnapshot,
+    backend: BackendKind,
+    rate_limits: Vec<RuntimeRateLimit>,
+) {
     if let Some(codex) = snapshot
         .backends
         .iter_mut()
-        .find(|diagnostic| diagnostic.backend == BackendKind::Codex)
+        .find(|diagnostic| diagnostic.backend == backend)
     {
         codex.rate_limits = rate_limits;
     }
@@ -1047,7 +1133,9 @@ mod tests {
 
         cache.preflight(BackendKind::Codex, None).unwrap();
 
-        assert!(cache.cached_rate_limits("local").is_none());
+        assert!(cache
+            .cached_rate_limits("local", BackendKind::Codex)
+            .is_none());
     }
 
     #[test]

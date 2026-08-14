@@ -61,6 +61,10 @@ A handoff works across backends and local or SSH sessions. Choose another Waitin
 - **Base directory** (required) — a git repo. Remembered across dialogs.
 - **Location** — Local or Remote (SSH host).
 
+## Diagnostics
+
+Open **Diagnostics** to check runtime installation, authentication, and provider usage. The Usage tab shows the account windows and reset times reported by Codex, Claude Code, or Grok when that provider exposes them; unsupported or temporarily unavailable usage is shown as unavailable. Usage probes are cached briefly and never run during session creation or resume.
+
 ## State model
 
 Every running session has its own classifier task that wakes on byte activity (via `tokio::sync::Notify`) or a per-session deadline. Unknown states use a bounded retry timer; there is no global polling ticker.

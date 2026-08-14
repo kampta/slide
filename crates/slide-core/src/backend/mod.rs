@@ -7,10 +7,12 @@ use std::time::SystemTime;
 
 mod agy;
 mod claude;
+pub(crate) mod claude_usage;
 mod codex;
 pub(crate) mod codex_app_server;
 mod codex_subagents;
 mod grok;
+pub(crate) mod grok_usage;
 mod opencode;
 
 pub use agy::AgyBackend;
@@ -32,6 +34,144 @@ pub struct ContextUsage {
     pub cache_read_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub output_tokens: u64,
+}
+
+/// Provider-reported account usage, reduced to the fields Slide can display
+/// without exposing provider-specific account or billing details.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ProviderRateLimit {
+    pub label: String,
+    pub used_percent: u8,
+    pub window_minutes: Option<u64>,
+    pub resets_at: Option<i64>,
+}
+
+/// Accept the timestamp forms used by provider usage responses: Unix seconds,
+/// Unix milliseconds, or RFC 3339 strings.
+pub(crate) fn parse_timestamp_ms(value: &serde_json::Value) -> Option<i64> {
+    if let Some(seconds) = value.as_i64() {
+        return if seconds.unsigned_abs() >= 1_000_000_000_000 {
+            Some(seconds)
+        } else {
+            seconds.checked_mul(1_000)
+        };
+    }
+    if let Some(seconds) = value.as_f64() {
+        if !seconds.is_finite() {
+            return None;
+        }
+        let multiplier = if seconds.abs() >= 1_000_000_000_000.0 {
+            1.0
+        } else {
+            1_000.0
+        };
+        let millis = (seconds * multiplier).round();
+        if millis < i64::MIN as f64 || millis > i64::MAX as f64 {
+            return None;
+        }
+        return Some(millis as i64);
+    }
+    value.as_str().and_then(parse_rfc3339_ms)
+}
+
+fn parse_rfc3339_ms(value: &str) -> Option<i64> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return None;
+    }
+    let number = |start: usize, length: usize| -> Option<i64> {
+        let end = start.checked_add(length)?;
+        let slice = bytes.get(start..end)?;
+        if !slice.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(slice).ok()?.parse().ok()
+    };
+    let year = number(0, 4)?;
+    let month = number(5, 2)? as u32;
+    let day = number(8, 2)? as u32;
+    let hour = number(11, 2)?;
+    let minute = number(14, 2)?;
+    let second = number(17, 2)?;
+    if !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+
+    let mut index = 19;
+    let mut millis = 0i64;
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        let fraction = bytes.get(start..index)?;
+        let digits = fraction
+            .iter()
+            .take(3)
+            .fold(0i64, |value, digit| value * 10 + i64::from(digit - b'0'));
+        millis = match fraction.len() {
+            0 => return None,
+            1 => digits * 100,
+            2 => digits * 10,
+            _ => digits,
+        };
+    }
+
+    let offset_minutes = match bytes.get(index)? {
+        b'Z' | b'z' if index + 1 == bytes.len() => 0,
+        b'+' | b'-' if index + 6 == bytes.len() && bytes.get(index + 3) == Some(&b':') => {
+            let sign = if bytes[index] == b'+' { 1 } else { -1 };
+            let hours = number(index + 1, 2)?;
+            let minutes = number(index + 4, 2)?;
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
+            sign * (hours * 60 + minutes)
+        }
+        _ => return None,
+    };
+    let days = days_from_civil(year, month, day)?;
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(hour * 3_600 + minute * 60 + second)?
+        .checked_sub(offset_minutes * 60)?;
+    seconds.checked_mul(1_000)?.checked_add(millis)
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+// Howard Hinnant's proleptic Gregorian calendar conversion, relative to the
+// Unix epoch. The provider timestamps are validated before this is called.
+fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
+    let year = year.checked_sub(i64::from(month <= 2))?;
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month = i64::from(month);
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era.checked_mul(146_097)?
+        .checked_add(day_of_era)?
+        .checked_sub(719_468)
 }
 
 /// A privacy-bounded view of a backend child agent. Provider prompts, tool
@@ -66,7 +206,7 @@ pub struct SubagentList {
     pub agents: Vec<SubagentSnapshot>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendKind {
     Claude,
@@ -314,6 +454,35 @@ mod tests {
         assert_eq!(
             BackendKind::from_str("antigravity"),
             Some(BackendKind::Antigravity)
+        );
+    }
+
+    #[test]
+    fn provider_timestamps_normalize_seconds_milliseconds_and_rfc3339() {
+        assert_eq!(
+            parse_timestamp_ms(&serde_json::json!(1_700_000_000)),
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(
+            parse_timestamp_ms(&serde_json::json!(1_700_000_000_123_i64)),
+            Some(1_700_000_000_123)
+        );
+        assert_eq!(
+            parse_timestamp_ms(&serde_json::json!("2026-08-14T12:30:00-07:00")),
+            Some(1_786_735_800_000)
+        );
+    }
+
+    #[test]
+    fn provider_timestamps_reject_malformed_values() {
+        assert_eq!(parse_timestamp_ms(&serde_json::json!(null)), None);
+        assert_eq!(
+            parse_timestamp_ms(&serde_json::json!("2026-99-14T12:30:00Z")),
+            None
+        );
+        assert_eq!(
+            parse_timestamp_ms(&serde_json::json!("2026-08-14T12:30:00+99:00")),
+            None
         );
     }
 
