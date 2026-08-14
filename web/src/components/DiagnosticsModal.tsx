@@ -101,6 +101,7 @@ function RateLimits({
       {limits.map((limit, index) => {
         const percent = clampPercent(limit.used_percent);
         const percentLabel = `${Math.round(percent)}% used`;
+        const meterTone = percent >= 90 ? "danger" : percent >= 75 ? "warn" : "ok";
         const window = formatWindowDuration(limit.window_minutes);
         const reset = formatResetTime(limit.resets_at);
         return (
@@ -110,7 +111,7 @@ function RateLimits({
               <strong>{percentLabel}</strong>
             </div>
             <div
-              className="diagnostic-rate-limit-meter"
+              className={`diagnostic-rate-limit-meter diagnostic-rate-limit-meter-${meterTone}`}
               role="progressbar"
               aria-label={`${provider} ${limit.label}: ${percentLabel}`}
               aria-valuemin={0}

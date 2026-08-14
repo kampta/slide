@@ -237,7 +237,7 @@ export interface RuntimeDiagnostic {
   message: string;
   action: string | null;
   last_error: string | null;
-  rate_limits: RuntimeRateLimit[];
+  rate_limits?: RuntimeRateLimit[];
 }
 
 export interface RuntimeCapability {

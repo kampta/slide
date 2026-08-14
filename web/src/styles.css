@@ -981,6 +981,10 @@ body.is-resizing-panels * {
   border-top: 1px solid var(--border);
 }
 
+.diagnostic-rate-limit {
+  min-width: 0;
+}
+
 .diagnostic-rate-limit-heading,
 .diagnostic-rate-limit-meta {
   display: flex;
@@ -992,6 +996,11 @@ body.is-resizing-panels * {
 .diagnostic-rate-limit-heading {
   color: var(--text-muted);
   font-size: 10px;
+}
+
+.diagnostic-rate-limit-heading > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .diagnostic-rate-limit-heading strong {
@@ -1015,9 +1024,17 @@ body.is-resizing-panels * {
   background: var(--active);
 }
 
+.diagnostic-rate-limit-meter-warn > span {
+  background: var(--waiting);
+}
+
+.diagnostic-rate-limit-meter-danger > span {
+  background: var(--danger);
+}
+
 .diagnostic-rate-limit-meta {
-  color: var(--text-faint);
-  font-size: 9px;
+  color: var(--text-muted);
+  font-size: 10px;
 }
 
 .diagnostic-rate-limit-meta time,
