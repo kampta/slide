@@ -219,6 +219,13 @@ export type RuntimeStatus =
   | "unauthenticated"
   | "broken";
 
+export interface RuntimeRateLimit {
+  label: string;
+  used_percent: number;
+  window_minutes: number | null;
+  resets_at: number | null;
+}
+
 export interface RuntimeDiagnostic {
   backend: Backend;
   label: string;
@@ -230,6 +237,7 @@ export interface RuntimeDiagnostic {
   message: string;
   action: string | null;
   last_error: string | null;
+  rate_limits: RuntimeRateLimit[];
 }
 
 export interface RuntimeCapability {
