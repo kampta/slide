@@ -1003,20 +1003,26 @@ mod tests {
             5,
         )
         .unwrap();
-        std::thread::sleep(Duration::from_millis(150));
-
-        let captured = capture_history(None, &id).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let captured = loop {
+            let captured = capture_history(None, &id).unwrap();
+            if captured
+                .windows(b"line-40".len())
+                .any(|window| window == b"line-40")
+            {
+                break captured;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pane did not finish rendering: {captured:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
         assert!(
             captured
                 .windows(b"line-01".len())
                 .any(|window| window == b"line-01"),
             "oldest scrollback row missing"
-        );
-        assert!(
-            captured
-                .windows(b"line-40".len())
-                .any(|window| window == b"line-40"),
-            "visible row missing"
         );
         assert!(captured.windows(5).any(|window| window == b"\x1b[31m"));
         assert!(captured
