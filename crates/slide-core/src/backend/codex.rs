@@ -31,10 +31,9 @@ fn argv_with_permissions() -> Vec<String> {
     ]
 }
 
-/// Classification patterns for codex-cli. The v0.124 prompt is a `›`
-/// followed by placeholder hint text (e.g. `› Write tests for @filename`);
-/// older builds drew `user>`, `>`, or `▌`. All kept so mixed versions
-/// classify correctly.
+/// Classification patterns for codex-cli. Current prompts use `»`; v0.124
+/// used `›`, and older builds drew `user>`, `>`, or `▌`. All are kept so
+/// mixed versions classify correctly.
 ///
 /// No idle-hint regex yet — codex's bottom row is a model/cwd label that
 /// is present in *both* states, so it's not a reliable positive signal.
@@ -59,11 +58,10 @@ fn signals() -> &'static Signals {
         // Active.
         idle_hints: vec![],
         prompt: vec![
-            // v0.124 form: `›` + whitespace + anything (placeholder hint
-            // or user-typed text). `›` only appears at the prompt line in
-            // rendered panes, so this is safe inside the 24-row viewport
-            // we hand to the classifier.
-            Regex::new(r"(?m)^›[\s\u{a0}].*$").unwrap(),
+            // Current `»` and v0.124 `›` forms: glyph + whitespace +
+            // placeholder or user-typed text. Anchoring keeps chevrons in
+            // ordinary output from being mistaken for the composer.
+            Regex::new(r"(?m)^[›»][ \t\u{a0}].*$").unwrap(),
             // Legacy forms from earlier codex builds and any backend
             // variant that draws a plain prompt.
             Regex::new(r"(?m)^[\s│▌>]*(?:user\s*>|>|▌)\s*$").unwrap(),
@@ -228,6 +226,8 @@ impl Backend for CodexBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::classifier::{classify, ClassificationReason, Snapshot};
+    use crate::session::SessionState;
     use std::fs;
     use std::time::Duration;
 
@@ -358,6 +358,42 @@ mod tests {
         assert!(any(&s.prompt, "›\u{a0}"));
     }
 
+    /// Codex 0.147 changed the composer glyph while keeping the same prompt
+    /// layout. This exact line was previously misclassified as Unknown.
+    #[test]
+    fn prompt_matches_v0_147_composer_line() {
+        let s = signals();
+        assert!(any(&s.prompt, "» Run /review on my current changes"));
+        assert!(any(&s.prompt, "» "));
+        assert!(any(&s.prompt, "»\u{a0}Run /review on my current changes"));
+
+        let pane = concat!(
+            "─ Worked for 13m 55s ─\n\n",
+            "» Run /review on my current changes\n\n",
+            "  gpt-5.6-sol ultra · /worktree · Main [default]",
+        );
+        let settled = classify(
+            &Snapshot {
+                pane,
+                idle_ms: 2_000,
+            },
+            s,
+        );
+        assert_eq!(settled.state, SessionState::Waiting);
+        assert_eq!(settled.reason, ClassificationReason::Prompt);
+        assert_eq!(
+            classify(
+                &Snapshot {
+                    pane,
+                    idle_ms: 1_000,
+                },
+                s,
+            )
+            .state,
+            SessionState::Active,
+        );
+    }
+
     /// Legacy codex prompt forms still classify so older builds aren't
     /// regressed.
     #[test]
@@ -368,12 +404,17 @@ mod tests {
         assert!(any(&s.prompt, "▌"));
     }
 
-    /// Random content containing `›` mid-line (e.g. something a tool
+    /// Random content containing a prompt glyph mid-line (e.g. tool
     /// output printed) must not flip the session to Waiting.
     #[test]
     fn prompt_does_not_match_prose_with_angle_quote() {
         let s = signals();
         assert!(!any(&s.prompt, "path/to/file › error"));
+        assert!(!any(&s.prompt, "analysis » result"));
+        assert!(!any(&s.prompt, "  » Run /review"));
+        assert!(!any(&s.prompt, "»Run /review"));
+        assert!(!any(&s.prompt, "»"));
+        assert!(!any(&s.prompt, "»\nordinary output"));
         assert!(!any(&s.prompt, "Here > result"));
     }
 
