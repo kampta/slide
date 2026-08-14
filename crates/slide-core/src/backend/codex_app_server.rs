@@ -11,7 +11,6 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const APP_SERVER_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_RESPONSE_LINE_BYTES: usize = 2 * 1024 * 1024;
 const APP_SERVER_COMMAND: &str = "codex app-server -c 'mcp_servers={}' --stdio";
 
 /// Start Codex locally or through the same SSH transport as a remote session.
@@ -83,11 +82,23 @@ pub(crate) struct Client {
 }
 
 impl Client {
-    pub(crate) fn connect(ssh_host: Option<&str>, experimental_api: bool) -> Result<Self> {
-        Self::with_command(command(ssh_host)?, experimental_api)
+    pub(crate) fn connect(
+        ssh_host: Option<&str>,
+        experimental_api: bool,
+        max_response_line_bytes: usize,
+    ) -> Result<Self> {
+        Self::with_command(
+            command(ssh_host)?,
+            experimental_api,
+            max_response_line_bytes,
+        )
     }
 
-    pub(crate) fn with_command(mut command: Command, experimental_api: bool) -> Result<Self> {
+    pub(crate) fn with_command(
+        mut command: Command,
+        experimental_api: bool,
+        max_response_line_bytes: usize,
+    ) -> Result<Self> {
         let child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -108,7 +119,8 @@ impl Client {
             .take()
             .context("open Codex app-server stdout")?;
         let (tx, responses) = std::sync::mpsc::channel();
-        let reader = std::thread::spawn(move || read_responses(stdout, tx));
+        let reader =
+            std::thread::spawn(move || read_responses(stdout, tx, max_response_line_bytes));
 
         let mut client = Self {
             child,
@@ -190,7 +202,11 @@ impl Client {
     }
 }
 
-fn read_responses(stdout: impl std::io::Read, tx: std::sync::mpsc::Sender<Value>) {
+fn read_responses(
+    stdout: impl std::io::Read,
+    tx: std::sync::mpsc::Sender<Value>,
+    max_line_bytes: usize,
+) {
     let mut reader = BufReader::new(stdout);
     let mut line = Vec::new();
     loop {
@@ -200,7 +216,7 @@ fn read_responses(stdout: impl std::io::Read, tx: std::sync::mpsc::Sender<Value>
         };
         let newline = buffer.iter().position(|byte| *byte == b'\n');
         let consumed = newline.map_or(buffer.len(), |index| index + 1);
-        if line.len().saturating_add(consumed) > MAX_RESPONSE_LINE_BYTES {
+        if line.len().saturating_add(consumed) > max_line_bytes {
             return;
         }
         line.extend_from_slice(&buffer[..consumed]);
@@ -268,10 +284,38 @@ mod tests {
     }
 
     #[test]
-    fn response_reader_rejects_an_oversized_line() {
-        let input = vec![b'x'; MAX_RESPONSE_LINE_BYTES + 1];
+    fn response_reader_enforces_its_caller_bound() {
+        let mut input = serde_json::to_vec(&serde_json::json!({
+            "id": 1,
+            "padding": "x".repeat(4096)
+        }))
+        .unwrap();
+        input.push(b'\n');
+
         let (tx, rx) = std::sync::mpsc::channel();
-        read_responses(input.as_slice(), tx);
+        read_responses(input.as_slice(), tx, input.len());
+        assert_eq!(rx.recv().unwrap()["id"], 1);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        read_responses(input.as_slice(), tx, input.len() - 1);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn transcript_bound_accepts_lines_that_quota_bound_rejects() {
+        let mut input = serde_json::to_vec(&serde_json::json!({
+            "id": 1,
+            "padding": "x".repeat(2_500_000)
+        }))
+        .unwrap();
+        input.push(b'\n');
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        read_responses(input.as_slice(), tx, 16 * 1024 * 1024);
+        assert_eq!(rx.recv().unwrap()["id"], 1);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        read_responses(input.as_slice(), tx, 256 * 1024);
         assert!(rx.try_recv().is_err());
     }
 }

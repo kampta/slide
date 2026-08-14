@@ -16,6 +16,7 @@ const MAX_SUBAGENTS: usize = 50;
 const MAX_LABEL_CHARS: usize = 160;
 const MAX_STATUS_PARENTS: usize = 20;
 const RECENT_TURNS_PER_PARENT: usize = 8;
+const MAX_APP_SERVER_RESPONSE_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -145,12 +146,18 @@ fn merge_lifecycle(result: TurnsListResult, states: &mut HashMap<String, Subagen
 /// preview text, transcript paths, turns, and provider-specific extras before
 /// the result reaches any Slide API response.
 pub(super) fn query(session_id: &str, ssh_host: Option<&str>) -> Result<Vec<SubagentSnapshot>> {
-    query_with_client(Client::connect(ssh_host, true)?, session_id)
+    query_with_client(
+        Client::connect(ssh_host, true, MAX_APP_SERVER_RESPONSE_LINE_BYTES)?,
+        session_id,
+    )
 }
 
 #[cfg(test)]
 fn query_with_command(command: Command, session_id: &str) -> Result<Vec<SubagentSnapshot>> {
-    query_with_client(Client::with_command(command, true)?, session_id)
+    query_with_client(
+        Client::with_command(command, true, MAX_APP_SERVER_RESPONSE_LINE_BYTES)?,
+        session_id,
+    )
 }
 
 fn query_with_client(mut client: Client, session_id: &str) -> Result<Vec<SubagentSnapshot>> {

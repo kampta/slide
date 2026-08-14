@@ -17,6 +17,7 @@ const PROBE_OUTPUT_LIMIT: usize = 16 * 1024;
 const MAX_CACHE_TARGETS: usize = 64;
 const MAX_RATE_LIMITS: usize = 16;
 const MAX_RATE_LIMIT_NAME_CHARS: usize = 80;
+const MAX_RATE_LIMIT_RESPONSE_LINE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -547,7 +548,7 @@ fn probe_backend_with(
 struct CodexRateLimitsResult {
     rate_limits: Option<CodexRateLimit>,
     #[serde(default)]
-    rate_limits_by_limit_id: BTreeMap<String, CodexRateLimit>,
+    rate_limits_by_limit_id: Option<BTreeMap<String, CodexRateLimit>>,
 }
 
 #[derive(Deserialize)]
@@ -568,13 +569,17 @@ struct CodexRateLimitWindow {
 }
 
 fn query_codex_rate_limits(host: Option<&str>) -> Result<Vec<RuntimeRateLimit>> {
-    let client = CodexClient::connect(host, false)?;
+    let client = CodexClient::connect(host, false, MAX_RATE_LIMIT_RESPONSE_LINE_BYTES)?;
     query_codex_rate_limits_with_client(client)
 }
 
 #[cfg(test)]
 fn query_codex_rate_limits_with_command(command: Command) -> Result<Vec<RuntimeRateLimit>> {
-    query_codex_rate_limits_with_client(CodexClient::with_command(command, false)?)
+    query_codex_rate_limits_with_client(CodexClient::with_command(
+        command,
+        false,
+        MAX_RATE_LIMIT_RESPONSE_LINE_BYTES,
+    )?)
 }
 
 fn query_codex_rate_limits_with_client(mut client: CodexClient) -> Result<Vec<RuntimeRateLimit>> {
@@ -584,16 +589,19 @@ fn query_codex_rate_limits_with_client(mut client: CodexClient) -> Result<Vec<Ru
 
 fn normalize_codex_rate_limits(result: CodexRateLimitsResult) -> Vec<RuntimeRateLimit> {
     let mut rows = Vec::new();
-    if result.rate_limits_by_limit_id.is_empty() {
-        if let Some(limit) = result.rate_limits {
-            append_rate_limit_rows(&mut rows, "codex", limit);
-        }
-    } else {
-        for (map_id, limit) in result.rate_limits_by_limit_id {
+    if let Some(rate_limits) = result
+        .rate_limits_by_limit_id
+        .filter(|rate_limits| !rate_limits.is_empty())
+    {
+        for (map_id, limit) in rate_limits {
             append_rate_limit_rows(&mut rows, &map_id, limit);
             if rows.len() >= MAX_RATE_LIMITS {
                 break;
             }
+        }
+    } else {
+        if let Some(limit) = result.rate_limits {
+            append_rate_limit_rows(&mut rows, "codex", limit);
         }
     }
     rows.sort_by(|left, right| {
@@ -1123,7 +1131,7 @@ esac
     }
 
     #[test]
-    fn rate_limit_map_is_preferred_and_legacy_shape_is_a_fallback() {
+    fn rate_limit_map_is_preferred_and_null_map_uses_legacy_fallback() {
         let mapped = serde_json::from_value(serde_json::json!({
             "rateLimits": {
                 "limitName": "Duplicate legacy row",
@@ -1154,7 +1162,7 @@ esac
                 },
                 "secondary": null
             },
-            "rateLimitsByLimitId": {}
+            "rateLimitsByLimitId": null
         }))
         .unwrap();
         let limits = normalize_codex_rate_limits(legacy);
