@@ -15,6 +15,7 @@ use rand::RngCore;
 use slide_core::config;
 use slide_core::SessionManager;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 
@@ -28,7 +29,11 @@ pub struct AppState {
     pub allowed_hosts: Arc<Vec<String>>,
     /// Exact phone-facing HTTPS origin, including any non-default port.
     pub public_origin: Arc<Option<String>>,
+    /// Bound terminal sockets and their per-connection tmux/SSH helpers.
+    pub terminal_slots: Arc<Semaphore>,
 }
+
+const MAX_TERMINAL_CONNECTIONS: usize = 32;
 
 pub async fn run(
     bind: &str,
@@ -72,6 +77,7 @@ pub async fn run(
         pairing: pairing.clone(),
         allowed_hosts: Arc::new(allowed_hosts),
         public_origin: Arc::new(public_url.clone()),
+        terminal_slots: Arc::new(Semaphore::new(MAX_TERMINAL_CONNECTIONS)),
     };
 
     // /api/* is fully gated by `auth_layer` (Host/Origin + token). /ws/* only

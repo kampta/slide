@@ -19,11 +19,45 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 
 const BROADCAST_CAP: usize = 256;
 const HANDOFF_TAIL_BYTES: usize = 32 * 1024;
 const HANDOFF_CONTEXT_CHARS: usize = 8_000;
+
+/// A browser-owned tmux client. Dropping it kills only the local attach
+/// process (or SSH transport); the supervised tmux session keeps running.
+pub struct TerminalAttachment {
+    pty: pty::Pty,
+    output: mpsc::Receiver<Bytes>,
+}
+
+impl TerminalAttachment {
+    fn new(spawned: pty::Spawned) -> Self {
+        Self {
+            pty: spawned.pty,
+            output: spawned.output,
+        }
+    }
+
+    pub async fn recv(&mut self) -> Option<Bytes> {
+        self.output.recv().await
+    }
+
+    pub fn write(&self, bytes: &[u8]) -> Result<()> {
+        self.pty.write(bytes)
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        self.pty.resize(cols, rows)
+    }
+}
+
+impl Drop for TerminalAttachment {
+    fn drop(&mut self) {
+        self.pty.kill();
+    }
+}
 
 /// Reject ids that could escape `logs_dir` when joined as `{id}.log`, or
 /// otherwise reach outside the caller's intent. All ids this daemon
@@ -342,19 +376,52 @@ impl SessionManager {
         Some(r.subscribe_with_snapshot().await)
     }
 
+    /// Open a fresh, correctly sized tmux client for one browser WebSocket.
+    /// Direct sessions keep using the daemon-owned PTY and return `None`.
+    pub async fn attach_terminal(
+        &self,
+        id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Option<TerminalAttachment>> {
+        check_id(id)?;
+        if cols == 0 || rows == 0 {
+            bail!("terminal dimensions must be non-zero");
+        }
+        let Some(running) = self.running_session(id).await else {
+            return Ok(None);
+        };
+        if !matches!(running.supervisor(), SupervisorKind::Tmux) {
+            return Ok(None);
+        }
+
+        let session = self.find(id).await?;
+        if let Some(host) = session.ssh_host.as_deref() {
+            crate::ssh::validate_host(host)?;
+        }
+        let argv = crate::tmux::attach_argv(session.ssh_host.as_deref(), id);
+        let cwd = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        let spawned = pty::spawn_sized(&argv, &cwd, &[], cols, rows)
+            .with_context(|| format!("attach terminal for session {id}"))?;
+        Ok(Some(TerminalAttachment::new(spawned)))
+    }
+
     pub async fn get_log(&self, id: &str) -> Result<Vec<u8>> {
         check_id(id)?;
-        // Prefer in-memory ring; fall back to disk log.
+        // Prefer the live in-memory ring. Once stopped, tmux requires the
+        // rendered pane snapshot captured by explicit Stop; Direct retains
+        // the existing bounded raw-log fallback.
         if let Some(r) = self.running_session(id).await {
             return Ok(r.snapshot().await);
         }
         let session = self.find(id).await?;
-        tokio::task::spawn_blocking(move || {
-            match history::read_tail(&session, history::DEFAULT_TAIL_BYTES) {
-                Ok(bytes) => Ok(bytes),
-                Err(error) if error.downcast_ref::<std::io::Error>().is_some() => Ok(Vec::new()),
-                Err(error) => Err(error),
+        let direct = matches!(session.supervisor, SupervisorKind::Direct);
+        tokio::task::spawn_blocking(move || match history::read_stopped(&session) {
+            Ok(bytes) => Ok(bytes),
+            Err(error) if direct && error.downcast_ref::<std::io::Error>().is_some() => {
+                Ok(Vec::new())
             }
+            Err(error) => Err(error),
         })
         .await?
     }
@@ -472,6 +539,37 @@ impl SessionManager {
         // session Stopped. Resume spawns a fresh backend that either
         // continues the prior conversation (via `--resume`) or starts new.
         let s = self.find(id).await?;
+        if matches!(s.supervisor, SupervisorKind::Tmux) {
+            let snapshot_session = s.clone();
+            let snapshot = tokio::task::spawn_blocking(move || {
+                let bytes = crate::tmux::capture_history(
+                    snapshot_session.ssh_host.as_deref(),
+                    &snapshot_session.id,
+                )?;
+                if bytes.is_empty() {
+                    bail!("tmux session disappeared before history capture");
+                }
+                history::write_rendered(&snapshot_session.id, &bytes)
+            })
+            .await;
+            if let Err(error) = snapshot
+                .context("join rendered terminal history capture")
+                .and_then(|result| result)
+            {
+                tracing::warn!(
+                    session = id,
+                    error = %format!("{error:#}"),
+                    "capture rendered terminal history before stop"
+                );
+                if let Err(remove_error) = history::remove_rendered(id) {
+                    tracing::warn!(
+                        session = id,
+                        error = %format!("{remove_error:#}"),
+                        "invalidate stale rendered terminal history"
+                    );
+                }
+            }
+        }
         supervisor::for_session(&s).teardown(id).await?;
         self.kill_running(id).await;
         self.backend_metadata.cancel_discovery(id);
@@ -503,6 +601,13 @@ impl SessionManager {
         }
         self.store.delete(id).await?;
         self.backend_metadata.clear_session(id).await;
+        if let Err(error) = history::remove_rendered(id) {
+            tracing::warn!(
+                session = id,
+                error = %format!("{error:#}"),
+                "remove rendered terminal history after delete"
+            );
+        }
         match session.location {
             Location::Local => {
                 let path = session
@@ -909,6 +1014,16 @@ impl SessionManager {
         intent: SpawnIntent,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
+            // Every backend launch starts a new terminal-generation. A
+            // rendered snapshot belongs only to the stopped generation that
+            // produced it, so remove it before attaching or spawning.
+            if let Err(error) = history::remove_rendered(&session.id) {
+                tracing::warn!(
+                    session = %session.id,
+                    error = %format!("{error:#}"),
+                    "invalidate rendered terminal history before launch"
+                );
+            }
             let backend = backend::for_kind(session.backend);
             // Step 1: build the backend argv and the cwd *on the host that runs
             // the backend*. The supervisor is responsible for wrapping this in
@@ -1009,7 +1124,7 @@ mod tests {
     use super::{
         attach_process, build_handoff_prompt, newest_chars, next_activity, normalize_focus,
         valid_id, validate_execution_policy, BackendMetadata, RunningSession, SessionManager,
-        BROADCAST_CAP,
+        TerminalAttachment, BROADCAST_CAP,
     };
     use crate::backend::BackendKind;
     use crate::runtime::RuntimeDiagnosticsCache;
@@ -1162,6 +1277,21 @@ mod tests {
                 expected_teardowns
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_terminal_attachment_kills_only_its_child() {
+        let cwd = tempfile::tempdir().unwrap();
+        let crate::session::pty::Spawned { pty, output, exit } =
+            crate::session::pty::spawn(&long_running_command(), cwd.path(), &[]).unwrap();
+        let attachment = TerminalAttachment { pty, output };
+
+        drop(attachment);
+
+        tokio::time::timeout(Duration::from_secs(2), exit)
+            .await
+            .expect("attachment child was not killed")
+            .expect("attachment waiter stopped unexpectedly");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

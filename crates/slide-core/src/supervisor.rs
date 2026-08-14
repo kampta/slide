@@ -177,7 +177,7 @@ impl Supervisor for TmuxSupervisor {
                     // (PRs #41/#42) or default drag bindings. Reapply the
                     // current policy idempotently before we hand the user
                     // a session that doesn't behave as documented.
-                    tmux::setup_mouse(host).ok();
+                    tmux::setup_server(host).ok();
                     tmux::pipe_pane(host, &id, &log_path)
                         .map_err(|e| translate_dead_session_err(e, &backend_name))?;
                     Ok(false)
@@ -215,7 +215,7 @@ impl Supervisor for TmuxSupervisor {
         .await?;
 
         Ok(Spawned {
-            attach_argv: tmux::attach_argv(self.host.as_deref(), &req.id),
+            attach_argv: tmux::monitor_argv(self.host.as_deref(), &req.id),
             attach_env: Vec::new(),
             // The attach process itself just needs a valid cwd; it doesn't
             // matter what since tmux owns the backend's real cwd.
