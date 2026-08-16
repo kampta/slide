@@ -1,4 +1,4 @@
-use super::{codex_subagents, Backend, BackendKind, SubagentSnapshot};
+use super::{Backend, BackendKind};
 use crate::classifier::{common_needs_input_signals, Signals};
 use crate::session::ExecutionPolicy;
 use anyhow::{Context, Result};
@@ -211,15 +211,6 @@ impl Backend for CodexBackend {
 
     fn supports_session_discovery(&self) -> bool {
         true
-    }
-
-    fn read_subagents(
-        &self,
-        _cwd: &Path,
-        session_id: &str,
-        ssh_host: Option<&str>,
-    ) -> Result<Option<Vec<SubagentSnapshot>>> {
-        codex_subagents::query(session_id, ssh_host).map(Some)
     }
 }
 

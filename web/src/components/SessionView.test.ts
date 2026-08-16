@@ -10,7 +10,6 @@ const codex: BackendInfo = {
   id: "codex",
   label: "Codex",
   context_usage: true,
-  subagents: true,
   fork: true,
   execution_policies: ["unrestricted", "sandboxed_auto"],
 };

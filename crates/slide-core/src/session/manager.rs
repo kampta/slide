@@ -6,7 +6,7 @@ use super::{
     CreateSessionRequest, ExecutionPolicy, ForkSessionRequest, HandoffRequest, Location, Session,
     SessionEvent, SessionState, SupervisorKind,
 };
-use crate::backend::{self, BackendKind, ContextUsage, SubagentList};
+use crate::backend::{self, BackendKind, ContextUsage};
 use crate::config;
 use crate::git;
 use crate::history;
@@ -436,13 +436,6 @@ impl SessionManager {
     /// backend session id yet, or the backend has no transcript concept.
     pub async fn context_usage(&self, id: &str) -> Option<ContextUsage> {
         self.backend_metadata.context_usage(id).await
-    }
-
-    /// Fetch a sanitized child-agent snapshot from the provider. Provider
-    /// calls are blocking subprocess I/O, so they run off Tokio's workers;
-    /// a short success cache amortizes the query across attached browsers.
-    pub async fn subagents(&self, id: &str) -> Result<SubagentList> {
-        self.backend_metadata.subagents(id).await
     }
 
     pub async fn runtime_diagnostics(

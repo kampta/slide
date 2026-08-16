@@ -1,25 +1,17 @@
-use super::manager::{check_id, valid_id};
+use super::manager::valid_id;
 use super::{Location, Session, SessionEvent};
-use crate::backend::{self, ContextUsage, SubagentList};
+use crate::backend::{self, ContextUsage};
 use crate::store::Store;
-use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, Weak};
-use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::{broadcast, RwLock};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, SystemTime};
+use tokio::sync::broadcast;
 use tokio::task::AbortHandle;
 
-const SUBAGENT_CACHE_TTL: Duration = Duration::from_secs(3);
 const DISCOVERY_DEADLINE: Duration = Duration::from_secs(120);
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
-
-#[derive(Clone)]
-struct CachedSubagents {
-    fetched_at: Instant,
-    value: SubagentList,
-}
 
 struct DiscoveryTask {
     generation: u64,
@@ -32,8 +24,6 @@ struct DiscoveryTask {
 pub(super) struct BackendMetadata {
     store: Arc<Store>,
     events: broadcast::Sender<Arc<SessionEvent>>,
-    subagent_cache: RwLock<HashMap<String, CachedSubagents>>,
-    subagent_query_locks: StdMutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     discovery_tasks: StdMutex<HashMap<String, DiscoveryTask>>,
     next_generation: AtomicU64,
 }
@@ -46,8 +36,6 @@ impl BackendMetadata {
         Arc::new(Self {
             store,
             events,
-            subagent_cache: RwLock::new(HashMap::new()),
-            subagent_query_locks: StdMutex::new(HashMap::new()),
             discovery_tasks: StdMutex::new(HashMap::new()),
             next_generation: AtomicU64::new(1),
         })
@@ -69,77 +57,6 @@ impl BackendMetadata {
         .await
         .ok()
         .flatten()
-    }
-
-    pub(super) async fn subagents(&self, id: &str) -> Result<SubagentList> {
-        check_id(id)?;
-        if let Some(cached) = self.cached_subagents(id).await {
-            return Ok(cached);
-        }
-        let query_lock = {
-            let mut locks = self
-                .subagent_query_locks
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            locks.retain(|_, lock| lock.strong_count() > 0);
-            if let Some(lock) = locks.get(id).and_then(Weak::upgrade) {
-                lock
-            } else {
-                let lock = Arc::new(tokio::sync::Mutex::new(()));
-                locks.insert(id.to_string(), Arc::downgrade(&lock));
-                lock
-            }
-        };
-        let _query_guard = query_lock.lock().await;
-        if let Some(cached) = self.cached_subagents(id).await {
-            return Ok(cached);
-        }
-
-        let session = self
-            .store
-            .get(id)
-            .await?
-            .with_context(|| format!("unknown session {id}"))?;
-        if !session.backend.info().subagents {
-            return Ok(SubagentList {
-                supported: false,
-                agents: Vec::new(),
-            });
-        }
-        let Some(session_id) = session.backend_session_id.clone() else {
-            return Ok(SubagentList {
-                supported: true,
-                agents: Vec::new(),
-            });
-        };
-        let cwd = PathBuf::from(session.project_path);
-        let ssh_host = session.ssh_host.clone();
-        let backend_kind = session.backend;
-        let result = tokio::task::spawn_blocking(move || {
-            backend::for_kind(backend_kind).read_subagents(&cwd, &session_id, ssh_host.as_deref())
-        })
-        .await
-        .context("join subagent metadata query")??;
-        let value = result.map_or(
-            SubagentList {
-                supported: false,
-                agents: Vec::new(),
-            },
-            |agents| SubagentList {
-                supported: true,
-                agents,
-            },
-        );
-        if self.store.get(id).await?.is_some() {
-            self.subagent_cache.write().await.insert(
-                id.to_string(),
-                CachedSubagents {
-                    fetched_at: Instant::now(),
-                    value: value.clone(),
-                },
-            );
-        }
-        Ok(value)
     }
 
     pub(super) fn start_discovery(self: &Arc<Self>, session: &Session, since: SystemTime) {
@@ -212,11 +129,6 @@ impl BackendMetadata {
 
     pub(super) async fn clear_session(&self, id: &str) {
         self.cancel_discovery(id);
-        self.subagent_cache.write().await.remove(id);
-        self.subagent_query_locks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(id);
     }
 
     pub(super) fn cancel_discovery(&self, id: &str) {
@@ -228,15 +140,6 @@ impl BackendMetadata {
         {
             task.abort.abort();
         }
-    }
-
-    async fn cached_subagents(&self, id: &str) -> Option<SubagentList> {
-        self.subagent_cache
-            .read()
-            .await
-            .get(id)
-            .filter(|cached| cached.fetched_at.elapsed() < SUBAGENT_CACHE_TTL)
-            .map(|cached| cached.value.clone())
     }
 
     fn finish_discovery(&self, id: &str, generation: u64) {

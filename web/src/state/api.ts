@@ -8,7 +8,6 @@ export interface BackendInfo {
   id: Backend;
   label: string;
   context_usage: boolean;
-  subagents: boolean;
   fork: boolean;
   execution_policies: ExecutionPolicy[];
 }
@@ -191,28 +190,6 @@ export interface ContextUsage {
   output_tokens: number;
 }
 
-export type SubagentState =
-  | "starting"
-  | "running"
-  | "waiting"
-  | "completed"
-  | "failed";
-
-export interface Subagent {
-  id: string;
-  parent_id: string;
-  name: string | null;
-  role: string | null;
-  state: SubagentState;
-  created_at: number;
-  updated_at: number;
-}
-
-export interface SubagentList {
-  supported: boolean;
-  agents: Subagent[];
-}
-
 export type RuntimeStatus =
   | "ready"
   | "missing"
@@ -283,8 +260,6 @@ export const api = {
   listSshHosts: () => req<SshHost[]>("GET", "/api/ssh-hosts"),
   getContext: (id: string) =>
     req<ContextUsage | null>("GET", sessionPath(id, "/context")),
-  getSubagents: (id: string) =>
-    req<SubagentList>("GET", sessionPath(id, "/subagents")),
   getRuntimeDiagnostics: (opts: { host?: string; refresh?: boolean } = {}) => {
     const params = new URLSearchParams();
     if (opts.host) params.set("host", opts.host);
