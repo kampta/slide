@@ -250,14 +250,14 @@ impl BackendKind {
                 id: self,
                 label: "Grok",
                 context_usage: false,
-                fork: false,
+                fork: true,
                 execution_policies: UNRESTRICTED_ONLY,
             },
             Self::Antigravity => BackendInfo {
                 id: self,
                 label: "Antigravity",
                 context_usage: false,
-                fork: false,
+                fork: true,
                 execution_policies: UNRESTRICTED_ONLY,
             },
             Self::OpenCode => BackendInfo {
@@ -329,15 +329,23 @@ pub trait Backend: Send + Sync {
         None
     }
 
-    /// Start a provider-native branch of an existing conversation. The
-    /// returned process must create a new provider session id rather than
-    /// attaching both Slide sessions to the same transcript.
+    /// Start a conversation from an existing provider session in a new
+    /// worktree. Providers with a native branch command create a new
+    /// conversation id; providers without one may continue the durable
+    /// conversation in the isolated worktree.
     fn fork_argv(
         &self,
         _cwd: &Path,
         _session_id: &str,
         _prompt: Option<&str>,
     ) -> Option<Vec<String>> {
+        None
+    }
+
+    /// Optional input sent after a fork process has attached. This is used
+    /// by providers whose fork command is an interactive slash command rather
+    /// than a launch flag.
+    fn fork_input(&self, _cwd: &Path, _session_id: &str) -> Option<Vec<u8>> {
         None
     }
 
@@ -520,7 +528,15 @@ mod tests {
             .filter(|backend| backend.fork)
             .map(|backend| backend.id)
             .collect::<Vec<_>>();
-        assert_eq!(fork_backends, [BackendKind::Claude, BackendKind::Codex]);
+        assert_eq!(
+            fork_backends,
+            [
+                BackendKind::Claude,
+                BackendKind::Codex,
+                BackendKind::Grok,
+                BackendKind::Antigravity
+            ]
+        );
     }
 
     #[test]
@@ -531,7 +547,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             discoverable,
-            [BackendKind::Claude, BackendKind::Codex, BackendKind::Grok]
+            [
+                BackendKind::Claude,
+                BackendKind::Codex,
+                BackendKind::Grok,
+                BackendKind::Antigravity
+            ]
         );
     }
 }

@@ -187,12 +187,6 @@ pub struct ForkSessionRequest {
     pub focus: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct HandoffRequest {
-    pub target_session_id: String,
-    pub focus: String,
-}
-
 fn default_local() -> Location {
     Location::Local
 }

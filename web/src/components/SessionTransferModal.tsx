@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { api, type BackendInfo, type Session } from "../state/api";
 import { useSessions } from "../state/sessionStore";
 import { useModalDialog } from "../hooks/useModalDialog";
@@ -11,7 +11,7 @@ export function suggestedForkName(source: string, existing: Set<string>): string
   return `${stem}-${suffix}`;
 }
 
-export function SessionTransferModal({
+export function SessionForkModal({
   open,
   source,
   onClose,
@@ -22,25 +22,14 @@ export function SessionTransferModal({
   onClose: () => void;
   onSelect: (sessionId: string) => void;
 }) {
-  const sessions = useSessions((state) => state.sessions);
   const forkSession = useSessions((state) => state.forkSession);
-  const handoffSession = useSessions((state) => state.handoffSession);
-  const [mode, setMode] = useState<"fork" | "handoff">("fork");
   const [backends, setBackends] = useState<BackendInfo[]>([]);
   const [name, setName] = useState("");
-  const [targetId, setTargetId] = useState("");
   const [focus, setFocus] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const dialogRef = useModalDialog<HTMLElement>(open, onClose, !loading);
 
-  const targets = useMemo(
-    () =>
-      Object.values(sessions)
-        .filter((session) => session.id !== source.id && session.state === "waiting")
-        .sort((left, right) => right.last_activity - left.last_activity),
-    [sessions, source.id],
-  );
   const backendCanFork = backends.find((backend) => backend.id === source.backend)?.fork ?? false;
   const canFork =
     source.location === "local" && Boolean(source.backend_session_id) && backendCanFork;
@@ -64,22 +53,13 @@ export function SessionTransferModal({
       setError(null);
       return;
     }
-    const existing = new Set(Object.values(sessions).map((session) => session.name));
-    setMode("fork");
+    const existing = new Set(
+      Object.values(useSessions.getState().sessions).map((session) => session.name),
+    );
     setName(suggestedForkName(source.name, existing));
-    setTargetId(targets[0]?.id ?? "");
     setFocus("");
     setError(null);
-  }, [open, source.id]);
-
-  useEffect(() => {
-    if (!open || targets.some((target) => target.id === targetId)) return;
-    setTargetId(targets[0]?.id ?? "");
-  }, [open, targetId, targets]);
-
-  useEffect(() => {
-    if (open && !canFork && backends.length > 0) setMode("handoff");
-  }, [backends.length, canFork, open]);
+  }, [open, source.id, source.name]);
 
   if (!open) return null;
 
@@ -89,12 +69,10 @@ export function SessionTransferModal({
     setLoading(true);
     setError(null);
     try {
-      const target = mode === "fork"
-        ? await forkSession(source.id, { name, focus: focus.trim() || undefined })
-        : await handoffSession(source.id, {
-            target_session_id: targetId,
-            focus: focus.trim(),
-          });
+      const target = await forkSession(source.id, {
+        name,
+        focus: focus.trim() || undefined,
+      });
       onSelect(target.id);
       onClose();
     } catch (reason) {
@@ -108,99 +86,63 @@ export function SessionTransferModal({
     <div className="modal-backdrop" onMouseDown={() => !loading && onClose()}>
       <section
         ref={dialogRef}
-        className="modal session-transfer-modal"
+        className="modal session-fork-modal"
         role="dialog"
         aria-modal="true"
-        aria-labelledby="session-transfer-title"
+        aria-labelledby="session-fork-title"
         tabIndex={-1}
         onMouseDown={(event) => event.stopPropagation()}
       >
         <div className="diagnostics-heading">
           <div>
-            <h2 id="session-transfer-title">Branch or hand off</h2>
+          <h2 id="session-fork-title">Fork session</h2>
             <p>Source: {source.name}</p>
           </div>
           <button
             type="button"
             className="btn-icon"
             onClick={onClose}
-            aria-label="Close transfer"
+            aria-label="Close fork dialog"
             disabled={loading}
           >
             ×
           </button>
         </div>
-        <div className="btn-group session-transfer-modes" role="tablist" aria-label="Transfer type">
-          <button
-            type="button"
-            role="tab"
-            aria-selected={mode === "fork"}
-            className={mode === "fork" ? "active" : ""}
-            onClick={() => setMode("fork")}
-          >
-            Fork session
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={mode === "handoff"}
-            className={mode === "handoff" ? "active" : ""}
-            onClick={() => setMode("handoff")}
-          >
-            Hand off context
-          </button>
-        </div>
-        <form className="session-transfer-form" onSubmit={submit}>
-          {mode === "fork" ? (
-            <>
-              <label>
-                <span>New session name</span>
-                <input
-                  autoFocus
-                  value={name}
-                  onChange={(event) => setName(event.target.value)}
-                  pattern="[A-Za-z0-9_][A-Za-z0-9_-]*"
-                  required
-                />
-              </label>
-              {!canFork && (
-                <p className="hint hint-error">
-                  Native forks require a local Claude or Codex session with a discovered conversation ID.
-                </p>
-              )}
-              <p className="hint">
-                Creates a new provider conversation and an isolated Slide worktree from the source's current Git-visible files. The source stays unchanged.
-              </p>
-            </>
-          ) : (
-            <>
-              <label>
-                <span>Waiting target</span>
-                <select value={targetId} onChange={(event) => setTargetId(event.target.value)} required>
-                  {targets.length === 0 && <option value="">No waiting sessions</option>}
-                  {targets.map((target) => (
-                    <option key={target.id} value={target.id}>
-                      {target.name} · {target.backend}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <p className="hint">
-                Sends a bounded, control-sequence-free tail of this session to the target as one focused turn.
-              </p>
-            </>
-          )}
+        <form className="session-fork-form" onSubmit={submit}>
           <label>
-            <span>{mode === "fork" ? "New direction (optional)" : "Focus for target"}</span>
-            <textarea
-              value={focus}
-              onChange={(event) => setFocus(event.target.value)}
-              maxLength={2000}
-              required={mode === "handoff"}
-              placeholder={mode === "fork" ? "Try a different implementation…" : "What should the target carry forward?"}
+            <span>New session name</span>
+            <input
+              autoFocus
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              pattern="[A-Za-z0-9_][A-Za-z0-9_-]*"
+              required
             />
           </label>
-          {error && <p className="error session-transfer-error">{error}</p>}
+          {!canFork && (
+            <p className="hint hint-error">
+              Forks require a local Claude, Codex, Grok, or Agy session with a discovered conversation ID.
+            </p>
+          )}
+          <p className="hint">
+            Creates a new isolated worktree from the source's current Git-visible files and continues its provider conversation. The source stays unchanged.
+          </p>
+          {source.backend === "agy" ? (
+            <p className="hint">
+              Agy forks the existing conversation through its CLI. Its command does not accept an initial direction here; enter it in the new session.
+            </p>
+          ) : (
+            <label>
+              <span>New direction (optional)</span>
+              <textarea
+                value={focus}
+                onChange={(event) => setFocus(event.target.value)}
+                maxLength={2000}
+                placeholder="Try a different implementation…"
+              />
+            </label>
+          )}
+          {error && <p className="error session-fork-error">{error}</p>}
           <div className="modal-actions">
             <button type="button" onClick={onClose} disabled={loading}>Cancel</button>
             <button
@@ -208,10 +150,10 @@ export function SessionTransferModal({
               className="btn-primary"
               disabled={
                 loading ||
-                (mode === "fork" ? !canFork || !name : !targetId || !focus.trim())
+                !canFork || !name
               }
             >
-              {loading ? "Working…" : mode === "fork" ? "Create fork" : "Send handoff"}
+              {loading ? "Working…" : "Create fork"}
             </button>
           </div>
         </form>

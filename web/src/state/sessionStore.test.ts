@@ -176,22 +176,6 @@ describe("session store mutations", () => {
     expect(useSessions.getState().sessions.fork).toEqual(fork);
   });
 
-  it("does not let a stale handoff response overwrite a newer state event", async () => {
-    const waiting = session("target", { state: "waiting", last_activity: 20 });
-    const active = { ...waiting, state: "active" as const, last_activity: 30 };
-    useSessions.getState().loadSnapshot([waiting]);
-    vi.spyOn(api, "handoffSession").mockImplementation(async () => {
-      useSessions.getState().upsert(active);
-      return waiting;
-    });
-
-    await expect(useSessions.getState().handoffSession("source", {
-      target_session_id: "target",
-      focus: "continue here",
-    })).resolves.toEqual(waiting);
-    expect(useSessions.getState().sessions.target).toEqual(active);
-  });
-
   it("preserves newer events that beat create and update responses", async () => {
     const original = session("existing", { last_activity: 10 });
     const updated = { ...original, state: "waiting" as const, last_activity: 30 };

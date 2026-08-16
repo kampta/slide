@@ -168,10 +168,6 @@ impl RunningSession {
         self.ring.lock().await.snapshot()
     }
 
-    pub(super) async fn tail(&self, len: usize) -> Vec<u8> {
-        self.ring.lock().await.tail(len)
-    }
-
     pub(super) async fn subscribe_with_snapshot(&self) -> (Vec<u8>, broadcast::Receiver<Bytes>) {
         let ring = self.ring.lock().await;
         let snapshot = ring.snapshot();

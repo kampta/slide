@@ -43,10 +43,6 @@ interface Store {
     id: string,
     request: Parameters<typeof api.forkSession>[1],
   ) => Promise<Session>;
-  handoffSession: (
-    sourceId: string,
-    request: Parameters<typeof api.handoffSession>[1],
-  ) => Promise<Session>;
   connect: () => () => void;
 }
 
@@ -192,12 +188,6 @@ export const useSessions = create<Store>((set, get) => ({
   forkSession: async (id, request) => {
     const session = await api.forkSession(id, request);
     upsertIfUnchanged(get, undefined, session);
-    return session;
-  },
-  handoffSession: async (sourceId, request) => {
-    const previous = get().sessions[request.target_session_id];
-    const session = await api.handoffSession(sourceId, request);
-    upsertIfUnchanged(get, previous, session);
     return session;
   },
   connect: () => {

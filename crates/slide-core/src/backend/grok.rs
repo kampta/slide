@@ -141,6 +141,24 @@ impl Backend for GrokBackend {
         Some(argv)
     }
 
+    fn fork_argv(
+        &self,
+        _cwd: &Path,
+        session_id: &str,
+        prompt: Option<&str>,
+    ) -> Option<Vec<String>> {
+        let mut argv = argv_with_permissions();
+        argv.extend([
+            "--resume".into(),
+            session_id.into(),
+            "--fork-session".into(),
+        ]);
+        if let Some(prompt) = prompt.filter(|prompt| !prompt.is_empty()) {
+            argv.push(prompt.into());
+        }
+        Some(argv)
+    }
+
     fn discover_session_id(&self, cwd: &Path, since: SystemTime) -> Option<String> {
         discover_in(&grok_home()?.join("sessions"), cwd, since)
     }
@@ -165,6 +183,22 @@ mod tests {
             .resume_argv(Path::new("/tmp"), "session-123")
             .unwrap();
         assert_eq!(&argv[argv.len() - 2..], ["--resume", "session-123"]);
+    }
+
+    #[test]
+    fn fork_argv_branches_resumed_session() {
+        let argv = GrokBackend::new()
+            .fork_argv(Path::new("/tmp"), "session-123", Some("try another design"))
+            .unwrap();
+        assert_eq!(
+            &argv[argv.len() - 4..],
+            [
+                "--resume",
+                "session-123",
+                "--fork-session",
+                "try another design"
+            ]
+        );
     }
 
     #[test]

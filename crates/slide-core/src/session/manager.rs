@@ -3,8 +3,8 @@ use super::pty;
 use super::recovery::RecoveryCoordinator;
 use super::running::RunningSession;
 use super::{
-    CreateSessionRequest, ExecutionPolicy, ForkSessionRequest, HandoffRequest, Location, Session,
-    SessionEvent, SessionState, SupervisorKind,
+    CreateSessionRequest, ExecutionPolicy, ForkSessionRequest, Location, Session, SessionEvent,
+    SessionState, SupervisorKind,
 };
 use crate::backend::{self, BackendKind, ContextUsage};
 use crate::config;
@@ -22,8 +22,6 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use tokio::sync::{broadcast, mpsc, RwLock};
 
 const BROADCAST_CAP: usize = 256;
-const HANDOFF_TAIL_BYTES: usize = 32 * 1024;
-const HANDOFF_CONTEXT_CHARS: usize = 8_000;
 
 /// A browser-owned tmux client. Dropping it kills only the local attach
 /// process (or SSH transport); the supervised tmux session keeps running.
@@ -113,26 +111,6 @@ fn normalize_focus(value: Option<&str>, required: bool) -> Result<Option<String>
     }
 }
 
-fn newest_chars(value: &str, limit: usize) -> &str {
-    if limit == 0 {
-        return "";
-    }
-    value
-        .char_indices()
-        .rev()
-        .nth(limit)
-        .map_or(value, |(index, character)| {
-            &value[index + character.len_utf8()..]
-        })
-}
-
-fn build_handoff_prompt(source_name: &str, focus: &str, context: &str) -> String {
-    format!(
-        "Slide handoff from session '{}'. Focus: {}. Recent source context: {}. Continue from this context, verify assumptions against the current workspace, and address the focus above.",
-        source_name, focus, context
-    )
-}
-
 pub(super) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -194,25 +172,25 @@ async fn rollback_owned_worktree(
 async fn attach_process(
     sup: &dyn supervisor::Supervisor,
     session_id: &str,
-    handoff: &supervisor::Spawned,
+    spawned_backend: &supervisor::Spawned,
 ) -> Result<pty::Spawned> {
     let spawned = pty::spawn(
-        &handoff.attach_argv,
-        &handoff.attach_cwd,
-        &handoff.attach_env,
+        &spawned_backend.attach_argv,
+        &spawned_backend.attach_cwd,
+        &spawned_backend.attach_env,
     )
     .with_context(|| {
         format!(
             "spawn {} in {}",
-            handoff.attach_argv.join(" "),
-            handoff.attach_cwd.display()
+            spawned_backend.attach_argv.join(" "),
+            spawned_backend.attach_cwd.display()
         )
     });
 
     match spawned {
         Ok(spawned) => Ok(spawned),
         Err(error) => {
-            if handoff.created_backend {
+            if spawned_backend.created_backend {
                 if let Err(cleanup_error) = sup.teardown(session_id).await {
                     return Err(anyhow!(
                         "{error:#}; failed to tear down newly created supervisor backend: {cleanup_error:#}"
@@ -781,7 +759,7 @@ impl SessionManager {
         check_id(source_id)?;
         let source = self.find(source_id).await?;
         if !matches!(source.location, Location::Local) {
-            bail!("provider-native forks currently require a local source session");
+            bail!("forks currently require a local source session");
         }
         let provider_session_id = source
             .backend_session_id
@@ -796,10 +774,7 @@ impl SessionManager {
             )
             .is_none()
         {
-            bail!(
-                "{} does not support provider-native forks",
-                source.backend.as_str()
-            );
+            bail!("{} does not support forks", source.backend.as_str());
         }
         let create = CreateSessionRequest {
             name: request.name,
@@ -821,50 +796,6 @@ impl SessionManager {
             Some(worktree_source),
         )
         .await
-    }
-
-    pub async fn handoff(&self, source_id: &str, request: HandoffRequest) -> Result<Session> {
-        check_id(source_id)?;
-        check_id(&request.target_session_id)?;
-        if source_id == request.target_session_id {
-            bail!("source and target sessions must be different");
-        }
-        let source = self.find(source_id).await?;
-        let target = self.find(&request.target_session_id).await?;
-        if !matches!(target.state, SessionState::Waiting) {
-            bail!("target session must be waiting before a handoff");
-        }
-        let focus = normalize_focus(Some(&request.focus), true)?.context("focus is required")?;
-        let running = self.running.read().await.get(source_id).cloned();
-        let bytes = match running {
-            Some(running) => running.tail(HANDOFF_TAIL_BYTES).await,
-            None => {
-                let source = source.clone();
-                tokio::task::spawn_blocking(move || {
-                    crate::history::read_tail(&source, HANDOFF_TAIL_BYTES)
-                })
-                .await
-                .context("join handoff history read")??
-            }
-        };
-        let compact = crate::terminal_text::compact(&String::from_utf8_lossy(&bytes));
-        if compact.is_empty() {
-            bail!("source session has no recent output to hand off");
-        }
-        let context = newest_chars(&compact, HANDOFF_CONTEXT_CHARS);
-        let mut prompt = build_handoff_prompt(&source.name, &focus, context).into_bytes();
-        prompt.push(b'\r');
-        // Context collection can involve disk or SSH I/O. Re-check immediately
-        // before sending so a target that became active in the meantime does not
-        // receive an unsolicited turn.
-        let operation = self.operation_lock(&target.id);
-        let _guard = operation.lock().await;
-        let target = self.find(&target.id).await?;
-        if !matches!(target.state, SessionState::Waiting) {
-            bail!("target session is no longer waiting");
-        }
-        self.write_input(&target.id, &prompt).await?;
-        Ok(target)
     }
 
     /// Resume a stopped session. When `backend` differs from the stored
@@ -1039,7 +970,14 @@ impl SessionManager {
                     prompt,
                 } => backend
                     .fork_argv(&host_cwd, provider_session_id, prompt.as_deref())
-                    .context("backend does not support provider-native forks")?,
+                    .context("backend does not support forks")?,
+            };
+            let fork_input = match &intent {
+                SpawnIntent::Fork {
+                    provider_session_id,
+                    ..
+                } => backend.fork_input(&host_cwd, provider_session_id),
+                _ => None,
             };
             let backend_argv =
                 backend.apply_execution_policy(session.execution_policy, backend_argv)?;
@@ -1070,17 +1008,17 @@ impl SessionManager {
                 cols: DEFAULT_COLS,
                 rows: DEFAULT_ROWS,
             };
-            let handoff = sup.spawn(&spawn_req).await?;
+            let spawned_backend = sup.spawn(&spawn_req).await?;
 
             // Step 3: open a local PTY for the attach process. For Direct this
             // is just the backend itself; for Tmux it's `tmux attach-session`.
-            let spawned = attach_process(sup.as_ref(), &session.id, &handoff).await?;
+            let spawned = attach_process(sup.as_ref(), &session.id, &spawned_backend).await?;
             let running = RunningSession::start(
                 self.clone(),
                 session,
                 spawned.pty,
                 spawned.output,
-                handoff.writes_log,
+                spawned_backend.writes_log,
                 &log_path,
             )
             .await;
@@ -1094,9 +1032,10 @@ impl SessionManager {
             // than the backend exiting.
             let id2 = session.id.clone();
             let mgr2 = self.clone();
+            let exit_running = running.clone();
             tokio::spawn(async move {
                 let _ = spawned.exit.await;
-                RecoveryCoordinator::handle_exit(mgr2, id2, running).await;
+                RecoveryCoordinator::handle_exit(mgr2, id2, exit_running).await;
             });
 
             // Discover the backend's native session id so we can `--resume`
@@ -1107,6 +1046,19 @@ impl SessionManager {
             self.backend_metadata
                 .start_discovery(session, launch_started);
 
+            if let Some(input) = fork_input {
+                let running = running.clone();
+                tokio::spawn(async move {
+                    // Agy's `/fork` is an interactive command. Queue it after
+                    // the TUI has had time to restore the source conversation;
+                    // PTY input remains ordered while the prompt is drawing.
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if let Err(error) = running.write(&input) {
+                        tracing::debug!(error = %format!("{error:#}"), "provider fork command was not accepted");
+                    }
+                });
+            }
+
             Ok(())
         })
     }
@@ -1115,9 +1067,8 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_process, build_handoff_prompt, newest_chars, next_activity, normalize_focus,
-        valid_id, validate_execution_policy, BackendMetadata, RunningSession, SessionManager,
-        TerminalAttachment, BROADCAST_CAP,
+        attach_process, next_activity, normalize_focus, valid_id, validate_execution_policy,
+        BackendMetadata, RunningSession, SessionManager, TerminalAttachment, BROADCAST_CAP,
     };
     use crate::backend::BackendKind;
     use crate::runtime::RuntimeDiagnosticsCache;
@@ -1225,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn handoff_focus_is_single_line_bounded_and_control_safe() {
+    fn fork_focus_is_single_line_bounded_and_control_safe() {
         assert_eq!(
             normalize_focus(Some("  inspect\n  auth   failures  "), true).unwrap(),
             Some("inspect auth failures".to_string()),
@@ -1236,23 +1187,12 @@ mod tests {
         assert_eq!(normalize_focus(None, false).unwrap(), None);
     }
 
-    #[test]
-    fn handoff_context_keeps_newest_unicode_without_allocating_a_copy() {
-        assert_eq!(newest_chars("aé日🙂", 2), "日🙂");
-        assert_eq!(newest_chars("short", 20), "short");
-        assert_eq!(newest_chars("value", 0), "");
-        let prompt = build_handoff_prompt("source", "check tests", "latest output");
-        assert!(prompt.contains("session 'source'"));
-        assert!(prompt.contains("Focus: check tests"));
-        assert!(!prompt.contains('\n'));
-    }
-
     #[tokio::test]
     async fn failed_attach_only_tears_down_a_new_supervisor_backend() {
         let cwd = tempfile::tempdir().unwrap();
         for (created_backend, expected_teardowns) in [(true, 1), (false, 0)] {
             let sup = RecordingSupervisor::default();
-            let handoff = Spawned {
+            let spawned_backend = Spawned {
                 attach_argv: Vec::new(),
                 attach_env: Vec::new(),
                 attach_cwd: PathBuf::from(cwd.path()),
@@ -1260,7 +1200,7 @@ mod tests {
                 created_backend,
             };
 
-            let error = attach_process(&sup, "session", &handoff)
+            let error = attach_process(&sup, "session", &spawned_backend)
                 .await
                 .err()
                 .expect("an empty attach argv must fail");

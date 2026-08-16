@@ -47,11 +47,11 @@ Restarting the Slide daemon reattaches existing tmux-backed agents; it does not 
 
 This starts the Rust daemon on `127.0.0.1:7777` and the Vite development server on `127.0.0.1:5173`. Vite serves the UI with hot reload and proxies `/api` and `/ws` to the daemon. Open the five-minute, single-use fragment-bootstrap URL printed in the terminal; run `slide open` for each later tab. Stop both processes with `Ctrl+C`.
 
-## Forks and handoffs
+## Forks
 
-Open **Branch** on a session to take work in a new direction. A native fork creates a separate provider conversation in a new Slide-managed Git worktree, copies the source worktree's current committed and uncommitted Git-visible file state without touching its index, and records its source-session lineage. Ignored files stay local to the source worktree. Native forks currently require a local Claude or Codex session whose provider conversation ID Slide has discovered; the source conversation and worktree remain unchanged.
+Open **Branch** on a session to take work in a new direction. Enter a name and Slide creates a new managed Git worktree from the source's current committed and uncommitted Git-visible file state without touching the source index, then starts the provider conversation from the source. The source session and worktree remain unchanged, and the new session records its source lineage. Ignored files stay local to the source worktree.
 
-A handoff works across backends and local or SSH sessions. Choose another Waiting session and a required focus: Slide reads at most 32 KiB of recent source output, removes terminal control sequences, collapses it to one line, keeps the newest 8,000 characters, and submits it as one turn to the target. Context is transferred only by this explicit action, and the target is checked again immediately before submission so an agent that has resumed working is not interrupted.
+Forking is available for local Claude, Codex, Grok, and Antigravity (Agy) sessions after Slide discovers the provider conversation ID. Claude, Codex, and Grok use their launch-time fork commands; Agy resumes the source briefly and issues its `/fork` command, then Slide discovers the new provider conversation. Remote sessions cannot be forked until remote transcript discovery is available.
 
 ## New session
 
@@ -72,7 +72,7 @@ Every running session has its own classifier task that wakes on byte activity (v
 - **Active** — bytes observed in the last ~1.5 s, or the backend's "working" regex matched the rendered pane.
 - **Waiting** — an approval/authentication modal, explicit idle hint, or settled prompt matched.
 - **Unknown** — the backend is running, but the settled pane has no reliable working or input signal. Slide periodically rechecks it.
-- **Stopped** — child process ended, or the user stopped the session. Resume continues the prior backend conversation when Slide has discovered its native conversation ID; otherwise it starts fresh. From a stopped session you can also pick a different backend before starting: that keeps the same workspace but clears the provider conversation id and launches a fresh agent (use **Branch → Hand off** if you need prior context on the new backend).
+- **Stopped** — child process ended, or the user stopped the session. Resume continues the prior backend conversation when Slide has discovered its native conversation ID; otherwise it starts fresh. From a stopped session you can also pick a different backend before starting: that keeps the same workspace but clears the provider conversation id and launches a fresh agent.
 
 ## Layout
 

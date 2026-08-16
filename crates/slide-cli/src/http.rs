@@ -7,9 +7,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 use slide_core::backend::BackendKind;
-use slide_core::session::{
-    CreateSessionRequest, ExecutionPolicy, ForkSessionRequest, HandoffRequest,
-};
+use slide_core::session::{CreateSessionRequest, ExecutionPolicy, ForkSessionRequest};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -20,7 +18,6 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/sessions/:id/log", get(get_log))
         .route("/sessions/:id/fork", post(fork_session))
-        .route("/sessions/:id/handoff", post(handoff_session))
         .route("/sessions/:id/context", get(get_context))
         .route("/ls", get(list_dir))
         .route("/diagnostics", get(get_runtime_diagnostics))
@@ -137,17 +134,6 @@ async fn fork_session(
     Json(request): Json<ForkSessionRequest>,
 ) -> Response {
     match state.manager.fork_session(&id, request).await {
-        Ok(session) => Json(session).into_response(),
-        Err(error) => client_error(&error),
-    }
-}
-
-async fn handoff_session(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(request): Json<HandoffRequest>,
-) -> Response {
-    match state.manager.handoff(&id, request).await {
         Ok(session) => Json(session).into_response(),
         Err(error) => client_error(&error),
     }

@@ -11,7 +11,7 @@ import type { TerminalHandle } from "./Terminal";
 import { MobileKeyBar } from "./MobileKeyBar";
 import { useIsMobile } from "../hooks/useMediaQuery";
 import { SessionPath, sessionDisplayPath } from "./SessionPath";
-import { SessionTransferModal } from "./SessionTransferModal";
+import { SessionForkModal } from "./SessionTransferModal";
 
 const TerminalView = lazy(() =>
   import("./Terminal").then((module) => ({ default: module.TerminalView })),
@@ -86,7 +86,7 @@ export function SessionView() {
   const deleteSession = useSessions((s) => s.deleteSession);
   const [usage, setUsage] = useState<ContextUsage | null>(null);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
-  const [transferOpen, setTransferOpen] = useState(false);
+  const [forkOpen, setForkOpen] = useState(false);
   const [backends, setBackends] = useState<BackendInfo[]>([]);
   const [resumeBackend, setResumeBackend] = useState<Backend | null>(null);
   const [resumePolicy, setResumePolicy] =
@@ -230,8 +230,8 @@ export function SessionView() {
           <button
             type="button"
             disabled={pendingAction !== null}
-            onClick={() => setTransferOpen(true)}
-            title="Fork this session or hand context to another waiting session"
+            onClick={() => setForkOpen(true)}
+            title="Fork this session into a new worktree"
           >
             Branch
           </button>
@@ -325,10 +325,10 @@ export function SessionView() {
           </button>
         </div>
       </header>
-      <SessionTransferModal
-        open={transferOpen}
+      <SessionForkModal
+        open={forkOpen}
         source={session}
-        onClose={() => setTransferOpen(false)}
+        onClose={() => setForkOpen(false)}
         onSelect={setActive}
       />
       <Suspense fallback={<div className="term-host terminal-loading">Loading terminal…</div>}>

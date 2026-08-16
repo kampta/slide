@@ -948,27 +948,17 @@ body.is-resizing-panels * {
   text-align: right;
 }
 
-.session-transfer-modal {
+.session-fork-modal {
   width: min(540px, 100%);
 }
 
-.session-transfer-modes button {
-  flex: 1;
-}
-
-.session-transfer-modes button.active {
-  border-color: var(--border-strong);
-  background: var(--surface-hover);
-  color: var(--text);
-}
-
-.session-transfer-form {
+.session-fork-form {
   display: flex;
   flex-direction: column;
   gap: 12px;
 }
 
-.session-transfer-error {
+.session-fork-error {
   margin: 0;
 }
 

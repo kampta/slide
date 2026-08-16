@@ -100,8 +100,7 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
 }
 
 /// Read a bounded suffix of persisted terminal output without loading the
-/// whole session log. Handoffs use this when the source is not currently
-/// attached to the daemon.
+/// whole session log.
 pub(crate) fn read_tail(session: &Session, limit: usize) -> Result<Vec<u8>> {
     match session.location {
         Location::Local => {
